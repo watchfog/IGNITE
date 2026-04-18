@@ -1,0 +1,32 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sensitive files (API keys / credentials)
+**/*api_key*
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+
+# Ignore all example artifacts
+examples/*
+!examples/.gitkeep
+
+# Ignore config except the shared baseline config
+config/*
+!config/general_config.yaml
+
+# Ignore tools content but keep directory placeholder
+tools/*
+!tools/.gitkeep
+
+# Ignore outputs content but keep directory placeholder
+outputs/*
+!outputs/.gitkeep
+
+# Ignore vs code settings
+.vscode/*

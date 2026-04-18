@@ -1,0 +1,172 @@
+general:
+  # Whether to render a final hard-subtitled video after subtitle generation.
+  # false: only export subtitle files such as SRT / ASS.
+  render_video: false
+  # Whether to enable online search capability in Bailian VLM requests.
+  # Keep false unless the selected model / account path explicitly supports it.
+  enable_web_search: false
+
+video:
+  # Override source FPS when the container metadata is wrong.
+  # null means use FPS reported by the video file.
+  fps_override: null
+  # Sampling interval when no dialogue activity is detected.
+  sample_interval_idle: 0.8
+  # Sampling interval when dialogue is active and precise detection is needed.
+  sample_interval_active: 0.08
+  # Sampling interval used in relatively stable dialogue regions.
+  sample_interval_stable: 0.25
+
+scan:
+  # Extra padding added before/after coarse detected ranges before refinement.
+  range_padding_sec: 0.8
+  # Merge adjacent ranges if their gap is shorter than this value.
+  merge_gap_sec: 0.45
+  # Drop ranges shorter than this duration.
+  min_range_sec: 0.25
+
+threshold:
+  # Frame-difference thresholds, normalized to [0, 1].
+  # Tune these when segmentation is too sensitive or too sluggish.
+  diff_dialogue_change: 0.08
+  diff_dialogue_clear: 0.03
+  diff_name_change: 0.22
+  diff_marker_change: 0.18
+
+  # Minimum stable / clear durations used by the state machine.
+  stable_duration_sec: 0.5
+  clear_duration_sec: 0.2
+  min_dialogue_duration_sec: 0.3
+
+  # Presence thresholds for dialogue box / name box / marker region.
+  presence_threshold: 0.04
+  name_presence_threshold: 0.02
+  marker_presence_threshold: 0.1
+
+state_machine:
+  # Split a segment when the detected speaker name visually changes.
+  split_on_name_change: true
+  # Split a segment when name OCR content changes.
+  split_on_name_ocr: true
+
+  # Fast speaker-name presence screening.
+  name_fast_check_frames: 5
+  name_fast_min_hits: 4
+
+  # Coarse-to-fine name blank / appearance verification.
+  name_coarse_step_frames: 6
+  name_smooth_blank_gap_frames: 1
+  name_min_blank_frames: 1
+  name_blank_verify_frames: 3
+  name_blank_verify_min_hits: 2
+
+  # Whether marker ROI participates in cueing the state machine.
+  use_marker_cue: true
+  marker_use_debounce: false
+  marker_min_on_frames: 3
+  marker_min_off_frames: 2
+  marker_smooth_window: 1
+
+marker:
+  # Use template matching on marker ROI.
+  use_template: true
+  # Parallel workers for marker matching.
+  parallel_workers: 8
+  # Coarse sampling step in frames.
+  coarse_step_frames: 3
+  # Refinement margin in seconds around coarse marker hits.
+  refine_margin: 0.06
+
+  # Marker template shift strategy.
+  # Only one axis is adjusted at a time: "vertical" or "horizontal".
+  shift_mode: vertical
+  horizontal_shift_px: 0
+  horizontal_shift_step: 1
+  template_center_width: null
+  vertical_shift_px: 6
+  vertical_shift_step: 1
+
+ocr:
+  # OCR backend. Current recommended default is RapidOCR.
+  engine: rapidocr
+  # Japanese recognition model selection for RapidOCR / PaddleOCR.
+  rapidocr_rec_lang: japan
+
+  # Parallel OCR workers used for speaker-name verification.
+  name_ocr_workers: 8
+
+  # Fast name-presence screening mode.
+  # "fast_mask" is used before falling back to heavier OCR checks.
+  name_presence_mode: fast_mask
+  name_presence_threshold_on: 0.018
+  name_presence_threshold_off: 0.012
+  # Whether to fall back to OCR when fast presence detection is uncertain.
+  name_presence_ocr_fallback: true
+
+  # Disable inherited HTTP proxy variables by default.
+  # Useful for environments with broken local proxy settings.
+  disable_env_proxy: true
+
+  # OCR runtime backend. cpu is the safest default.
+  backend: cpu
+  # Add black border before OCR to improve detection robustness for tight crops.
+  # Total border size is based on original width/height, then split equally to both sides.
+  input_border_ratio: 0.5
+  # Minimum border per side in pixels.
+  input_border_min_px: 40
+  # Max OCR candidate frames collected per segment.
+  max_candidates_per_segment: 8
+
+translation:
+  # Translation mode used by pipeline and review GUI.
+  # Current default is Bailian VLM.
+  mode: vlm_bailian
+
+  # VLM API base URL. Default points to DashScope compatible endpoint.
+  # In your current workflow this is used with Bailian and responses-style calls.
+  vlm_api: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+  # File that stores the API key.
+  api_key_file: config/keys/bailian_api_key
+
+  # Available VLM models for manual selection.
+  # Models listed here should support visual input.
+  vlm_models:
+    - qwen3.6-plus
+
+  # Active model used by pipeline and Cache Review.
+  # Must be one of the entries in vlm_models.
+  model: qwen3.6-plus
+
+  # Generation controls.
+  temperature: 1.3
+  # Thinking is enabled by default in the current workflow.
+  enable_thinking: true
+  # Optional explicit thinking token cap. null means model default.
+  thinking_budget: null
+  # Whether to preserve raw thinking content in logs / results if supported.
+  preserve_thinking: false
+
+  # Logging and concurrency controls.
+  io_log_enabled: true
+  vlm_concurrent_workers: 64
+  history_enabled: false
+  history_n: 5
+  timeout_sec: 90
+  timeout_backoff_sec: 15
+  max_retries: 5
+  retry_delay_sec: 1.5
+  concurrent_workers: 4
+  disable_env_proxy: true
+
+  # Translation target language.
+  target_language: zh-CN
+
+tools:
+  # FFmpeg / FFprobe executables used for frame extraction and rendering.
+  ffmpeg_path: tools/ffmpeg/bin/ffmpeg.exe
+  ffprobe_path: tools/ffmpeg/bin/ffprobe.exe
+
+  # Preview decode acceleration for GUI seek.
+  # Allowed values include: auto / d3d11va / dxva2 / none
+  ffmpeg_hwaccel: auto
