@@ -149,8 +149,8 @@ class CacheReviewApp:
 
         nav = ttk.Frame(top)
         nav.grid(row=3, column=0, columnspan=10, sticky="ew", pady=(6, 0))
-        ttk.Button(nav, text="上一段 (←/A)", command=self._prev_segment).pack(side=tk.LEFT, padx=2)
-        ttk.Button(nav, text="下一段 (→/D)", command=self._next_segment).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav, text="上一段 (←)", command=self._prev_segment).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav, text="下一段 (→)", command=self._next_segment).pack(side=tk.LEFT, padx=2)
         ttk.Label(nav, text="跳转段号").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(nav, textvariable=self.goto_var, width=10).pack(side=tk.LEFT)
         ttk.Button(nav, text="跳转", command=self._jump_segment).pack(side=tk.LEFT, padx=2)
@@ -250,12 +250,33 @@ class CacheReviewApp:
         self.review_text.pack(fill=tk.BOTH, expand=True)
 
     def _bind_keys(self) -> None:
-        self.root.bind("<Left>", lambda _e: self._prev_segment())
-        self.root.bind("<Right>", lambda _e: self._next_segment())
-        self.root.bind("<a>", lambda _e: self._prev_segment())
-        self.root.bind("<d>", lambda _e: self._next_segment())
+        self.root.bind("<Left>", self._on_prev_segment_shortcut)
+        self.root.bind("<Right>", self._on_next_segment_shortcut)
         self.root.bind("<Control-s>", lambda _e: self._save_current_entry())
         self.root.bind("<Control-S>", lambda _e: self._save_current_entry())
+
+    def _is_focus_on_input_widget(self) -> bool:
+        widget = self.root.focus_get()
+        if widget is None:
+            return False
+        input_types = (tk.Entry, tk.Text, tk.Spinbox, ttk.Entry, ttk.Combobox, ttk.Spinbox)
+        if isinstance(widget, input_types):
+            return True
+        # Fallback for widget wrappers where isinstance may not match reliably.
+        widget_class = str(widget.winfo_class()).lower()
+        return widget_class in {"entry", "text", "spinbox", "tentry", "tcombobox", "tspinbox"}
+
+    def _on_prev_segment_shortcut(self, _e: tk.Event[Any]) -> str | None:
+        if self._is_focus_on_input_widget():
+            return None
+        self._prev_segment()
+        return "break"
+
+    def _on_next_segment_shortcut(self, _e: tk.Event[Any]) -> str | None:
+        if self._is_focus_on_input_widget():
+            return None
+        self._next_segment()
+        return "break"
 
     def _get_custom_prompt(self) -> str:
         return self.custom_prompt_text.get("1.0", tk.END).strip()
@@ -770,7 +791,8 @@ class CacheReviewApp:
             return
         idx = max(0, min(idx, len(self.entries) - 1))
         self.current_index = idx
-        self.goto_var.set(str(idx + 1))
+        seg_id = self.entries[idx].get("segment_id")
+        self.goto_var.set(str(seg_id if seg_id is not None else (idx + 1)))
         self._update_seg_info(idx)
         self.json_text.delete("1.0", tk.END)
         self.json_text.insert("1.0", json.dumps(self.entries[idx], ensure_ascii=False, indent=2))
@@ -825,8 +847,28 @@ class CacheReviewApp:
 
     def _jump_segment(self) -> None:
         self._save_current_entry()
-        i = int(self.goto_var.get().strip()) - 1
-        self._show_segment(i, request_prefetch=True)
+        raw = self.goto_var.get().strip()
+        if not raw:
+            self.status_var.set("跳转值不能为空")
+            return
+        try:
+            target = int(raw)
+        except Exception:
+            self.status_var.set(f"无效段号: {raw}")
+            return
+
+        idx: int | None = None
+        for i, entry in enumerate(self.entries):
+            seg_num = self._seg_numeric_id(entry)
+            if seg_num is not None and seg_num == target:
+                idx = i
+                break
+
+        if idx is None:
+            self.status_var.set(f"未找到 segment_id={target}")
+            return
+
+        self._show_segment(idx, request_prefetch=True)
 
     def _cancel_pending_seek(self) -> None:
         self._pending_seek_sec = None
