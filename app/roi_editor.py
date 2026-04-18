@@ -931,6 +931,7 @@ class RoiEditorApp:
         errs: list[str] = []
         raw_video = self.video_path_var.get().strip()
         raw_cfg = self.config_path_var.get().strip()
+        cfg_for_run: dict[str, Any] | None = None
         if not raw_video:
             errs.append("未选择视频路径。")
         elif not Path(raw_video).resolve().exists():
@@ -939,6 +940,11 @@ class RoiEditorApp:
             errs.append("未选择配置文件。")
         elif not Path(raw_cfg).resolve().exists():
             errs.append(f"配置不存在：{Path(raw_cfg).resolve()}")
+        else:
+            try:
+                cfg_for_run = load_config(Path(raw_cfg).resolve())
+            except Exception as exc:
+                errs.append(f"配置加载失败：{exc}")
 
         required_rois = ["name_roi", "dialogue_roi", "marker_roi"]
         for key in required_rois:
@@ -953,6 +959,33 @@ class RoiEditorApp:
         self._ensure_output_name_default()
         if not self._sanitize_output_name(self.output_name_var.get()):
             errs.append("输出文件夹名无效。")
+
+        # Only require online translation config when translation is enabled.
+        if not bool(self.skip_translation_var.get()) and cfg_for_run is not None:
+            tr_cfg = cfg_for_run.get("translation", {})
+            if not isinstance(tr_cfg, dict):
+                tr_cfg = {}
+
+            vlm_api = str(tr_cfg.get("vlm_api", "") or "").strip()
+            if not vlm_api:
+                errs.append(
+                    "未勾选“跳过翻译”时必须配置 translation.vlm_api（请在 config/general_config.yaml 中填写）。"
+                )
+
+            api_key_inline = str(tr_cfg.get("api_key", "") or "").strip()
+            api_key_file = str(tr_cfg.get("api_key_file", "") or "").strip()
+            if not api_key_inline and not api_key_file:
+                errs.append(
+                    "未勾选“跳过翻译”时必须配置 translation.api_key 或 translation.api_key_file。"
+                )
+            elif (not api_key_inline) and api_key_file:
+                key_path = Path(api_key_file)
+                if not key_path.is_absolute():
+                    key_path = (ROOT / key_path).resolve()
+                if not key_path.exists() or not key_path.is_file():
+                    errs.append(
+                        f"api_key_file 不存在：{key_path}（请检查 translation.api_key_file）。"
+                    )
         return errs
 
     def _append_run_log(self, text: str) -> None:

@@ -28,31 +28,46 @@ def _parse_scalar(raw: str) -> Any:
 
 
 def _simple_yaml_load(text: str) -> dict[str, Any]:
-    root: dict[str, Any] = {}
-    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
-
+    # Minimal YAML subset parser used when PyYAML is unavailable.
+    # It preserves `key:` as None unless nested mapping lines follow.
+    entries: list[tuple[int, str, str | None]] = []
     for line in text.splitlines():
-        stripped = line.strip()
+        raw = line.rstrip()
+        stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if ":" not in stripped:
             continue
-        indent = len(line) - len(line.lstrip(" "))
+        indent = len(raw) - len(raw.lstrip(" "))
         key, value = stripped.split(":", 1)
-        key = key.strip()
-        value = value.strip()
+        k = key.strip()
+        v = value.strip()
+        entries.append((indent, k, v if v != "" else None))
 
-        while len(stack) > 1 and indent <= stack[-1][0]:
-            stack.pop()
+    def _parse_block(start: int, parent_indent: int) -> tuple[dict[str, Any], int]:
+        out: dict[str, Any] = {}
+        i = start
+        while i < len(entries):
+            indent, key, value = entries[i]
+            if indent <= parent_indent:
+                break
+            if value is not None:
+                out[key] = _parse_scalar(value)
+                i += 1
+                continue
 
-        current = stack[-1][1]
-        if value == "":
-            child: dict[str, Any] = {}
-            current[key] = child
-            stack.append((indent, child))
-        else:
-            current[key] = _parse_scalar(value)
-    return root
+            has_child = (i + 1) < len(entries) and entries[i + 1][0] > indent
+            if has_child:
+                child, next_i = _parse_block(i + 1, indent)
+                out[key] = child
+                i = next_i
+            else:
+                out[key] = None
+                i += 1
+        return out, i
+
+    parsed, _ = _parse_block(0, -1)
+    return parsed
 
 
 def _load_single_config(path: Path) -> dict[str, Any]:

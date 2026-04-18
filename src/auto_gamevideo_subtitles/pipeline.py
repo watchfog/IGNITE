@@ -128,6 +128,17 @@ def _resolve_active_vlm_model(cfg: dict[str, Any]) -> str:
     return active
 
 
+def _require_non_empty_translation_str(tr_cfg: dict[str, Any], key: str) -> str:
+    raw = tr_cfg.get(key, None)
+    value = str(raw or "").strip()
+    if value:
+        return value
+    raise ValueError(
+        f"Invalid config: translation.{key} is empty. "
+        f"Please set translation.{key} in config/general_config.yaml."
+    )
+
+
 def _cleanup_old_work_runs(base_work_dir: Path, keep_latest: int = 3) -> None:
     keep_n = max(1, int(keep_latest))
     if not base_work_dir.exists():
@@ -2362,15 +2373,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _log("Initializing Bailian VLM translator.")
         api_key = str(tr_cfg.get("api_key", "")).strip()
         if not api_key:
-            api_key = load_api_key(tr_cfg["api_key_file"])
-        vlm_api = str(tr_cfg.get("vlm_api", "")).strip()
-        if not vlm_api:
-            vlm_api = str(
-                tr_cfg.get(
-                    "base_url",
-                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                )
-            )
+            api_key_file = _require_non_empty_translation_str(tr_cfg, "api_key_file")
+            api_key = load_api_key(api_key_file)
+        vlm_api = _require_non_empty_translation_str(tr_cfg, "vlm_api")
         vlm_translator = BailianVlmTranslator(
             api_key=api_key,
             model=_resolve_active_vlm_model(cfg),

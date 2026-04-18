@@ -10,10 +10,23 @@ from typing import Any, Callable
 from urllib import error as urlerror
 from urllib import request
 
+
 def load_api_key(path: str | Path) -> str:
-    text = Path(path).read_text(encoding="utf-8").strip()
+    path_str = str(path or "").strip()
+    if not path_str:
+        raise ValueError(
+            "Invalid config: translation.api_key_file is empty. "
+            "Please set translation.api_key_file in config/general_config.yaml."
+        )
+    key_path = Path(path_str)
+    if not key_path.exists() or not key_path.is_file():
+        raise ValueError(
+            f"api key file does not exist: {key_path}. "
+            "Please check translation.api_key_file in config/general_config.yaml."
+        )
+    text = key_path.read_text(encoding="utf-8").strip()
     if not text:
-        raise ValueError(f"api key file is empty: {path}")
+        raise ValueError(f"api key file is empty: {key_path}")
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -24,7 +37,7 @@ def load_api_key(path: str | Path) -> str:
                 return v.strip()
         else:
             return line
-    raise ValueError(f"cannot parse api key from file: {path}")
+    raise ValueError(f"cannot parse api key from file: {key_path}")
 
 
 def _normalize_quotes_for_subtitle(text: str) -> str:
