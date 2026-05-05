@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -46,6 +47,7 @@ ROI_COLORS = {
     "title_translation_location": "#36bf36",
     "title_info_location": "#ff0da6",
 }
+DEFAULT_MARKER_FORCE_THRESHOLD = 0.6
 
 
 def _load_raw_cfg(path: Path) -> dict[str, Any]:
@@ -65,15 +67,16 @@ def _load_raw_cfg(path: Path) -> dict[str, Any]:
 
 
 def _save_raw_cfg(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(_raw_cfg_to_text(data), encoding="utf-8")
+
+
+def _raw_cfg_to_text(data: dict[str, Any]) -> str:
     try:
         import yaml  # type: ignore
 
-        text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
-        path.write_text(text, encoding="utf-8")
-        return
+        return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
     except Exception:
-        pass
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 class RoiEditorApp:
@@ -94,9 +97,10 @@ class RoiEditorApp:
         self.vshift_step_var = tk.StringVar(value="1")
         self.hshift_px_var = tk.StringVar(value="0")
         self.hshift_step_var = tk.StringVar(value="1")
-        self.force_thd_var = tk.StringVar(value="")
+        self.force_thd_var = tk.StringVar(value=str(DEFAULT_MARKER_FORCE_THRESHOLD))
         self.anchor_from_end_var = tk.StringVar(value="3")
         self.blank_ignore_var = tk.StringVar(value="1")
+        self.game_name_var = tk.StringVar(value="")
         self.source_lang_var = tk.StringVar(value="ja")
         self.target_lang_var = tk.StringVar(value="zh-CN")
         self.vlm_models_var = tk.StringVar(value="qwen3.6-plus")
@@ -162,6 +166,8 @@ class RoiEditorApp:
         self.undo_stack: list[dict[str, Any]] = []
         self.redo_stack: list[dict[str, Any]] = []
         self._applying_history = False
+        self._profile_preview_after_id: str | None = None
+        self._updating_profile_preview = False
         
         self._preview_seek_after_id: str | None = None
         self._last_preview_seek_ts = 0.0
@@ -293,6 +299,10 @@ class RoiEditorApp:
         )
         ttk.Label(top, text="目标语言").grid(row=10, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(top, textvariable=self.target_lang_var, width=12).grid(row=10, column=3, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="游戏名称").grid(row=10, column=4, sticky="e", pady=(4, 0))
+        ttk.Entry(top, textvariable=self.game_name_var, width=24).grid(
+            row=10, column=5, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0)
+        )
         ttk.Label(top, text="VLM模型(逗号分隔)").grid(row=11, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(top, textvariable=self.vlm_models_var, width=86).grid(
             row=11, column=1, columnspan=5, sticky="ew", padx=(6, 4), pady=(4, 0)
@@ -348,6 +358,25 @@ class RoiEditorApp:
             var.trace_add("write", lambda *_: self._update_match_score())
         self.vlm_models_var.trace_add("write", lambda *_: self._sync_current_model_from_list())
         self.output_name_var.trace_add("write", lambda *_: self._on_output_name_changed())
+        for var in [
+            self.video_path_var,
+            self.template_paths_var,
+            self.shift_mode_var,
+            self.vshift_px_var,
+            self.vshift_step_var,
+            self.hshift_px_var,
+            self.hshift_step_var,
+            self.force_thd_var,
+            self.anchor_from_end_var,
+            self.blank_ignore_var,
+            self.game_name_var,
+            self.source_lang_var,
+            self.target_lang_var,
+            self.vlm_models_var,
+            self.vlm_model_var,
+            self.output_name_var,
+        ]:
+            var.trace_add("write", lambda *_: self._schedule_profile_preview_refresh())
 
     def _pick_video(self) -> None:
         p = filedialog.askopenfilename(
@@ -403,20 +432,48 @@ class RoiEditorApp:
         return {
             "extends": "general_config.yaml",
             "game": {
-                "name": "",
+                "name": str(self.game_name_var.get().strip()),
                 "source_language": "ja",
                 "target_language": "zh-CN",
             },
             "output_name": "",
             "video_path": "",
             "roi": {},
-            "marker": {
-                "ocr_anchor_from_end_frames": 3,
-            },
+            "marker": self._default_marker_payload(),
             "general": {
                 "blank_ignore_under_frames": 1,
             },
         }
+
+    def _default_marker_payload(self) -> dict[str, Any]:
+        return {
+            "ocr_anchor_from_end_frames": 3,
+            "shift_mode": "vertical",
+            "vertical_shift_px": 6,
+            "vertical_shift_step": 1,
+            "horizontal_shift_px": 0,
+            "horizontal_shift_step": 1,
+            "force_threshold": DEFAULT_MARKER_FORCE_THRESHOLD,
+        }
+
+    def _selected_video_cfg_path(self) -> str:
+        raw_video = self.video_path_var.get().strip()
+        if not raw_video:
+            return ""
+        return self._to_cfg_path(Path(raw_video).resolve())
+
+    def _apply_selected_video_to_payload(self, payload: dict[str, Any]) -> None:
+        raw_video = self.video_path_var.get().strip()
+        video_cfg = self._selected_video_cfg_path()
+        if video_cfg:
+            payload["video_path"] = video_cfg
+        if raw_video:
+            output_name = self._sanitize_output_name(Path(raw_video).stem)
+            if output_name:
+                payload["output_name"] = output_name
+
+    def _remove_imported_marker_config(self, payload: dict[str, Any]) -> None:
+        payload["marker"] = self._default_marker_payload()
 
     def _create_new_profile(self) -> None:
         default_dir = (ROOT / "config").resolve()
@@ -433,10 +490,7 @@ class RoiEditorApp:
 
         out = Path(save_path).resolve()
         payload = self._empty_profile_payload()
-
-        raw_video = self.video_path_var.get().strip()
-        if raw_video:
-            payload["video_path"] = self._to_cfg_path(Path(raw_video).resolve())
+        self._apply_selected_video_to_payload(payload)
 
         _save_raw_cfg(out, payload)
         self.config_path_var.set(str(out.as_posix()))
@@ -470,9 +524,8 @@ class RoiEditorApp:
         if not save_path:
             return
 
-        raw_video = self.video_path_var.get().strip()
-        if raw_video:
-            payload["video_path"] = self._to_cfg_path(Path(raw_video).resolve())
+        self._apply_selected_video_to_payload(payload)
+        self._remove_imported_marker_config(payload)
 
         out = Path(save_path).resolve()
         _save_raw_cfg(out, payload)
@@ -494,8 +547,36 @@ class RoiEditorApp:
         except Exception as exc:
             self.status_var.set(f"读取配置失败: {exc}")
             return
-        self.profile_text.delete("1.0", tk.END)
-        self.profile_text.insert("1.0", text)
+        self._set_profile_preview_text(text)
+
+    def _set_profile_preview_text(self, text: str) -> None:
+        self._updating_profile_preview = True
+        try:
+            yview = self.profile_text.yview()
+            self.profile_text.delete("1.0", tk.END)
+            self.profile_text.insert("1.0", text)
+            if yview:
+                self.profile_text.yview_moveto(yview[0])
+        finally:
+            self._updating_profile_preview = False
+
+    def _schedule_profile_preview_refresh(self) -> None:
+        if self._updating_profile_preview:
+            return
+        if self._profile_preview_after_id is not None:
+            try:
+                self.root.after_cancel(self._profile_preview_after_id)
+            except Exception:
+                pass
+        self._profile_preview_after_id = self.root.after_idle(self._refresh_profile_preview_from_state)
+
+    def _refresh_profile_preview_from_state(self) -> None:
+        self._profile_preview_after_id = None
+        try:
+            payload = self._current_profile_payload()
+            self._set_profile_preview_text(_raw_cfg_to_text(payload))
+        except Exception as exc:
+            self.status_var.set(f"刷新 YAML 预览失败: {exc}")
 
     def _save_profile_text_to_file(self) -> None:
         raw_cfg = self.config_path_var.get().strip()
@@ -579,8 +660,8 @@ class RoiEditorApp:
         self.hshift_px_var.set(str(int(marker_cfg.get("horizontal_shift_px", 0))))
         self.hshift_step_var.set(str(int(marker_cfg.get("horizontal_shift_step", 1))))
         self.template_center_width = int(marker_cfg.get("template_center_width")) if marker_cfg.get("template_center_width") is not None else None
-        force_thd = marker_cfg.get("force_threshold", None)
-        self.force_thd_var.set("" if force_thd is None else str(force_thd))
+        force_thd = marker_cfg.get("force_threshold", DEFAULT_MARKER_FORCE_THRESHOLD)
+        self.force_thd_var.set(str(force_thd))
         self.anchor_from_end_var.set(
             str(max(1, self._int_or_default(str(marker_cfg.get("ocr_anchor_from_end_frames", 3)), 3)))
         )
@@ -589,6 +670,7 @@ class RoiEditorApp:
             str(max(0, self._int_or_default(str(general_cfg.get("blank_ignore_under_frames", 1)), 1)))
         )
         game_cfg = self.cfg_merged.get("game", {})
+        self.game_name_var.set(str(game_cfg.get("name", "")))
         self.source_lang_var.set(str(game_cfg.get("source_language", "ja")))
         self.target_lang_var.set(str(game_cfg.get("target_language", "zh-CN")))
         tr_cfg = self.cfg_merged.get("translation", {})
@@ -1712,6 +1794,7 @@ class RoiEditorApp:
         crop = self.frame_rgb_full[y0:y1, x0:x1].copy()
         profile_name = re.sub(r'[<>:"/\\\\|?*]+', "_", cfg_path.stem.strip()) or "default_profile"
         default_dir = (ROOT / "config" / profile_name).resolve()
+        created_default_dir = not default_dir.exists()
         default_dir.mkdir(parents=True, exist_ok=True)
         default_name = f"marker_template_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
 
@@ -1723,10 +1806,14 @@ class RoiEditorApp:
             filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg"), ("所有文件", "*.*")],
         )
         if not save_path:
+            self._remove_empty_created_dir(default_dir, created_default_dir)
             return
         out = Path(save_path).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+        if not cv2.imwrite(str(out), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)):
+            self._remove_empty_created_dir(default_dir, created_default_dir)
+            self.status_var.set(f"模板保存失败: {out}")
+            return
         paths = self._parse_template_paths()
         rel = self._to_cfg_path(out)
         if rel not in paths:
@@ -1734,6 +1821,15 @@ class RoiEditorApp:
             self.template_paths_var.set(";".join(paths))
             self._record_history()
         self.status_var.set(f"模板已保存: {out}")
+
+    def _remove_empty_created_dir(self, path: Path, was_created: bool) -> None:
+        if not was_created:
+            return
+        try:
+            if path.exists() and path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+        except Exception:
+            pass
 
     def _snapshot_state(self) -> dict[str, Any]:
         return {
@@ -1759,9 +1855,10 @@ class RoiEditorApp:
             self.vshift_step_var.set(str(st.get("vshift_step", "1")))
             self.hshift_px_var.set(str(st.get("hshift_px", "0")))
             self.hshift_step_var.set(str(st.get("hshift_step", "1")))
-            self.force_thd_var.set(str(st.get("force_thd", "")))
+            self.force_thd_var.set(str(st.get("force_thd", DEFAULT_MARKER_FORCE_THRESHOLD)))
             self._refresh_canvas()
             self._update_match_score()
+            self._schedule_profile_preview_refresh()
         finally:
             self._applying_history = False
 
@@ -1777,6 +1874,7 @@ class RoiEditorApp:
             return
         self.undo_stack.append(cur)
         self.redo_stack = []
+        self._schedule_profile_preview_refresh()
 
     def _undo(self) -> None:
         if len(self.undo_stack) <= 1:
@@ -1915,37 +2013,50 @@ class RoiEditorApp:
             self.canvas.create_rectangle(x1, y1, x2, y2, fill="#000000", outline="#4c9aff", width=1)
             self.canvas.create_text(x1 + 14, y1 + 9, text=tip, anchor="nw", fill="#ffffff", font=("Segoe UI", 10, "bold"))
 
-    def _save_config(self) -> bool:
+    def _current_profile_payload(self) -> dict[str, Any]:
         raw_cfg = self.config_path_var.get().strip()
-        if not raw_cfg:
-            self.status_var.set("未选择配置，请先选择或新建 profile。")
-            return False
-        cfg_path = Path(raw_cfg).resolve()
-        if not cfg_path.exists():
-            self.status_var.set(f"配置不存在: {cfg_path.as_posix()}")
-            return False
-        if not self.cfg_raw:
-            self.cfg_raw = _load_raw_cfg(cfg_path)
+        if self.cfg_raw:
+            data = copy.deepcopy(self.cfg_raw)
+        elif raw_cfg and Path(raw_cfg).resolve().exists():
+            data = _load_raw_cfg(Path(raw_cfg).resolve())
+        else:
+            data = self._empty_profile_payload()
+        if not isinstance(data, dict):
+            data = {}
+        self._apply_current_state_to_payload(data)
+        return data
+
+    def _apply_current_state_to_payload(self, data: dict[str, Any]) -> None:
         raw_video = self.video_path_var.get().strip()
         if raw_video:
-            self.cfg_raw["video_path"] = self._to_cfg_path(Path(raw_video).resolve())
+            data["video_path"] = self._to_cfg_path(Path(raw_video).resolve())
         else:
-            self.cfg_raw.pop("video_path", None)
-        self.cfg_raw.setdefault("roi", {})
-        # Drop legacy keys when saving to keep profile concise.
-        self.cfg_raw["roi"].pop("subtitle_roi", None)
-        self.cfg_raw["roi"].pop("title_text_roi", None)
-        self.cfg_raw["roi"].pop("title_info_roi", None)
-        self.cfg_raw["roi"].pop("title_subtitle_roi", None)
-        self.cfg_raw["roi"].pop("title_speaker_roi", None)
-        self.cfg_raw["roi"].pop("title_roi", None)
-        for k, rect in self.rois.items():
-            self.cfg_raw["roi"][k] = [int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])]
-        if self.video_w > 0 and self.video_h > 0:
-            self.cfg_raw["roi"]["resolution_base"] = [int(self.video_w), int(self.video_h)]
+            data.pop("video_path", None)
 
-        self.cfg_raw.setdefault("marker", {})
-        marker = self.cfg_raw["marker"]
+        data.setdefault("roi", {})
+        roi = data["roi"]
+        if not isinstance(roi, dict):
+            roi = {}
+            data["roi"] = roi
+        for key in [
+            "subtitle_roi",
+            "title_text_roi",
+            "title_info_roi",
+            "title_subtitle_roi",
+            "title_speaker_roi",
+            "title_roi",
+        ]:
+            roi.pop(key, None)
+        for k, rect in self.rois.items():
+            roi[k] = [int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])]
+        if self.video_w > 0 and self.video_h > 0:
+            roi["resolution_base"] = [int(self.video_w), int(self.video_h)]
+
+        data.setdefault("marker", {})
+        marker = data["marker"]
+        if not isinstance(marker, dict):
+            marker = {}
+            data["marker"] = marker
         tpl_paths = self._parse_template_paths()
         if tpl_paths:
             marker["template_paths"] = tpl_paths
@@ -1965,27 +2076,40 @@ class RoiEditorApp:
         else:
             marker["force_threshold"] = force_thd
 
-        self.cfg_raw.setdefault("general", {})
-        self.cfg_raw["general"]["blank_ignore_under_frames"] = max(
-            0, self._int_or_default(self.blank_ignore_var.get(), 1)
-        )
+        data.setdefault("general", {})
+        if not isinstance(data["general"], dict):
+            data["general"] = {}
+        data["general"]["blank_ignore_under_frames"] = max(0, self._int_or_default(self.blank_ignore_var.get(), 1))
 
-        self.cfg_raw.setdefault("game", {})
-        self.cfg_raw["game"]["source_language"] = str(self.source_lang_var.get().strip() or "ja")
-        self.cfg_raw["game"]["target_language"] = str(self.target_lang_var.get().strip() or "zh-CN")
-        self.cfg_raw["output_name"] = self._sanitize_output_name(self.output_name_var.get())
+        data.setdefault("game", {})
+        if not isinstance(data["game"], dict):
+            data["game"] = {}
+        data["game"]["name"] = str(self.game_name_var.get().strip())
+        data["game"]["source_language"] = str(self.source_lang_var.get().strip() or "ja")
+        data["game"]["target_language"] = str(self.target_lang_var.get().strip() or "zh-CN")
+        data["output_name"] = self._sanitize_output_name(self.output_name_var.get())
 
-        self.cfg_raw.setdefault("translation", {})
+        data.setdefault("translation", {})
+        if not isinstance(data["translation"], dict):
+            data["translation"] = {}
         model_list = self._parse_model_list(self.vlm_models_var.get())
-        self.cfg_raw["translation"]["vlm_models"] = model_list if model_list else ["qwen3.6-plus"]
+        data["translation"]["vlm_models"] = model_list if model_list else ["qwen3.6-plus"]
         self._sync_current_model_from_list()
-        self.cfg_raw["translation"]["model"] = str(
-            self.vlm_model_var.get().strip() or self.cfg_raw["translation"]["vlm_models"][0]
-        )
+        data["translation"]["model"] = str(self.vlm_model_var.get().strip() or data["translation"]["vlm_models"][0])
 
+    def _save_config(self) -> bool:
+        raw_cfg = self.config_path_var.get().strip()
+        if not raw_cfg:
+            self.status_var.set("未选择配置，请先选择或新建 profile。")
+            return False
+        cfg_path = Path(raw_cfg).resolve()
+        if not cfg_path.exists():
+            self.status_var.set(f"配置不存在: {cfg_path.as_posix()}")
+            return False
+        self.cfg_raw = self._current_profile_payload()
         _save_raw_cfg(cfg_path, self.cfg_raw)
         self.status_var.set(f"配置已保存: {cfg_path.as_posix()}")
-        self._load_profile_text_from_file()
+        self._set_profile_preview_text(_raw_cfg_to_text(self.cfg_raw))
         return True
 
     def _run_pipeline_from_gui(self) -> None:

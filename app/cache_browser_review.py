@@ -4,6 +4,7 @@ import argparse
 from collections import OrderedDict
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import cv2
 import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +61,14 @@ class CacheReviewApp:
         self.title_end_var = tk.StringVar(value="2.00")
         self.title_info_var = tk.StringVar(value="")
         self.review_web_search_var = tk.BooleanVar(value=False)
+        self.embed_ffmpeg_path_var = tk.StringVar(value="")
+        self.embed_output_path_var = tk.StringVar(value="")
+        self.embed_vcodec_var = tk.StringVar(value="libx264")
+        self.embed_crf_var = tk.StringVar(value="18")
+        self.embed_preset_var = tk.StringVar(value="medium")
+        self.embed_acodec_var = tk.StringVar(value="copy")
+        self.embed_extra_input_args_var = tk.StringVar(value="")
+        self.embed_extra_output_args_var = tk.StringVar(value="")
 
         self.entries: list[dict[str, Any]] = []
         self.cache_payload: dict[str, Any] = {}
@@ -161,6 +170,11 @@ class CacheReviewApp:
             text="生成字幕（当前Cache）",
             command=self._generate_subtitles_from_cache,
         ).pack(side=tk.RIGHT, padx=(12, 2))
+        ttk.Button(
+            nav,
+            text="生成内嵌字幕视频",
+            command=self._open_embed_subtitles_dialog,
+        ).pack(side=tk.RIGHT, padx=2)
 
         title_bar = ttk.Frame(top)
         title_bar.grid(row=4, column=0, columnspan=10, sticky="ew", pady=(6, 0))
@@ -174,6 +188,11 @@ class CacheReviewApp:
             title_bar,
             text="插入/更新Title(title_ocr_roi+VLM)",
             command=self._insert_title_segment_from_roi,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            title_bar,
+            text="从Cache读取Title",
+            command=lambda: self._load_title_fields_from_cache(show_status=True),
         ).pack(side=tk.LEFT, padx=2)
 
         ttk.Label(top, textvariable=self.seg_info_var, foreground="#1f5f99").grid(row=5, column=0, columnspan=10, sticky="w", pady=(6, 0))
@@ -319,12 +338,13 @@ class CacheReviewApp:
         }
         return out
 
-    def _run_bg(self, title: str, fn: Callable[[], None]) -> None:
+    def _run_bg(self, title: str, fn: Callable[[], None], *, show_review_progress: bool = False) -> None:
         if self._busy:
             self.status_var.set("任务执行中，请稍候")
             return
         self._busy = True
-        self.review_meta_var.set(self._usage_to_meta(None, running=True))
+        if show_review_progress:
+            self.review_meta_var.set(self._usage_to_meta(None, running=True))
 
         def _runner() -> None:
             try:
@@ -457,10 +477,43 @@ class CacheReviewApp:
         except Exception:
             return None
 
+    def _find_title_entry(self) -> dict[str, Any] | None:
+        for e in self.entries:
+            if self._seg_numeric_id(e) == 0:
+                return e
+        for e in self.entries:
+            if str(e.get("dialogue_type", "")).strip().lower() == "title":
+                return e
+        return None
+
+    def _load_title_fields_from_cache(self, *, show_status: bool = False) -> bool:
+        title = self._find_title_entry()
+        if title is None:
+            if show_status:
+                self.status_var.set("未找到 segment_id=0 的标题段")
+            return False
+        try:
+            st = float(title.get("time_start", 0.0) or 0.0)
+        except Exception:
+            st = 0.0
+        try:
+            ed = float(title.get("time_end", st) or st)
+        except Exception:
+            ed = st
+        self.title_start_var.set(f"{max(0.0, st):.2f}")
+        self.title_end_var.set(f"{max(0.0, ed):.2f}")
+        self.title_info_var.set(str(title.get("speaker", "") or ""))
+        if show_status:
+            self.status_var.set("已从 cache 的标题段读取标题时间和翻译信息")
+        return True
+
     def _init_title_time_defaults(self) -> None:
         if not self.entries:
             self.title_start_var.set("0.00")
             self.title_end_var.set("2.00")
+            self.title_info_var.set("")
+            return
+        if self._load_title_fields_from_cache(show_status=False):
             return
         seg1_candidates: list[tuple[float, dict[str, Any]]] = []
         non_title: list[tuple[float, dict[str, Any]]] = []
@@ -605,29 +658,148 @@ class CacheReviewApp:
             str(cache_path),
         ]
 
+    def _generate_subtitles_for_current_cache(self) -> Path:
+        self._save_current_entry()
+        self._save_cache_file()
+
+        cache_path = self.cache_path.resolve()
+        if not cache_path.exists():
+            raise RuntimeError(f"cache不存在: {cache_path}")
+        output_dir = self._resolve_output_dir_from_cache(cache_path)
+
+        video_path = Path(self.video_var.get().strip()).resolve()
+        if not video_path.exists():
+            raise RuntimeError(f"视频不存在: {video_path}")
+        config_path = Path(self.config_var.get().strip()).resolve()
+        if not config_path.exists():
+            raise RuntimeError(f"配置不存在: {config_path}")
+
+        cmd = self._build_subtitle_command(
+            cache_path=cache_path,
+            video_path=video_path,
+            config_path=config_path,
+            output_dir=output_dir,
+        )
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stdout or "").splitlines()[-30:])
+            raise RuntimeError(f"生成字幕失败(退出码={proc.returncode})\n{tail}")
+        return output_dir
+
     def _generate_subtitles_from_cache(self) -> None:
         def _job() -> None:
-            self._save_current_entry()
-            self._save_cache_file()
+            output_dir = self._generate_subtitles_for_current_cache()
+            self._set_status_threadsafe(f"字幕已生成: {output_dir}")
 
-            cache_path = self.cache_path.resolve()
-            if not cache_path.exists():
-                raise RuntimeError(f"cache不存在: {cache_path}")
-            output_dir = self._resolve_output_dir_from_cache(cache_path)
+        self._run_bg("生成字幕", _job)
 
+    def _default_embed_output_path(self) -> Path:
+        raw_video = self.video_var.get().strip()
+        stem = Path(raw_video).stem if raw_video else "video"
+        safe_stem = re.sub(r'[<>:"/\\\\|?*]+', "_", stem).strip("._ ") or "video"
+        return (ROOT / "outputs" / safe_stem / f"{safe_stem}_subtitled.mp4").resolve()
+
+    def _refresh_embed_defaults(self) -> None:
+        if not self.embed_ffmpeg_path_var.get().strip():
+            self.embed_ffmpeg_path_var.set(str(self.ffmpeg_path))
+        self.embed_output_path_var.set(str(self._default_embed_output_path()))
+
+    def _open_embed_subtitles_dialog(self) -> None:
+        self._refresh_embed_defaults()
+        win = tk.Toplevel(self.root)
+        win.title("生成内嵌字幕视频")
+        win.geometry("880x340")
+        win.transient(self.root)
+
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+
+        def _row(idx: int, label: str, var: tk.StringVar, browse: Callable[[], None] | None = None) -> None:
+            ttk.Label(body, text=label).grid(row=idx, column=0, sticky="w", pady=4)
+            ttk.Entry(body, textvariable=var).grid(row=idx, column=1, sticky="ew", padx=(8, 4), pady=4)
+            if browse is not None:
+                ttk.Button(body, text="浏览", command=browse).grid(row=idx, column=2, sticky="ew", pady=4)
+
+        def _browse_ffmpeg() -> None:
+            p = filedialog.askopenfilename(
+                title="选择 ffmpeg",
+                initialdir=str(self.ffmpeg_path.parent if self.ffmpeg_path else ROOT),
+                filetypes=[("ffmpeg", "*.exe"), ("所有文件", "*.*")],
+                parent=win,
+            )
+            if p:
+                self.embed_ffmpeg_path_var.set(str(Path(p).resolve()))
+
+        def _browse_output() -> None:
+            cur = Path(self.embed_output_path_var.get().strip() or self._default_embed_output_path())
+            p = filedialog.asksaveasfilename(
+                title="保存内嵌字幕视频",
+                initialdir=str(cur.parent),
+                initialfile=cur.name,
+                defaultextension=".mp4",
+                filetypes=[("MP4", "*.mp4"), ("所有文件", "*.*")],
+                parent=win,
+            )
+            if p:
+                self.embed_output_path_var.set(str(Path(p).resolve()))
+
+        _row(0, "ffmpeg", self.embed_ffmpeg_path_var, _browse_ffmpeg)
+        _row(1, "输出视频", self.embed_output_path_var, _browse_output)
+        _row(2, "视频编码(-c:v)", self.embed_vcodec_var)
+        _row(3, "CRF", self.embed_crf_var)
+        _row(4, "Preset", self.embed_preset_var)
+        _row(5, "音频编码(-c:a)", self.embed_acodec_var)
+        _row(6, "额外输入参数", self.embed_extra_input_args_var)
+        _row(7, "额外输出参数", self.embed_extra_output_args_var)
+
+        btns = ttk.Frame(body)
+        btns.grid(row=8, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="重置默认值", command=self._reset_embed_defaults).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="生成", command=lambda: self._start_embed_subtitled_video(win)).pack(side=tk.LEFT, padx=4)
+
+    def _reset_embed_defaults(self) -> None:
+        self.embed_ffmpeg_path_var.set(str(self.ffmpeg_path))
+        self.embed_output_path_var.set(str(self._default_embed_output_path()))
+        self.embed_vcodec_var.set("libx264")
+        self.embed_crf_var.set("18")
+        self.embed_preset_var.set("medium")
+        self.embed_acodec_var.set("copy")
+        self.embed_extra_input_args_var.set("")
+        self.embed_extra_output_args_var.set("")
+
+    def _start_embed_subtitled_video(self, win: tk.Toplevel) -> None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+        def _job() -> None:
+            output_dir = self._generate_subtitles_for_current_cache()
+            ass_path = output_dir / "subtitles.ass"
+            if not ass_path.exists():
+                raise RuntimeError(f"字幕文件不存在: {ass_path}")
             video_path = Path(self.video_var.get().strip()).resolve()
             if not video_path.exists():
                 raise RuntimeError(f"视频不存在: {video_path}")
-            config_path = Path(self.config_var.get().strip()).resolve()
-            if not config_path.exists():
-                raise RuntimeError(f"配置不存在: {config_path}")
-
-            cmd = self._build_subtitle_command(
-                cache_path=cache_path,
+            out_path = Path(self.embed_output_path_var.get().strip() or self._default_embed_output_path()).resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            cmd = self._build_embed_subtitled_video_cmd(
                 video_path=video_path,
-                config_path=config_path,
-                output_dir=output_dir,
+                ass_path=ass_path.resolve(),
+                output_path=out_path,
             )
+            self._set_status_threadsafe(f"开始生成内嵌字幕视频: {out_path}")
             proc = subprocess.run(
                 cmd,
                 cwd=str(ROOT),
@@ -639,11 +811,42 @@ class CacheReviewApp:
                 check=False,
             )
             if proc.returncode != 0:
-                tail = "\n".join((proc.stdout or "").splitlines()[-30:])
-                raise RuntimeError(f"生成字幕失败(退出码={proc.returncode})\n{tail}")
-            self._set_status_threadsafe(f"字幕已生成: {output_dir}")
+                tail = "\n".join((proc.stdout or "").splitlines()[-40:])
+                raise RuntimeError(f"ffmpeg生成失败(退出码={proc.returncode})\n{tail}")
+            self._set_status_threadsafe(f"内嵌字幕视频已生成: {out_path}")
 
-        self._run_bg("生成字幕", _job)
+        self._run_bg("生成内嵌字幕视频", _job)
+
+    def _split_custom_ffmpeg_args(self, text: str) -> list[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        return shlex.split(raw, posix=False)
+
+    def _ass_filter_path(self, ass_path: Path) -> str:
+        try:
+            rel = ass_path.resolve().relative_to(ROOT)
+            p = f"./{rel.as_posix()}"
+        except Exception:
+            p = ass_path.resolve().as_posix()
+        p = p.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+        return f"ass='{p}'"
+
+    def _build_embed_subtitled_video_cmd(self, video_path: Path, ass_path: Path, output_path: Path) -> list[str]:
+        ffmpeg = Path(self.embed_ffmpeg_path_var.get().strip() or self.ffmpeg_path).resolve()
+        if not ffmpeg.exists():
+            raise RuntimeError(f"ffmpeg不存在: {ffmpeg}")
+        vcodec = self.embed_vcodec_var.get().strip() or "libx264"
+        crf = self.embed_crf_var.get().strip() or "18"
+        preset = self.embed_preset_var.get().strip() or "medium"
+        acodec = self.embed_acodec_var.get().strip() or "copy"
+        cmd = [str(ffmpeg), "-y"]
+        cmd.extend(self._split_custom_ffmpeg_args(self.embed_extra_input_args_var.get()))
+        cmd.extend(["-i", str(video_path), "-vf", self._ass_filter_path(ass_path)])
+        cmd.extend(["-c:v", vcodec, "-crf", crf, "-preset", preset, "-c:a", acodec])
+        cmd.extend(self._split_custom_ffmpeg_args(self.embed_extra_output_args_var.get()))
+        cmd.append(str(output_path))
+        return cmd
 
     def _parse_time_input(self, text: str) -> float:
         s = str(text or "").strip()
@@ -760,7 +963,7 @@ class CacheReviewApp:
                 ),
             )
 
-        self._run_bg("Title段插入", _job)
+        self._run_bg("Title段插入", _job, show_review_progress=True)
 
     def _entry_times(self, idx: int) -> tuple[float, float]:
         e = self.entries[idx]
@@ -1564,7 +1767,7 @@ class CacheReviewApp:
             self.last_review_result = result
             self.root.after(0, lambda: self._show_review_result(result, usage, "截图复译完成"))
 
-        self._run_bg("截图复译", _job)
+        self._run_bg("截图复译", _job, show_review_progress=True)
 
     def _review_by_text_only(self) -> None:
         def _job() -> None:
@@ -1590,7 +1793,7 @@ class CacheReviewApp:
             self.last_review_result = result
             self.root.after(0, lambda: self._show_review_result(result, usage, "原文重译完成"))
 
-        self._run_bg("原文重译", _job)
+        self._run_bg("原文重译", _job, show_review_progress=True)
 
     def _read_current_json_from_editor(self) -> dict[str, Any]:
         content = self.json_text.get("1.0", tk.END).strip()

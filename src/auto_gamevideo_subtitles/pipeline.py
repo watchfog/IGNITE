@@ -64,23 +64,48 @@ def _vlm_translate_task(
     speaker: str,
     history_items: list[dict[str, str]] | None = None,
 ) -> tuple[str, str, str, dict[str, int]]:
-    _log(f"[VLM] segment {seg_id}: request started")
-    speaker_name, original_text, translated_text, usage = translator.translate_image_ja_to_zh_cn_structured_with_tag(
-        image_path=image_path,
-        speaker_image_path=speaker_image_path,
-        speaker=speaker,
-        request_tag=f"segment {seg_id}",
-        history_items=history_items,
-    )
-    pt = int(usage.get("prompt_tokens", 0))
-    ct = int(usage.get("completion_tokens", 0))
-    tt = int(usage.get("total_tokens", pt + ct))
-    _log(
-        f"[VLM] segment {seg_id}: request succeeded "
-        f"(orig_chars={len(original_text)}, trans_chars={len(translated_text)}, "
-        f"tokens_in={pt}, tokens_out={ct}, tokens_total={tt})"
-    )
-    return speaker_name, original_text, translated_text, usage
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    attempts = max(1, int(getattr(translator, "max_retries", 0)) + 1)
+    last_err: ValueError | None = None
+    for attempt in range(1, attempts + 1):
+        _log(f"[VLM] segment {seg_id}: request started (attempt {attempt}/{attempts})")
+        try:
+            speaker_name, original_text, translated_text, usage = (
+                translator.translate_image_ja_to_zh_cn_structured_with_tag(
+                    image_path=image_path,
+                    speaker_image_path=speaker_image_path,
+                    speaker=speaker,
+                    request_tag=f"segment {seg_id}",
+                    history_items=history_items,
+                )
+            )
+            pt = _safe_int(usage.get("prompt_tokens", 0))
+            ct = _safe_int(usage.get("completion_tokens", 0))
+            tt = _safe_int(usage.get("total_tokens", pt + ct), pt + ct)
+            _log(
+                f"[VLM] segment {seg_id}: request succeeded "
+                f"(orig_chars={len(original_text)}, trans_chars={len(translated_text)}, "
+                f"tokens_in={pt}, tokens_out={ct}, tokens_total={tt})"
+            )
+            return speaker_name, original_text, translated_text, usage
+        except ValueError as exc:
+            last_err = exc
+            detail = str(exc).strip() or repr(exc)
+            if attempt >= attempts:
+                break
+            _log(
+                f"[VLM] segment {seg_id}: ValueError on attempt {attempt}/{attempts}: "
+                f"{detail}; retrying"
+            )
+            time.sleep(max(0.0, float(getattr(translator, "retry_delay_sec", 0.0))))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("VLM request failed without an exception")
 
 
 def _roi_from_cfg(cfg: dict[str, Any], key: str) -> Roi:
@@ -2724,9 +2749,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     seg.translation_subtitle = debug_text
                     seg.review_reason.append(f"vlm_translation_error:{exc.__class__.__name__}")
                     seg.needs_review = True
+                    detail = str(exc).strip() or repr(exc)
                     _log(
                         f"[VLM] segment {seg.segment_id}: request failed ({exc.__class__.__name__}), "
-                        "fallback to debug text"
+                        f"{detail}; fallback to debug text"
                     )
                 if seg.translation_subtitle and seg.translation_subtitle != debug_text:
                     history_records.append(
@@ -2781,9 +2807,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 seg.translation_subtitle = dbg
                 seg.review_reason.append(f"vlm_translation_error:{exc.__class__.__name__}")
                 seg.needs_review = True
+                detail = str(exc).strip() or repr(exc)
                 _log(
                     f"[VLM] segment {seg.segment_id}: request failed ({exc.__class__.__name__}), "
-                    "fallback to debug text"
+                    f"{detail}; fallback to debug text"
                 )
         _log("All VLM tasks finished.")
     if cache_hit_count > 0:
