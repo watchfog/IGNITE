@@ -11,6 +11,29 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
+def _parse_optional_float(value: object) -> float | None:
+    if value in (None, "", "N/A"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_frame_rate(value: object) -> float | None:
+    if not isinstance(value, str) or value in ("", "N/A", "0/0"):
+        return None
+    if "/" in value:
+        num_text, den_text = value.split("/", 1)
+        fps_num = _parse_optional_float(num_text)
+        fps_den = _parse_optional_float(den_text)
+        if fps_num is None or fps_den in (None, 0.0):
+            return None
+        return fps_num / fps_den
+    fps = _parse_optional_float(value)
+    return fps if fps not in (None, 0.0) else None
+
+
 def extract_frame_to_memory(
     ffmpeg_path: str | Path,
     video_path: str | Path,
@@ -44,20 +67,32 @@ def ffprobe_video(ffprobe_path: str | Path, video_path: str | Path) -> VideoMeta
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,r_frame_rate,duration",
+        "stream=width,height,r_frame_rate,avg_frame_rate,duration:format=duration",
         "-of",
         "json",
         str(video_path),
     ]
     out = _run(cmd).stdout
-    data = json.loads(out)["streams"][0]
-    fps_num, fps_den = data["r_frame_rate"].split("/")
-    fps = float(fps_num) / float(fps_den)
+    probe = json.loads(out)
+    streams = probe.get("streams") or []
+    if not streams:
+        raise ValueError(f"No video stream found in {video_path}")
+    data = streams[0]
+    fps = _parse_frame_rate(data.get("r_frame_rate")) or _parse_frame_rate(
+        data.get("avg_frame_rate")
+    )
+    if fps is None:
+        raise ValueError(f"Could not determine video FPS for {video_path}")
+    duration = _parse_optional_float(data.get("duration")) or _parse_optional_float(
+        (probe.get("format") or {}).get("duration")
+    )
+    if duration is None:
+        raise ValueError(f"Could not determine video duration for {video_path}")
     return VideoMeta(
         width=int(data["width"]),
         height=int(data["height"]),
         fps=fps,
-        duration=float(data["duration"]),
+        duration=duration,
     )
 
 

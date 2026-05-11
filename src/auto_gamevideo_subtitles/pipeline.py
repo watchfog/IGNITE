@@ -21,6 +21,7 @@ from .event_detect import (
     FrameMetric,
     MarkerTemplateMatcher,
     extract_text_features,
+    extract_text_mask_stats,
     frame_text_change_score,
     load_gray,
 )
@@ -63,6 +64,7 @@ def _vlm_translate_task(
     image_path: Path,
     speaker: str,
     history_items: list[dict[str, str]] | None = None,
+    extra_requirements: str = "",
 ) -> tuple[str, str, str, dict[str, int]]:
     def _safe_int(value: Any, default: int = 0) -> int:
         try:
@@ -82,6 +84,7 @@ def _vlm_translate_task(
                     speaker=speaker,
                     request_tag=f"segment {seg_id}",
                     history_items=history_items,
+                    extra_requirements=extra_requirements,
                 )
             )
             pt = _safe_int(usage.get("prompt_tokens", 0))
@@ -822,7 +825,43 @@ def _subtitle_cache_key(segment_id: int, time_start: float, time_end: float, dia
     return f"id={int(segment_id)}|{st}-{ed}|{dialogue_type}"
 
 
-def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+def _translation_cache_review_reasons(
+    dialogue_type: str,
+    translation_subtitle: Any,
+    debug_subtitle: Any,
+) -> list[str]:
+    dt = str(dialogue_type or "").strip().lower()
+    if dt in {"blank_no_name", "blank"}:
+        return []
+    text = _normalize_quotes_for_subtitle(str(translation_subtitle or "").strip())
+    debug = str(debug_subtitle or "").strip()
+    if not text:
+        return ["translation_missing"]
+    if debug and text == debug:
+        return ["translation_fallback_debug_text"]
+    if text.startswith("[DEBUG]"):
+        return ["translation_fallback_debug_text"]
+    return []
+
+
+def _cache_entry_with_review_metadata(entry: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(entry)
+    reasons = _merge_review_reasons(
+        out.get("review_reason"),
+        out.get("review_reasons"),
+        _translation_cache_review_reasons(
+            str(out.get("dialogue_type", "") or ""),
+            out.get("translation_subtitle", ""),
+            out.get("debug_subtitle", ""),
+        ),
+    )
+    if bool(out.get("needs_review", False)) or reasons:
+        out["needs_review"] = True
+        out["review_reason"] = reasons
+    return out
+
+
+def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if not path.exists():
         return {}, {}
     try:
@@ -830,8 +869,8 @@ def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, str]], dict
     except Exception:
         return {}, {}
     entries = raw.get("entries", []) if isinstance(raw, dict) else []
-    by_full_key: dict[str, dict[str, str]] = {}
-    by_time_type: dict[str, dict[str, str]] = {}
+    by_full_key: dict[str, dict[str, Any]] = {}
+    by_time_type: dict[str, dict[str, Any]] = {}
     for e in entries:
         if not isinstance(e, dict):
             continue
@@ -843,12 +882,18 @@ def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, str]], dict
         ts = float(e.get("time_start", 0.0) or 0.0)
         te = float(e.get("time_end", 0.0) or 0.0)
         dt = str(e.get("dialogue_type", "") or "")
+        dbg = str(e.get("debug_subtitle", "") or "")
         k1 = _subtitle_cache_key(sid, ts, te, dt)
         k2 = _subtitle_cache_key(0, ts, te, dt)
         payload = {
             "speaker": str(e.get("speaker", "") or ""),
             "text_original": original,
             "translation_subtitle": text,
+            "needs_review": bool(e.get("needs_review", False)),
+            "review_reason": _merge_review_reasons(
+                e.get("review_reason"),
+                _translation_cache_review_reasons(dt, text, dbg),
+            ),
         }
         by_full_key[k1] = payload
         by_time_type[k2] = payload
@@ -865,22 +910,28 @@ def _dump_translation_cache(
 ) -> None:
     entries: list[dict[str, Any]] = []
     if prefix_entries:
-        entries.extend(copy.deepcopy(prefix_entries))
+        entries.extend(_cache_entry_with_review_metadata(e) for e in prefix_entries)
     for seg, dbg in zip(segments, debug_texts):
-        entries.append(
-            {
-                "segment_id": seg.segment_id,
-                "time_start": seg.time_start,
-                "time_end": seg.time_end,
-                "srt_start": _srt_time(seg.time_start),
-                "srt_end": _srt_time(seg.time_end),
-                "dialogue_type": seg.dialogue_type,
-                "speaker": seg.speaker,
-                "text_original": seg.text_original,
-                "translation_subtitle": seg.translation_subtitle,
-                "debug_subtitle": dbg,
-            }
+        entry = {
+            "segment_id": seg.segment_id,
+            "time_start": seg.time_start,
+            "time_end": seg.time_end,
+            "srt_start": _srt_time(seg.time_start),
+            "srt_end": _srt_time(seg.time_end),
+            "dialogue_type": seg.dialogue_type,
+            "speaker": seg.speaker,
+            "text_original": seg.text_original,
+            "translation_subtitle": seg.translation_subtitle,
+            "debug_subtitle": dbg,
+        }
+        reasons = _merge_review_reasons(
+            seg.review_reason,
+            _translation_cache_review_reasons(seg.dialogue_type, seg.translation_subtitle, dbg),
         )
+        if seg.needs_review or reasons:
+            entry["needs_review"] = True
+            entry["review_reason"] = reasons
+        entries.append(entry)
     payload = {
         "version": 1,
         "video": str(video_path),
@@ -963,20 +1014,34 @@ def _assert_crop_size(paths: list[Path], roi: Roi, tag: str) -> None:
 class NameOcrRunner:
     """Name ROI OCR runner with optional multi-thread parallelism."""
 
-    def __init__(self, ocr_cfg: dict[str, Any], fallback_engine: Any, workers: int = 1) -> None:
+    def __init__(self, ocr_cfg: dict[str, Any], fallback_engine: Any | None, workers: int = 1) -> None:
         self._ocr_cfg = ocr_cfg
         self._fallback_engine = fallback_engine
         self._workers = max(1, int(workers))
         self._presence_mode = str(ocr_cfg.get("name_presence_mode", "fast_mask")).lower()
         self._mask_thr_on = float(ocr_cfg.get("name_presence_threshold_on", 0.018))
         self._mask_thr_off = float(ocr_cfg.get("name_presence_threshold_off", 0.012))
+        self._mask_min_components = int(ocr_cfg.get("name_presence_min_components", 2))
+        self._mask_max_components = int(ocr_cfg.get("name_presence_max_components", 120))
+        self._mask_max_x_min_ratio = float(ocr_cfg.get("name_presence_max_x_min_ratio", 0.34))
+        self._mask_max_y_span_ratio = float(ocr_cfg.get("name_presence_max_y_span_ratio", 0.62))
+        self._mask_min_aspect_ratio = float(ocr_cfg.get("name_presence_min_aspect_ratio", 0.85))
+        self._mask_max_largest_ratio = float(ocr_cfg.get("name_presence_max_largest_component_ratio", 0.82))
         self._use_ocr_fallback = bool(ocr_cfg.get("name_presence_ocr_fallback", True))
         self._pool: ThreadPoolExecutor | None = None
         self._local = threading.local()
         self._stats_lock = threading.Lock()
         self._stats = {
             "total": 0,
+            "mask_total": 0,
             "mask_only": 0,
+            "mask_on": 0,
+            "mask_off": 0,
+            "mask_uncertain": 0,
+            "mask_rejected_shape": 0,
+            "mask_score_sum": 0.0,
+            "mask_score_min": None,
+            "mask_score_max": None,
             "ocr_fallback": 0,
             "ocr_verify": 0,
         }
@@ -1004,18 +1069,82 @@ class NameOcrRunner:
             self._stats["total"] += 1
             self._stats[key] += 1
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         with self._stats_lock:
             return dict(self._stats)
 
+    def _inc_mask_decision(self, decision: str, score: float) -> None:
+        with self._stats_lock:
+            self._stats["mask_total"] += 1
+            self._stats["mask_only"] += 1
+            self._stats[decision] = self._stats.get(decision, 0) + 1
+            self._stats["mask_score_sum"] = float(self._stats.get("mask_score_sum", 0.0) or 0.0) + float(score)
+            cur_min = self._stats.get("mask_score_min")
+            cur_max = self._stats.get("mask_score_max")
+            self._stats["mask_score_min"] = float(score) if cur_min is None else min(float(cur_min), float(score))
+            self._stats["mask_score_max"] = float(score) if cur_max is None else max(float(cur_max), float(score))
+
+    def _mask_shape_reject_reason(
+        self,
+        component_count: int,
+        x_min: float,
+        x_span: float,
+        y_span: float,
+        largest_ratio: float,
+    ) -> str:
+        if component_count < self._mask_min_components:
+            return "few_components"
+        if component_count > self._mask_max_components:
+            return "too_many_components"
+        if x_min > self._mask_max_x_min_ratio:
+            return "right_side_only"
+        if y_span > self._mask_max_y_span_ratio:
+            return "wide_y_span"
+        if (x_span / max(1e-6, y_span)) < self._mask_min_aspect_ratio:
+            return "not_horizontal_line"
+        if largest_ratio > self._mask_max_largest_ratio:
+            return "large_single_component"
+        return ""
+
+    def _mask_detail_from_gray(self, gray: np.ndarray) -> tuple[bool, bool, float, dict[str, Any]]:
+        _mask, st = extract_text_mask_stats(gray, mode="name")
+        score = float(st.presence)
+        meta: dict[str, Any] = {
+            "presence": score,
+            "components": int(st.component_count),
+            "x_min": float(st.x_min_ratio),
+            "x_max": float(st.x_max_ratio),
+            "x_span": float(st.x_span_ratio),
+            "y_span": float(st.y_span_ratio),
+            "largest": float(st.largest_component_ratio),
+            "reject_reason": "",
+        }
+        reject_reason = self._mask_shape_reject_reason(
+            int(st.component_count),
+            float(st.x_min_ratio),
+            float(st.x_span_ratio),
+            float(st.y_span_ratio),
+            float(st.largest_component_ratio),
+        )
+        if score <= self._mask_thr_off:
+            self._inc_mask_decision("mask_off", score)
+            return False, False, score, meta
+        if reject_reason:
+            meta["reject_reason"] = reject_reason
+            self._inc_mask_decision("mask_rejected_shape", score)
+            return False, True, score, meta
+        if score >= self._mask_thr_on:
+            self._inc_mask_decision("mask_on", score)
+            return True, False, score, meta
+        self._inc_mask_decision("mask_uncertain", score)
+        return False, True, score, meta
+
     def _has_text_fast_mask(self, image_path: Path) -> bool | None:
         gray = load_gray(image_path)
-        _, presence = extract_text_features(gray, mode="name")
-        if presence >= self._mask_thr_on:
-            self._inc_stat("mask_only")
+        present, uncertain, _score, _meta = self._mask_detail_from_gray(gray)
+        if present:
             return True
-        if presence <= self._mask_thr_off:
-            self._inc_stat("mask_only")
+        if not uncertain:
             return False
         return None
 
@@ -1028,25 +1157,41 @@ class NameOcrRunner:
                 return fast
             if not self._use_ocr_fallback:
                 # Uncertain band defaults to "no name" when OCR fallback is disabled.
-                self._inc_stat("mask_only")
                 return False
             self._inc_stat("ocr_fallback")
         else:
             self._inc_stat("ocr_fallback")
         engine = self._fallback_engine if self._pool is None else self._thread_engine()
+        if engine is None:
+            return False
         r = engine.recognize(image_path)
         return bool((r.text or "").strip())
 
     def has_text_mask(self, image_path: Path) -> bool:
         """Mask-only name presence check (no OCR fallback)."""
+        present, _uncertain, _presence = self.has_text_mask_detail(image_path)
+        return present
+
+    def has_text_mask_detail(self, image_path: Path) -> tuple[bool, bool, float]:
+        """Mask-only name presence with uncertainty and raw presence score."""
+        present, uncertain, score, _meta = self.has_text_mask_detail_meta(image_path)
+        return present, uncertain, score
+
+    def has_text_mask_detail_meta(self, image_path: Path) -> tuple[bool, bool, float, dict[str, Any]]:
+        """Mask-only name presence with diagnostics used by debug/stat output."""
         if not image_path.exists():
-            return False
-        fast = self._has_text_fast_mask(image_path)
-        if fast is None:
-            # Uncertain band treats as no-name for conservative split anchoring.
-            self._inc_stat("mask_only")
-            return False
-        return bool(fast)
+            return False, False, 0.0, {
+                "presence": 0.0,
+                "components": 0,
+                "x_min": 0.0,
+                "x_max": 0.0,
+                "x_span": 0.0,
+                "y_span": 0.0,
+                "largest": 0.0,
+                "reject_reason": "missing",
+            }
+        gray = load_gray(image_path)
+        return self._mask_detail_from_gray(gray)
 
     def has_text_ocr(self, image_path: Path) -> bool:
         if not image_path.exists():
@@ -1054,6 +1199,8 @@ class NameOcrRunner:
         with self._stats_lock:
             self._stats["ocr_verify"] += 1
         engine = self._fallback_engine if self._pool is None else self._thread_engine()
+        if engine is None:
+            return False
         r = engine.recognize(image_path)
         text = (r.text or "").strip()
         # _log(f"[has_text_ocr] {image_path.name} text={text!r}")
@@ -1145,12 +1292,56 @@ def _find_latest_translation_cache(base_work_dir: Path) -> Path | None:
         return candidates[-1]
 
 
+def _name_mask_debug_label(gray: np.ndarray, ocr_cfg: dict[str, Any]) -> str:
+    _mask, st = extract_text_mask_stats(gray, mode="name")
+    score = float(st.presence)
+    thr_on = float(ocr_cfg.get("name_presence_threshold_on", 0.018))
+    thr_off = float(ocr_cfg.get("name_presence_threshold_off", 0.012))
+    min_components = int(ocr_cfg.get("name_presence_min_components", 2))
+    max_components = int(ocr_cfg.get("name_presence_max_components", 120))
+    max_x_min = float(ocr_cfg.get("name_presence_max_x_min_ratio", 0.34))
+    max_y_span = float(ocr_cfg.get("name_presence_max_y_span_ratio", 0.62))
+    min_aspect = float(ocr_cfg.get("name_presence_min_aspect_ratio", 0.85))
+    max_largest = float(ocr_cfg.get("name_presence_max_largest_component_ratio", 0.82))
+
+    reject_reason = ""
+    if int(st.component_count) < min_components:
+        reject_reason = "few"
+    elif int(st.component_count) > max_components:
+        reject_reason = "many"
+    elif float(st.x_min_ratio) > max_x_min:
+        reject_reason = "right"
+    elif float(st.y_span_ratio) > max_y_span:
+        reject_reason = "tall"
+    elif (float(st.x_span_ratio) / max(1e-6, float(st.y_span_ratio))) < min_aspect:
+        reject_reason = "nonline"
+    elif float(st.largest_component_ratio) > max_largest:
+        reject_reason = "blob"
+
+    if score <= thr_off:
+        state = "off"
+    elif reject_reason:
+        state = f"rej-{reject_reason}"
+    elif score >= thr_on:
+        state = "on"
+    else:
+        state = "unc"
+
+    return (
+        f"m{score:.4f}_c{int(st.component_count):03d}"
+        f"_xmin{float(st.x_min_ratio):.2f}_xs{float(st.x_span_ratio):.2f}"
+        f"_y{float(st.y_span_ratio):.2f}"
+        f"_l{float(st.largest_component_ratio):.2f}_{state}"
+    )
+
+
 def _export_name_frames_for_segment(
     out_root: Path,
     seg_label: str,
     name_dir: Path,
     frame_start: int,
     frame_end: int,
+    ocr_cfg: dict[str, Any],
 ) -> None:
     seg_key = seg_label.replace(" ", "_")
     seg_dir = out_root / seg_key
@@ -1163,14 +1354,55 @@ def _export_name_frames_for_segment(
             continue
         try:
             gray = load_gray(src)
-            _, mask_presence = extract_text_features(gray, mode="name")
-            dst = seg_dir / f"f{fid:06d}_m{mask_presence:.4f}.png"
+            mask_label = _name_mask_debug_label(gray, ocr_cfg)
+            dst = seg_dir / f"f{fid:06d}_{mask_label}.png"
         except Exception:
             dst = seg_dir / f"f{fid:06d}.png"
         try:
             shutil.copy2(src, dst)
         except Exception:
             pass
+
+
+def _coerce_review_reasons(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        items = value
+    else:
+        items = [value]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        out.append(s)
+        seen.add(s)
+    return out
+
+
+def _merge_review_reasons(*values: Any) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for reason in _coerce_review_reasons(value):
+            if reason in seen:
+                continue
+            out.append(reason)
+            seen.add(reason)
+    return out
+
+
+def _attach_review_metadata(
+    payload: dict[str, Any],
+    reasons: list[str],
+    force_review: bool = False,
+) -> dict[str, Any]:
+    if reasons or force_review:
+        payload["needs_review"] = True
+        payload["review_reason"] = reasons
+    return payload
 
 
 def _build_refined_subsegment(
@@ -1182,9 +1414,11 @@ def _build_refined_subsegment(
     st: int,
     ed: int,
     has_name: bool,
+    review_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
     sample = [] if (not has_name) else [st + (ed - st) // 2]
-    return {
+    reasons = _merge_review_reasons(raw.get("review_reason"), review_reasons)
+    out = {
         "range_index": int(raw["range_index"]),
         "frame_start": st,
         "frame_end": ed,
@@ -1202,6 +1436,7 @@ def _build_refined_subsegment(
         "marker_presence_threshold_used": marker_thr,
         "marker_seg_id": marker_seg_id,
     }
+    return _attach_review_metadata(out, reasons, force_review=bool(raw.get("needs_review", False)))
 
 
 def _fill_short_false_gaps(flags: list[bool], max_gap: int) -> None:
@@ -1224,15 +1459,20 @@ def _fill_short_false_gaps(flags: list[bool], max_gap: int) -> None:
         p = q
 
 
-def _last_true_run_start(flags: list[bool]) -> int | None:
-    true_idx = [i for i, v in enumerate(flags) if v]
-    if not true_idx:
-        return None
-    run_end = true_idx[-1]
-    run_start = run_end
-    while run_start > 0 and flags[run_start - 1]:
-        run_start -= 1
-    return run_start
+def _first_true_run_bounds(flags: list[bool], min_run: int = 1) -> tuple[int, int] | None:
+    min_len = max(1, int(min_run))
+    p = 0
+    while p < len(flags):
+        if not flags[p]:
+            p += 1
+            continue
+        q = p
+        while q < len(flags) and flags[q]:
+            q += 1
+        if (q - p) >= min_len:
+            return p, q - 1
+        p = q
+    return None
 
 
 def _head_probe_hits_ocr(
@@ -1243,6 +1483,7 @@ def _head_probe_hits_ocr(
     fast_check_frames: int,
     name_ocr: NameOcrRunner,
     name_cache: dict[int, bool],
+    use_ocr: bool = True,
 ) -> int:
     probe_n = max(1, int(fast_check_frames))
     probe_offset = max(0, int(round(0.16 * scan_fps)))
@@ -1250,7 +1491,10 @@ def _head_probe_hits_ocr(
     probe_end = min(frame_end, probe_start + probe_n - 1)
     probe_fids = list(range(probe_start, probe_end + 1))
     probe_paths = [name_dir / f"{fid + 1:06d}.png" for fid in probe_fids]
-    probe_flags = name_ocr.has_text_batch_ocr(probe_paths)
+    if use_ocr:
+        probe_flags = name_ocr.has_text_batch_ocr(probe_paths)
+    else:
+        probe_flags = [name_ocr.has_text_mask(p) for p in probe_paths]
     for fid, flag in zip(probe_fids, probe_flags):
         name_cache[fid] = bool(flag)
     return sum(1 for x in probe_flags if x)
@@ -1260,6 +1504,7 @@ def _split_segment_by_name_ocr(
     raw: dict[str, Any],
     name_dir: Path,
     name_ocr: NameOcrRunner,
+    use_ocr: bool = True,
     fast_check_frames: int = 5,
     fast_min_hits: int = 4,
     coarse_step_frames: int = 6,
@@ -1284,6 +1529,9 @@ def _split_segment_by_name_ocr(
     )
 
     name_mask_cache: dict[int, bool] = {}
+    name_mask_uncertain_cache: dict[int, bool] = {}
+    name_mask_presence_cache: dict[int, float] = {}
+    name_mask_meta_cache: dict[int, dict[str, Any]] = {}
     name_ocr_cache: dict[int, bool] = {}
     name_cache: dict[int, bool] = {}
 
@@ -1291,9 +1539,45 @@ def _split_segment_by_name_ocr(
         if fid in name_mask_cache:
             return name_mask_cache[fid]
         p = name_dir / f"{fid + 1:06d}.png"
-        v = name_ocr.has_text_mask(p)
+        v, uncertain, presence, meta = name_ocr.has_text_mask_detail_meta(p)
         name_mask_cache[fid] = bool(v)
+        name_mask_uncertain_cache[fid] = bool(uncertain)
+        name_mask_presence_cache[fid] = float(presence)
+        name_mask_meta_cache[fid] = dict(meta)
         return bool(v)
+
+    def _mask_uncertain_review_reasons(
+        start_f: int,
+        end_f: int,
+        *,
+        tag: str = "name_mask_uncertain",
+    ) -> list[str]:
+        if end_f < start_f:
+            return []
+        fids_check = list(range(start_f, end_f + 1))
+        for fid in fids_check:
+            _has_name_mask(fid)
+        uncertain = [fid for fid in fids_check if name_mask_uncertain_cache.get(fid, False)]
+        if not uncertain:
+            return []
+        scores = [name_mask_presence_cache.get(fid, 0.0) for fid in uncertain]
+        reject_counts: dict[str, int] = {}
+        for fid in uncertain:
+            reason = str(name_mask_meta_cache.get(fid, {}).get("reject_reason", "") or "")
+            if reason:
+                reject_counts[reason] = reject_counts.get(reason, 0) + 1
+        reject_text = ""
+        if reject_counts:
+            reject_text = " reject=" + ",".join(
+                f"{k}:{v}" for k, v in sorted(reject_counts.items())
+            )
+        return [
+            f"{tag}:"
+            f"count={len(uncertain)} "
+            f"range=[{uncertain[0]},{uncertain[-1]}] "
+            f"score=[{min(scores):.4f},{max(scores):.4f}]"
+            f"{reject_text}"
+        ]
 
     def _has_name_ocr(fid: int) -> bool:
         if fid in name_ocr_cache:
@@ -1303,8 +1587,11 @@ def _split_segment_by_name_ocr(
         name_ocr_cache[fid] = bool(v)
         return bool(v)
 
+    def _has_name_confirm(fid: int) -> bool:
+        return _has_name_ocr(fid) if use_ocr else _has_name_mask(fid)
+
     def _blank_confirm(start_f: int, end_f: int) -> bool:
-        # Returns True only if this run is confirmed blank by OCR sampling.
+        # Returns True only if this run is confirmed blank by OCR/mask sampling.
         if end_f < start_f:
             return True
         k = max(1, int(blank_verify_frames))
@@ -1317,7 +1604,10 @@ def _split_segment_by_name_ocr(
         sample_frames = sorted(set(head + tail))
 
         verify_paths = [name_dir / f"{f + 1:06d}.png" for f in sample_frames]
-        vflags = name_ocr.has_text_batch_ocr(verify_paths)
+        if use_ocr:
+            vflags = name_ocr.has_text_batch_ocr(verify_paths)
+        else:
+            vflags = [name_ocr.has_text_mask(p) for p in verify_paths]
 
         hits = sum(1 for x in vflags if x)
         ok = hits < need
@@ -1331,7 +1621,7 @@ def _split_segment_by_name_ocr(
         """Fine scan: frame-by-frame backward OCR search."""
         seen_name = False
         for fid in range(end_f, start_f - 1, -1):
-            if _has_name_ocr(fid):
+            if _has_name_confirm(fid):
                 seen_name = True
                 continue
             if seen_name:
@@ -1357,7 +1647,7 @@ def _split_segment_by_name_ocr(
         seen_name = False
         prev_fid: int | None = None
         for fid in coarse_points:
-            has_name = _has_name_ocr(fid)
+            has_name = _has_name_confirm(fid)
             if has_name:
                 seen_name = True
             elif seen_name:
@@ -1405,7 +1695,7 @@ def _split_segment_by_name_ocr(
             run_len: int,
         ) -> tuple[int | None, int, int | None, int]:
             for ff in range(lo, hi + 1):
-                v = _has_name_ocr(ff)
+                v = _has_name_confirm(ff)
                 if v:
                     if run_len <= 0:
                         run_start = ff
@@ -1457,7 +1747,7 @@ def _split_segment_by_name_ocr(
         activated = False
 
         for fid in coarse_points:
-            coarse_hit = _has_name_ocr(fid)
+            coarse_hit = _has_name_confirm(fid)
             # _log(
             #     f"{log_prefix} forward_ocr coarse_point "
             #     f"fid={fid} has_name_ocr={coarse_hit}"
@@ -1498,18 +1788,35 @@ def _split_segment_by_name_ocr(
     
     # Step-2: quick pure-dialogue probe.
     probe_hits_need = max(1, int(fast_min_hits))
-    probe_hits = _head_probe_hits_ocr(
-        name_dir=name_dir,
-        frame_start=frame_start,
-        frame_end=frame_end,
-        scan_fps=scan_fps,
-        fast_check_frames=fast_check_frames,
-        name_ocr=name_ocr,
-        name_cache=name_cache,
-    )
+    probe_n = max(1, int(fast_check_frames))
+    probe_offset = max(0, int(round(0.16 * scan_fps)))
+    probe_start = min(frame_end, frame_start + probe_offset)
+    probe_end = min(frame_end, probe_start + probe_n - 1)
+    if use_ocr:
+        probe_hits = _head_probe_hits_ocr(
+            name_dir=name_dir,
+            frame_start=frame_start,
+            frame_end=frame_end,
+            scan_fps=scan_fps,
+            fast_check_frames=fast_check_frames,
+            name_ocr=name_ocr,
+            name_cache=name_cache,
+            use_ocr=True,
+        )
+    else:
+        probe_fids = list(range(probe_start, probe_end + 1))
+        probe_flags = [_has_name_mask(fid) for fid in probe_fids]
+        for fid, flag in zip(probe_fids, probe_flags):
+            name_cache[fid] = bool(flag)
+        probe_hits = sum(1 for x in probe_flags if x)
     for fid, flag in name_cache.items():
         name_ocr_cache[int(fid)] = bool(flag)
     if probe_hits >= probe_hits_need:
+        probe_review_reasons = _mask_uncertain_review_reasons(
+            probe_start,
+            probe_end,
+            tag="name_mask_probe_uncertain",
+        )
         _log(
             f"{log_prefix} abandon_blank reason=head_probe_hits "
             f"probe_hits={probe_hits} need={probe_hits_need}"
@@ -1524,6 +1831,7 @@ def _split_segment_by_name_ocr(
                 st=frame_start,
                 ed=frame_end,
                 has_name=True,
+                review_reasons=probe_review_reasons,
             )
         ]
 
@@ -1542,14 +1850,24 @@ def _split_segment_by_name_ocr(
     flags = [_has_name_mask(fid) for fid in fids]
     # Fill tiny mask dropouts to keep one continuous candidate block.
     _fill_short_false_gaps(flags, max_gap=max(0, int(smooth_blank_gap_frames)))
+    mask_review_reasons: list[str] = []
 
-    run_start = _last_true_run_start(flags)
-    if run_start is None:
-        # Mask missed everything: force backward OCR search instead of marking
+    # A marker segment can only be "blank -> subtitle" or "subtitle".
+    # Later False/True toggles are detector noise, so use the first durable
+    # name run as the single boundary candidate.
+    mask_candidate_min_run = min(2, max(1, len(flags)))
+    run_bounds = _first_true_run_bounds(flags, min_run=mask_candidate_min_run)
+    if run_bounds is None:
+        # Mask missed everything: force backward confirmation instead of marking
         # whole marker segment as blank.
         dialog_start = _find_dialog_start_by_backward_ocr(frame_start, anchor)
         if dialog_start is None:
-            _log(f"{log_prefix} abandon_blank reason=mask_miss_and_backward_ocr_failed anchor={anchor}")
+            miss_reason = (
+                "mask_miss_and_backward_ocr_failed"
+                if use_ocr
+                else "mask_miss_and_backward_mask_failed"
+            )
+            _log(f"{log_prefix} abandon_blank reason={miss_reason} anchor={anchor}")
             # Marker-based segment should contain dialogue text; fall back to
             # whole has-name segment rather than blank-only segment.
             return [
@@ -1562,6 +1880,16 @@ def _split_segment_by_name_ocr(
                     st=frame_start,
                     ed=frame_end,
                     has_name=True,
+                    review_reasons=(
+                        _merge_review_reasons(
+                            _mask_uncertain_review_reasons(
+                                frame_start,
+                                anchor,
+                                tag="name_mask_search_uncertain",
+                            ),
+                            [f"name_split_boundary_unconfirmed:{miss_reason}"],
+                        )
+                    ),
                 )
             ]
         # If no leading blank remains after backward OCR, keep as pure dialogue.
@@ -1615,6 +1943,11 @@ def _split_segment_by_name_ocr(
                     st=frame_start,
                     ed=frame_end,
                     has_name=True,
+                    review_reasons=(
+                        _merge_review_reasons(
+                            ["name_split_blank_confirm_failed"],
+                        )
+                    ),
                 )
             ]
         return [
@@ -1640,35 +1973,176 @@ def _split_segment_by_name_ocr(
             ),
         ]
 
-    # Candidate dialogue starts at first True of last contiguous True-run.
+    # Candidate dialogue starts at the first durable True-run.
+    run_start, run_end = run_bounds
     candidate_start = frame_start + run_start
-    # OCR confirmation: coarse+fine forward search.
-    # Search from candidate_start-lookback up to anchor, and do not require mask=True.
-    confirm_start = max(frame_start, candidate_start - max(0, int(confirm_lookback_frames)))
-    dialog_start = _find_dialog_start_by_forward_ocr(confirm_start, anchor)
-    if dialog_start is None:
-        # Mask found candidate but OCR didn't confirm: force backward OCR search.
-        dialog_start = _find_dialog_start_by_backward_ocr(frame_start, anchor)
-        if dialog_start is None:
-            _log(
-                f"{log_prefix} abandon_blank reason=forward_backward_ocr_both_failed "
-                f"candidate_start={candidate_start} confirm_start={confirm_start} anchor={anchor}"
+    candidate_end = frame_start + run_end
+    mask_run_len = run_end - run_start + 1
+    mask_tail_gap = max(0, anchor - candidate_end)
+    left_mask_hits = sum(1 for x in flags[:run_start] if x)
+    candidate_presence_scores = [
+        name_mask_presence_cache.get(fid, 0.0)
+        for fid in range(candidate_start, candidate_end + 1)
+    ]
+    candidate_presence_avg = (
+        sum(candidate_presence_scores) / max(1, len(candidate_presence_scores))
+        if candidate_presence_scores
+        else 0.0
+    )
+    candidate_presence_min = min(candidate_presence_scores) if candidate_presence_scores else 0.0
+    pre_window_len = max(1, min(mask_run_len, 4))
+    pre_start = max(frame_start, candidate_start - pre_window_len)
+    pre_scores = [
+        name_mask_presence_cache.get(fid, 0.0)
+        for fid in range(pre_start, candidate_start)
+    ]
+    pre_presence_avg = (
+        sum(pre_scores) / max(1, len(pre_scores))
+        if pre_scores
+        else 0.0
+    )
+    candidate_presence_rise = candidate_presence_avg - pre_presence_avg
+    boundary_margin_frames = max(1, int(smooth_blank_gap_frames) + 1)
+    mask_review_reasons = _mask_uncertain_review_reasons(
+        max(frame_start, candidate_start - boundary_margin_frames),
+        min(anchor, candidate_end + boundary_margin_frames),
+        tag="name_mask_boundary_uncertain",
+    )
+    mask_split_presence_threshold = float(
+        name_ocr._ocr_cfg.get(
+            "name_presence_split_threshold",
+            float(name_ocr._mask_thr_on),
+        )
+    )
+    mask_split_min_run = int(name_ocr._ocr_cfg.get("name_presence_split_min_run_frames", 2))
+    mask_min_rise_delta = float(name_ocr._ocr_cfg.get("name_presence_min_rise_delta", 0.002))
+    mask_candidate_low_reasons = []
+    if (not use_ocr) and (
+        mask_run_len < max(1, mask_split_min_run)
+        or candidate_presence_avg < mask_split_presence_threshold
+        or (
+            candidate_start > frame_start
+            and candidate_presence_rise < mask_min_rise_delta
+        )
+    ):
+        mask_candidate_low_reasons = [
+            "name_mask_low_confidence_candidate:"
+            f"run_len={mask_run_len} "
+            f"avg={candidate_presence_avg:.4f} "
+            f"pre_avg={pre_presence_avg:.4f} "
+            f"rise={candidate_presence_rise:.4f} "
+            f"min={candidate_presence_min:.4f} "
+            f"need_avg={mask_split_presence_threshold:.4f} "
+            f"need_run={max(1, mask_split_min_run)} "
+            f"need_rise={mask_min_rise_delta:.4f}"
+        ]
+        _log(
+            f"{log_prefix} abandon_blank reason=mask_candidate_low_confidence "
+            f"candidate_start={candidate_start} mask_run=[{candidate_start},{candidate_end}] "
+            f"mask_run_len={mask_run_len} avg={candidate_presence_avg:.4f} "
+            f"pre_avg={pre_presence_avg:.4f} rise={candidate_presence_rise:.4f} "
+            f"min={candidate_presence_min:.4f} need_avg={mask_split_presence_threshold:.4f} "
+            f"need_run={max(1, mask_split_min_run)} need_rise={mask_min_rise_delta:.4f} anchor={anchor}"
+        )
+        return [
+            _build_refined_subsegment(
+                raw=raw,
+                marker_seg_id=marker_seg_id,
+                start_sec=start_sec,
+                scan_fps=scan_fps,
+                marker_thr=marker_thr,
+                st=frame_start,
+                ed=frame_end,
+                has_name=True,
+                review_reasons=_merge_review_reasons(
+                    mask_review_reasons,
+                    mask_candidate_low_reasons,
+                ),
             )
-            return [
-                _build_refined_subsegment(
-                    raw=raw,
-                    marker_seg_id=marker_seg_id,
-                    start_sec=start_sec,
-                    scan_fps=scan_fps,
-                    marker_thr=marker_thr,
-                    st=frame_start,
-                    ed=frame_end,
-                    has_name=True,
-                )
-            ]
+        ]
+    min_blank = max(1, int(min_blank_frames))
+    if (candidate_start - frame_start) < min_blank:
+        _log(
+            f"{log_prefix} abandon_blank reason=leading_blank_too_short "
+            f"blank_len={candidate_start - frame_start} min_blank={min_blank} "
+            f"candidate_start={candidate_start} anchor={anchor}"
+        )
+        return [
+            _build_refined_subsegment(
+                raw=raw,
+                marker_seg_id=marker_seg_id,
+                start_sec=start_sec,
+                scan_fps=scan_fps,
+                marker_thr=marker_thr,
+                st=frame_start,
+                ed=frame_end,
+                has_name=True,
+                review_reasons=mask_review_reasons,
+            )
+        ]
+
+    boundary_review_reasons = list(mask_review_reasons)
+    if not use_ocr:
+        dialog_start = candidate_start
+        _log(
+            f"{log_prefix} mask_boundary candidate_start={candidate_start} "
+            f"mask_run=[{candidate_start},{candidate_end}] "
+            f"mask_run_len={mask_run_len} tail_gap={mask_tail_gap} "
+            f"left_mask_hits={left_mask_hits} anchor={anchor}"
+        )
+    else:
+        # OCR confirmation: coarse+fine forward search.
+        # Search from candidate_start-lookback up to anchor, and do not require mask=True.
+        confirm_start = max(frame_start, candidate_start - max(0, int(confirm_lookback_frames)))
+        dialog_start = _find_dialog_start_by_forward_ocr(confirm_start, anchor)
+        if dialog_start is None:
+            # Mask found candidate but OCR didn't confirm: force backward OCR search.
+            dialog_start = _find_dialog_start_by_backward_ocr(frame_start, anchor)
+            if dialog_start is None:
+                allow_mask_fallback = bool(name_ocr._ocr_cfg.get("name_ocr_allow_mask_fallback", False))
+                mask_fallback_min_run = max(2, min(3, probe_hits_need))
+                mask_tail_tolerance = max(0, int(smooth_blank_gap_frames))
+                if (
+                    allow_mask_fallback
+                    and mask_run_len >= mask_fallback_min_run
+                    and mask_tail_gap <= mask_tail_tolerance
+                ):
+                    dialog_start = candidate_start
+                    boundary_review_reasons = _merge_review_reasons(
+                        boundary_review_reasons,
+                        ["name_ocr_boundary_fallback:mask_candidate_after_ocr_failed"],
+                    )
+                    _log(
+                        f"{log_prefix} fallback_blank reason=mask_candidate_after_ocr_failed "
+                        f"candidate_start={candidate_start} mask_run=[{candidate_start},{candidate_end}] "
+                        f"mask_run_len={mask_run_len} tail_gap={mask_tail_gap} "
+                        f"left_mask_hits={left_mask_hits} anchor={anchor}"
+                    )
+                else:
+                    _log(
+                        f"{log_prefix} abandon_blank reason=forward_backward_ocr_both_failed "
+                        f"candidate_start={candidate_start} confirm_start={confirm_start} anchor={anchor} "
+                        f"mask_run=[{candidate_start},{candidate_end}] mask_run_len={mask_run_len} "
+                        f"tail_gap={mask_tail_gap} left_mask_hits={left_mask_hits}"
+                    )
+                    return [
+                        _build_refined_subsegment(
+                            raw=raw,
+                            marker_seg_id=marker_seg_id,
+                            start_sec=start_sec,
+                            scan_fps=scan_fps,
+                            marker_thr=marker_thr,
+                            st=frame_start,
+                            ed=frame_end,
+                            has_name=True,
+                            review_reasons=_merge_review_reasons(
+                                boundary_review_reasons,
+                                ["name_ocr_boundary_unconfirmed:forward_backward_ocr_both_failed"],
+                            ),
+                        )
+                    ]
 
     # If head blank too short, merge into dialogue to avoid jitter.
-    min_blank = max(1, int(min_blank_frames))
     if (dialog_start - frame_start) < min_blank:
         _log(
             f"{log_prefix} abandon_blank reason=leading_blank_too_short "
@@ -1684,10 +2158,11 @@ def _split_segment_by_name_ocr(
                 st=frame_start,
                 ed=frame_end,
                 has_name=True,
+                review_reasons=boundary_review_reasons,
             )
         ]
 
-    # Blank leading part must be OCR-confirmed blank; otherwise merge.
+    # Blank leading part must be confirmed blank; otherwise merge.
     if not _blank_confirm(frame_start, dialog_start - 1):
         _log(
             f"{log_prefix} abandon_blank reason=blank_confirm_failed "
@@ -1703,9 +2178,295 @@ def _split_segment_by_name_ocr(
                 st=frame_start,
                 ed=frame_end,
                 has_name=True,
+                review_reasons=(
+                    _merge_review_reasons(
+                        boundary_review_reasons,
+                        ["name_split_blank_confirm_failed"],
+                    )
+                ),
             )
         ]
 
+    return [
+        _build_refined_subsegment(
+            raw=raw,
+            marker_seg_id=marker_seg_id,
+            start_sec=start_sec,
+            scan_fps=scan_fps,
+            marker_thr=marker_thr,
+            st=frame_start,
+            ed=dialog_start - 1,
+            has_name=False,
+            review_reasons=boundary_review_reasons,
+        ),
+        _build_refined_subsegment(
+            raw=raw,
+            marker_seg_id=marker_seg_id,
+            start_sec=start_sec,
+            scan_fps=scan_fps,
+            marker_thr=marker_thr,
+            st=dialog_start,
+            ed=frame_end,
+            has_name=True,
+            review_reasons=boundary_review_reasons,
+        ),
+    ]
+
+
+def _normalize_name_subsegments_per_marker(
+    segs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not segs:
+        return []
+    out: list[dict[str, Any]] = []
+
+    def _finalize(payload: dict[str, Any], parts: list[dict[str, Any]]) -> dict[str, Any]:
+        return _attach_review_metadata(
+            payload,
+            _merge_review_reasons(*[p.get("review_reason") for p in parts]),
+            force_review=any(bool(p.get("needs_review", False)) for p in parts),
+        )
+
+    i = 0
+    while i < len(segs):
+        sid = int(segs[i].get("marker_seg_id", -1))
+        grp: list[dict[str, Any]] = []
+        while i < len(segs) and int(segs[i].get("marker_seg_id", -1)) == sid:
+            grp.append(segs[i])
+            i += 1
+        if not grp:
+            continue
+        scan_fps = float(grp[0]["scan_fps"])
+        start_sec = float(grp[0]["start_sec"])
+        marker_thr = float(grp[0].get("marker_presence_threshold_used", 0.0))
+        range_index = int(grp[0]["range_index"])
+        has_true = any(bool(g.get("has_name", False)) for g in grp)
+        fs = int(grp[0]["frame_start"])
+        fe = int(grp[-1]["frame_end"])
+        if not has_true:
+            out.append(
+                _finalize(
+                    {
+                        "range_index": range_index,
+                        "frame_start": fs,
+                        "frame_end": fe,
+                        "time_start": start_sec + (fs / scan_fps),
+                        "time_end": start_sec + (fe / scan_fps),
+                        "has_name": False,
+                        "sample_frames": [],
+                        "scan_fps": scan_fps,
+                        "start_sec": start_sec,
+                        "stable_time": start_sec + ((fs + fe) / (2.0 * scan_fps)),
+                        "marker_presence_threshold_used": marker_thr,
+                        "marker_seg_id": sid,
+                    },
+                    grp,
+                )
+            )
+            continue
+        first_true_idx = next(
+            j for j, g in enumerate(grp) if bool(g.get("has_name", False))
+        )
+        if first_true_idx > 0:
+            bfs = int(grp[0]["frame_start"])
+            bfe = int(grp[first_true_idx - 1]["frame_end"])
+            if bfe >= bfs:
+                out.append(
+                    _finalize(
+                        {
+                            "range_index": range_index,
+                            "frame_start": bfs,
+                            "frame_end": bfe,
+                            "time_start": start_sec + (bfs / scan_fps),
+                            "time_end": start_sec + (bfe / scan_fps),
+                            "has_name": False,
+                            "sample_frames": [],
+                            "scan_fps": scan_fps,
+                            "start_sec": start_sec,
+                            "stable_time": start_sec + ((bfs + bfe) / (2.0 * scan_fps)),
+                            "marker_presence_threshold_used": marker_thr,
+                            "marker_seg_id": sid,
+                        },
+                        grp[:first_true_idx],
+                    )
+                )
+        dfs = int(grp[first_true_idx]["frame_start"])
+        dfe = int(grp[-1]["frame_end"])
+        dmid = dfs + ((dfe - dfs) // 2)
+        out.append(
+            _finalize(
+                {
+                    "range_index": range_index,
+                    "frame_start": dfs,
+                    "frame_end": dfe,
+                    "time_start": start_sec + (dfs / scan_fps),
+                    "time_end": start_sec + (dfe / scan_fps),
+                    "has_name": True,
+                    "sample_frames": [dmid],
+                    "scan_fps": scan_fps,
+                    "start_sec": start_sec,
+                    "stable_time": start_sec + (dmid / scan_fps),
+                    "marker_presence_threshold_used": marker_thr,
+                    "marker_seg_id": sid,
+                },
+                grp[first_true_idx:],
+            )
+        )
+    return out
+
+
+def _split_segment_by_marker2(
+    raw: dict[str, Any],
+    marker2_dir: Path,
+    matcher: MarkerTemplateMatcher,
+    *,
+    threshold: float,
+    fast_check_frames: int = 5,
+    fast_min_hits: int = 4,
+    min_blank_frames: int = 1,
+    blank_verify_frames: int = 3,
+    blank_verify_min_hits: int = 1,
+    smooth_blank_gap_frames: int = 1,
+) -> list[dict[str, Any]]:
+    frame_start = int(raw["frame_start"])
+    frame_end = int(raw["frame_end"])
+    scan_fps = float(raw["scan_fps"])
+    start_sec = float(raw["start_sec"])
+    marker_thr = float(raw.get("marker_presence_threshold_used", 0.0))
+    marker_seg_id = int(raw.get("marker_seg_id", raw.get("segment_id", 0)))
+    if frame_end < frame_start:
+        return [raw]
+
+    score_cache: dict[int, float] = {}
+    flag_cache: dict[int, bool] = {}
+
+    def _score(fid: int) -> float:
+        if fid in score_cache:
+            return score_cache[fid]
+        p = marker2_dir / f"{fid + 1:06d}.png"
+        sc = 0.0
+        if p.exists():
+            try:
+                sc = float(matcher.score(load_gray(p)))
+            except Exception:
+                sc = 0.0
+        score_cache[fid] = sc
+        return sc
+
+    def _present(fid: int) -> bool:
+        if fid not in flag_cache:
+            flag_cache[fid] = _score(fid) >= float(threshold)
+        return flag_cache[fid]
+
+    def _review_reason(tag: str, start_f: int, end_f: int) -> list[str]:
+        if end_f < start_f:
+            return []
+        vals = [_score(fid) for fid in range(start_f, end_f + 1)]
+        if not vals:
+            return []
+        return [
+            f"{tag}:score=[{min(vals):.4f},{max(vals):.4f}] "
+            f"threshold={float(threshold):.4f}"
+        ]
+
+    def _blank_confirm(start_f: int, end_f: int) -> bool:
+        if end_f < start_f:
+            return True
+        k = max(1, int(blank_verify_frames))
+        need = max(1, int(blank_verify_min_hits))
+        step = 3
+        head = [start_f + i * step for i in range(k) if start_f + i * step <= end_f]
+        tail = [end_f - i * step for i in range(k) if end_f - i * step >= start_f]
+        sample_frames = sorted(set(head + tail))
+        hits = sum(1 for fid in sample_frames if _present(fid))
+        _log(
+            f"[split_by_marker2] seg_id={marker_seg_id} blank_confirm "
+            f"range=[{start_f},{end_f}] samples={sample_frames} hits={hits} "
+            f"need_lt={need} threshold={float(threshold):.4f}"
+        )
+        return hits < need
+
+    probe_n = max(1, int(fast_check_frames))
+    probe_offset = max(0, int(round(0.16 * scan_fps)))
+    probe_start = min(frame_end, frame_start + probe_offset)
+    probe_end = min(frame_end, probe_start + probe_n - 1)
+    probe_hits = sum(1 for fid in range(probe_start, probe_end + 1) if _present(fid))
+    if probe_hits >= max(1, int(fast_min_hits)):
+        return [
+            _build_refined_subsegment(
+                raw=raw,
+                marker_seg_id=marker_seg_id,
+                start_sec=start_sec,
+                scan_fps=scan_fps,
+                marker_thr=marker_thr,
+                st=frame_start,
+                ed=frame_end,
+                has_name=True,
+            )
+        ]
+
+    anchor = frame_end
+    samples = raw.get("sample_frames") or []
+    if samples:
+        try:
+            anchor = int(samples[0])
+        except Exception:
+            anchor = frame_end
+    anchor = max(frame_start, min(frame_end, anchor))
+    fids = list(range(frame_start, anchor + 1))
+    flags = [_present(fid) for fid in fids]
+    _fill_short_false_gaps(flags, max_gap=max(0, int(smooth_blank_gap_frames)))
+    run_bounds = _first_true_run_bounds(flags, min_run=min(2, max(1, len(flags))))
+    if run_bounds is None:
+        return [
+            _build_refined_subsegment(
+                raw=raw,
+                marker_seg_id=marker_seg_id,
+                start_sec=start_sec,
+                scan_fps=scan_fps,
+                marker_thr=marker_thr,
+                st=frame_start,
+                ed=frame_end,
+                has_name=True,
+                review_reasons=_review_reason("marker2_boundary_unconfirmed", frame_start, anchor),
+            )
+        ]
+
+    run_start, _run_end = run_bounds
+    dialog_start = frame_start + run_start
+    min_blank = max(1, int(min_blank_frames))
+    if (dialog_start - frame_start) < min_blank:
+        return [
+            _build_refined_subsegment(
+                raw=raw,
+                marker_seg_id=marker_seg_id,
+                start_sec=start_sec,
+                scan_fps=scan_fps,
+                marker_thr=marker_thr,
+                st=frame_start,
+                ed=frame_end,
+                has_name=True,
+            )
+        ]
+    if not _blank_confirm(frame_start, dialog_start - 1):
+        return [
+            _build_refined_subsegment(
+                raw=raw,
+                marker_seg_id=marker_seg_id,
+                start_sec=start_sec,
+                scan_fps=scan_fps,
+                marker_thr=marker_thr,
+                st=frame_start,
+                ed=frame_end,
+                has_name=True,
+                review_reasons=_review_reason("marker2_blank_confirm_failed", frame_start, dialog_start - 1),
+            )
+        ]
+
+    _log(
+        f"[split_by_marker2] seg_id={marker_seg_id} split "
+        f"dialog_start={dialog_start} threshold={float(threshold):.4f}"
+    )
     return [
         _build_refined_subsegment(
             raw=raw,
@@ -1728,91 +2489,6 @@ def _split_segment_by_name_ocr(
             has_name=True,
         ),
     ]
-
-
-def _normalize_name_subsegments_per_marker(
-    segs: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if not segs:
-        return []
-    out: list[dict[str, Any]] = []
-    i = 0
-    while i < len(segs):
-        sid = int(segs[i].get("marker_seg_id", -1))
-        grp: list[dict[str, Any]] = []
-        while i < len(segs) and int(segs[i].get("marker_seg_id", -1)) == sid:
-            grp.append(segs[i])
-            i += 1
-        if not grp:
-            continue
-        scan_fps = float(grp[0]["scan_fps"])
-        start_sec = float(grp[0]["start_sec"])
-        marker_thr = float(grp[0].get("marker_presence_threshold_used", 0.0))
-        range_index = int(grp[0]["range_index"])
-        has_true = any(bool(g.get("has_name", False)) for g in grp)
-        fs = int(grp[0]["frame_start"])
-        fe = int(grp[-1]["frame_end"])
-        if not has_true:
-            out.append(
-                {
-                    "range_index": range_index,
-                    "frame_start": fs,
-                    "frame_end": fe,
-                    "time_start": start_sec + (fs / scan_fps),
-                    "time_end": start_sec + (fe / scan_fps),
-                    "has_name": False,
-                    "sample_frames": [],
-                    "scan_fps": scan_fps,
-                    "start_sec": start_sec,
-                    "stable_time": start_sec + ((fs + fe) / (2.0 * scan_fps)),
-                    "marker_presence_threshold_used": marker_thr,
-                    "marker_seg_id": sid,
-                }
-            )
-            continue
-        first_true_idx = next(
-            j for j, g in enumerate(grp) if bool(g.get("has_name", False))
-        )
-        if first_true_idx > 0:
-            bfs = int(grp[0]["frame_start"])
-            bfe = int(grp[first_true_idx - 1]["frame_end"])
-            if bfe >= bfs:
-                out.append(
-                    {
-                        "range_index": range_index,
-                        "frame_start": bfs,
-                        "frame_end": bfe,
-                        "time_start": start_sec + (bfs / scan_fps),
-                        "time_end": start_sec + (bfe / scan_fps),
-                        "has_name": False,
-                        "sample_frames": [],
-                        "scan_fps": scan_fps,
-                        "start_sec": start_sec,
-                        "stable_time": start_sec + ((bfs + bfe) / (2.0 * scan_fps)),
-                        "marker_presence_threshold_used": marker_thr,
-                        "marker_seg_id": sid,
-                    }
-                )
-        dfs = int(grp[first_true_idx]["frame_start"])
-        dfe = int(grp[-1]["frame_end"])
-        dmid = dfs + ((dfe - dfs) // 2)
-        out.append(
-            {
-                "range_index": range_index,
-                "frame_start": dfs,
-                "frame_end": dfe,
-                "time_start": start_sec + (dfs / scan_fps),
-                "time_end": start_sec + (dfe / scan_fps),
-                "has_name": True,
-                "sample_frames": [dmid],
-                "scan_fps": scan_fps,
-                "start_sec": start_sec,
-                "stable_time": start_sec + (dmid / scan_fps),
-                "marker_presence_threshold_used": marker_thr,
-                "marker_seg_id": sid,
-            }
-        )
-    return out
 
 
 def _pick_marker_anchor_frame(
@@ -1974,6 +2650,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
     name_roi = _roi_from_cfg(cfg, "name_roi")
     dialogue_roi = _roi_from_cfg(cfg, "dialogue_roi")
     marker_roi = _roi_from_cfg(cfg, "marker_roi")
+    marker2_roi = (
+        _roi_from_cfg(cfg, "marker_2_roi")
+        if isinstance(cfg.get("roi", {}).get("marker_2_roi"), list)
+        else marker_roi
+    )
     subtitle_location = cfg["roi"].get("subtitle_location", cfg["roi"].get("subtitle_roi"))
     if not isinstance(subtitle_location, list) or len(subtitle_location) != 4:
         raise RuntimeError("Invalid config: roi.subtitle_location must be [x1,y1,x2,y2]")
@@ -1992,7 +2673,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
         f"x={name_roi.x1},y={name_roi.y1},w={name_roi.width},h={name_roi.height}"
     )
     marker_matcher = None
+    marker2_matcher = None
     marker_cfg = cfg.get("marker", {})
+    marker2_cfg = cfg.get("marker_2", {})
     marker_workers = int(marker_cfg.get("parallel_workers", 1))
     marker_coarse_step = int(marker_cfg.get("coarse_step_frames", 1))
     marker_refine_margin = float(marker_cfg.get("refine_margin", 0.06))
@@ -2037,6 +2720,30 @@ def run_pipeline(args: argparse.Namespace) -> int:
         else:
             _log("Marker templates not found, fallback to mask mode.")
 
+    marker2_threshold = float(marker2_cfg.get("force_threshold", marker2_cfg.get("presence_threshold", 0.5)))
+    if bool(marker2_cfg.get("use_template", True)):
+        marker2_templates = _collect_marker_templates(marker2_cfg)
+        if marker2_templates:
+            marker2_matcher = MarkerTemplateMatcher(
+                marker2_templates,
+                center_width=(
+                    int(marker2_cfg.get("template_center_width"))
+                    if marker2_cfg.get("template_center_width") is not None
+                    else None
+                ),
+                vertical_shift_px=int(marker2_cfg.get("vertical_shift_px", 0)),
+                vertical_shift_step=int(marker2_cfg.get("vertical_shift_step", 1)),
+                horizontal_shift_px=int(marker2_cfg.get("horizontal_shift_px", 0)),
+                horizontal_shift_step=int(marker2_cfg.get("horizontal_shift_step", 1)),
+                shift_mode=str(marker2_cfg.get("shift_mode", "vertical")),
+            )
+            _log(
+                f"Marker2 template enabled: {marker2_matcher.template_count} templates "
+                f"(first={marker2_templates[0]}) threshold={marker2_threshold:.3f}"
+            )
+        else:
+            _log("Marker2 templates not found; marker2 split path unavailable.")
+
     ranges = [(0.0, video_meta.duration)]
     _log("Marker mode: scan full video once.")
 
@@ -2059,6 +2766,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             dialog_dir = work_dir / f"fine_{ridx:03d}_dialog"
             name_dir = work_dir / f"fine_{ridx:03d}_name"
             marker_dir = work_dir / f"fine_{ridx:03d}_marker"
+            marker2_dir = work_dir / f"fine_{ridx:03d}_marker2"
             dialogue_dir = work_dir / f"fine_{ridx:03d}_dialogue"
             marker_thr_eff = base_marker_threshold
             if marker_force_threshold is not None:
@@ -2107,6 +2815,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 start_sec=start_sec,
                 duration_sec=duration,
             )
+            marker2_paths: list[Path] = []
+            if marker2_matcher is not None:
+                marker2_paths = extract_sequence(
+                    ffmpeg_path=ffmpeg_path,
+                    video_path=args.video,
+                    output_dir=marker2_dir,
+                    fps=scan_fps,
+                    start_sec=start_sec,
+                    duration_sec=duration,
+                    vf_filters=[marker2_roi.as_crop_filter()],
+                )
 
             if marker_worker is not None:
                 worker_stop_event.set()
@@ -2115,6 +2834,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 _log("Marker prune worker finished.")
 
             _assert_crop_size(name_paths, name_roi, "fine window name")
+            if marker2_paths:
+                _assert_crop_size(marker2_paths, marker2_roi, "fine window marker2")
             dialog_paths = name_paths
 
             marker_stats: dict[str, int] = {}
@@ -2274,30 +2995,85 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _save_json(raw_seg_json, raw_segments)
         _log(f"Segmentation done. Raw segments: {len(raw_segments)}")
 
-    _log("Initializing OCR engine (name split / OCR tasks).")
-    ocr_engine = build_ocr_engine(cfg["ocr"])
-    ocr_info = ocr_engine.info()
-    _log(
-        "OCR engine: "
-        f"{ocr_info.get('engine')} / runtime={ocr_info.get('runtime')} / "
-        f"target={ocr_info.get('target_lang')} / actual={ocr_info.get('actual_lang')} / "
-        f"charset={ocr_info.get('charset_size')}"
-    )
-    if (
-        str(cfg["ocr"].get("rapidocr_rec_lang", "")).lower().startswith("japan")
-        and ocr_info.get("engine") == "rapidocr"
-        and ocr_info.get("actual_lang") == "non_japan_like"
-    ):
-        raise RuntimeError(
-            "OCR is configured for Japanese, but current RapidOCR model is non-Japanese. "
-            "Please provide Japanese OCR model files or switch to paddleocr_cli with --lang japan."
-        )
-    name_ocr_workers = int(cfg["ocr"].get("name_ocr_workers", 1))
-    name_ocr = NameOcrRunner(cfg["ocr"], ocr_engine, workers=name_ocr_workers)
-    _log(f"Name OCR workers: {name_ocr.workers}")
+    name_split_mode = str(getattr(args, "name_split_mode", "config") or "config").strip().lower()
+    split_name_enabled = bool(cfg["state_machine"].get("split_on_name_ocr", True))
+    if name_split_mode in {"mask", "ocr"}:
+        split_name_enabled = True
+    name_split_use_ocr = bool(cfg["state_machine"].get("name_split_use_ocr", True))
+    if name_split_mode == "mask":
+        name_split_use_ocr = False
+    elif name_split_mode == "ocr":
+        name_split_use_ocr = True
 
-    if bool(cfg["state_machine"].get("split_on_name_ocr", True)):
-        _log("Refining segments by name-region OCR.")
+    name_ocr: NameOcrRunner | None = None
+    if split_name_enabled and (not name_split_use_ocr) and marker2_matcher is None:
+        raise RuntimeError(
+            "OCR disabled, but marker_2.template_paths are not configured. "
+            "Set marker_2 templates in roi_editor or enable OCR."
+        )
+    if split_name_enabled and (not name_split_use_ocr) and marker2_matcher is not None:
+        _log("Refining segments by marker2 template presence (OCR disabled).")
+        refined = []
+        fast_frames = int(cfg["state_machine"].get("name_fast_check_frames", 5))
+        fast_hits = int(cfg["state_machine"].get("name_fast_min_hits", 4))
+        smooth_gap = int(cfg["state_machine"].get("name_smooth_blank_gap_frames", 1))
+        general_cfg = cfg.get("general", {})
+        min_blank = int(
+            general_cfg.get(
+                "blank_ignore_under_frames",
+                cfg["state_machine"].get("name_min_blank_frames", 1),
+            )
+        )
+        blank_verify_frames = int(cfg["state_machine"].get("name_blank_verify_frames", 3))
+        blank_verify_hits = int(cfg["state_machine"].get("name_blank_verify_min_hits", 1))
+        for raw in raw_segments:
+            ridx = int(raw["range_index"])
+            refined.extend(
+                _split_segment_by_marker2(
+                    raw,
+                    work_dir / f"fine_{ridx:03d}_marker2",
+                    marker2_matcher,
+                    threshold=marker2_threshold,
+                    fast_check_frames=fast_frames,
+                    fast_min_hits=fast_hits,
+                    min_blank_frames=min_blank,
+                    blank_verify_frames=blank_verify_frames,
+                    blank_verify_min_hits=blank_verify_hits,
+                    smooth_blank_gap_frames=smooth_gap,
+                )
+            )
+        refined = _normalize_name_subsegments_per_marker(refined)
+        _log(f"Marker2 refine: {len(raw_segments)} -> {len(refined)} segments.")
+        raw_segments = refined
+        _save_json(raw_seg_json, raw_segments)
+    elif split_name_enabled:
+        ocr_engine = None
+        if name_split_use_ocr:
+            _log("Initializing OCR engine (name split verification).")
+            ocr_engine = build_ocr_engine(cfg["ocr"])
+            ocr_info = ocr_engine.info()
+            _log(
+                "OCR engine: "
+                f"{ocr_info.get('engine')} / runtime={ocr_info.get('runtime')} / "
+                f"target={ocr_info.get('target_lang')} / actual={ocr_info.get('actual_lang')} / "
+                f"charset={ocr_info.get('charset_size')}"
+            )
+            if (
+                str(cfg["ocr"].get("rapidocr_rec_lang", "")).lower().startswith("japan")
+                and ocr_info.get("engine") == "rapidocr"
+                and ocr_info.get("actual_lang") == "non_japan_like"
+            ):
+                raise RuntimeError(
+                    "OCR is configured for Japanese, but current RapidOCR model is non-Japanese. "
+                    "Please provide Japanese OCR model files or switch to paddleocr_cli with --lang japan."
+                )
+        else:
+            _log("Name split mode: mask-only (OCR disabled).")
+        name_ocr_workers = int(cfg["ocr"].get("name_ocr_workers", 1)) if name_split_use_ocr else 1
+        name_ocr = NameOcrRunner(cfg["ocr"], ocr_engine, workers=name_ocr_workers)
+        _log(f"Name split workers: {name_ocr.workers}; use_ocr={name_split_use_ocr}")
+
+        _log("Refining segments by name-region presence.")
         refined: list[dict[str, Any]] = []
         fast_frames = int(cfg["state_machine"].get("name_fast_check_frames", 5))
         fast_hits = int(cfg["state_machine"].get("name_fast_min_hits", 4))
@@ -2314,7 +3090,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         blank_verify_hits = int(cfg["state_machine"].get("name_blank_verify_min_hits", 1))
         confirm_lookback_frames = int(general_cfg.get("name_confirm_lookback_frames", 10))
         _log(
-            f"Name OCR fast-check: first {fast_frames} frames, hits>={fast_hits}; "
+            f"Name split fast-check: first {fast_frames} frames, hits>={fast_hits}; "
             f"coarse_step={coarse_step}; smooth_blank_gap={smooth_gap}; "
             f"blank_ignore_under={min_blank}; "
             f"blank_verify={blank_verify_frames}/{blank_verify_hits}; "
@@ -2326,7 +3102,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             if idx == 1 or idx % 10 == 0 or idx == refine_total:
                 elapsed = (datetime.now() - refine_started_at).total_seconds()
                 _log(
-                    f"Name OCR refine progress: {idx}/{refine_total} "
+                    f"Name presence refine progress: {idx}/{refine_total} "
                     f"({(idx / max(1, refine_total)) * 100:.1f}%, elapsed={elapsed:.1f}s)"
                 )
             ridx = int(raw["range_index"])
@@ -2336,6 +3112,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     raw,
                     name_dir,
                     name_ocr,
+                    use_ocr=name_split_use_ocr,
                     fast_check_frames=fast_frames,
                     fast_min_hits=fast_hits,
                     coarse_step_frames=coarse_step,
@@ -2348,14 +3125,29 @@ def run_pipeline(args: argparse.Namespace) -> int:
             )
         refined = _normalize_name_subsegments_per_marker(refined)
         st = name_ocr.stats()
+        mask_total = int(st.get("mask_total", 0) or 0)
+        mask_avg = (
+            float(st.get("mask_score_sum", 0.0) or 0.0) / max(1, mask_total)
+            if mask_total
+            else 0.0
+        )
+        mask_min_score = st.get("mask_score_min")
+        mask_max_score = st.get("mask_score_max")
         _log(
             "Name presence stats: "
             f"total={st.get('total', 0)} "
+            f"mask_total={mask_total} "
             f"mask_only={st.get('mask_only', 0)} "
+            f"mask_on={st.get('mask_on', 0)} "
+            f"mask_off={st.get('mask_off', 0)} "
+            f"mask_uncertain={st.get('mask_uncertain', 0)} "
+            f"mask_rejected_shape={st.get('mask_rejected_shape', 0)} "
+            f"mask_score=min:{float(mask_min_score or 0.0):.4f}/"
+            f"avg:{mask_avg:.4f}/max:{float(mask_max_score or 0.0):.4f} "
             f"ocr_fallback={st.get('ocr_fallback', 0)} "
             f"ocr_verify={st.get('ocr_verify', 0)}"
         )
-        _log(f"Name OCR refine: {len(raw_segments)} -> {len(refined)} segments.")
+        _log(f"Name presence refine: {len(raw_segments)} -> {len(refined)} segments.")
         raw_segments = refined
         _save_json(raw_seg_json, raw_segments)
 
@@ -2381,6 +3173,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             llm_thinking_budget = None
     llm_preserve_thinking = bool(tr_cfg.get("preserve_thinking", False))
     vlm_io_log_enabled = bool(tr_cfg.get("io_log_enabled", False))
+    vlm_extra_requirements = str(game_cfg.get("extra_requirements", "")).strip()
     vlm_translator: BailianVlmTranslator | None = None
     translation_mode = str(tr_cfg.get("mode", "vlm_bailian")).lower()
     translate_llm = str(tr_cfg.get("translate_llm", "")).strip().lower()
@@ -2495,13 +3288,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         has_name = bool(raw.get("has_name", True))
         name_dir = work_dir / f"fine_{ridx:03d}_name"
         if debug_mode:
-            _export_name_frames_for_segment(
-                out_root=name_debug_root,
-                seg_label=seg_label,
-                name_dir=name_dir,
-                frame_start=int(raw["frame_start"]),
-                frame_end=int(raw["frame_end"]),
-            )
+                _export_name_frames_for_segment(
+                    out_root=name_debug_root,
+                    seg_label=seg_label,
+                    name_dir=name_dir,
+                    frame_start=int(raw["frame_start"]),
+                    frame_end=int(raw["frame_end"]),
+                    ocr_cfg=cfg["ocr"],
+                )
 
         selected_ts_for_ocr: float | None = None
         vlm_dialog_path: str | Path | None = None
@@ -2514,8 +3308,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             )
             selected_ts_for_ocr = float(raw["start_sec"]) + (float(anchor_fid) / float(raw["scan_fps"]))
         
-        review_reasons: list[str] = []
-        needs_review = False
+        review_reasons = _coerce_review_reasons(raw.get("review_reason"))
+        needs_review = bool(raw.get("needs_review", False)) or bool(review_reasons)
 
         frame_start_abs = int(round(raw["time_start"] * base_fps))
         frame_end_abs = int(round(raw["time_end"] * base_fps))
@@ -2576,7 +3370,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             seg.translation_subtitle = debug_text
         final_segments.append(seg)
 
-        cached_item: dict[str, str] | None = None
+        cached_item: dict[str, Any] | None = None
         if has_name and vlm_translator is not None:
             k1 = _subtitle_cache_key(
                 seg.segment_id,
@@ -2597,6 +3391,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     seg.speaker = cached_speaker
                 seg.text_original = str(cached_item.get("text_original", "") or "")
                 seg.translation_subtitle = str(cached_item.get("translation_subtitle", "") or "")
+                cached_reasons = _coerce_review_reasons(cached_item.get("review_reason"))
+                if bool(cached_item.get("needs_review", False)) or cached_reasons:
+                    seg.needs_review = True
+                    seg.review_reason = _merge_review_reasons(seg.review_reason, cached_reasons)
                 cache_hit_count += 1
                 _log(
                     f"[VLM] segment {seg.segment_id}: cache hit, skip image load and request"
@@ -2679,6 +3477,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
             if dialogue_image is None or name_image is None:
                 _log(f"[IMAGE_CACHE] image_prepare_failed segment={i}")
+                seg.translation_subtitle = debug_text
+                seg.review_reason = _merge_review_reasons(
+                    seg.review_reason,
+                    ["image_prepare_failed"],
+                )
+                seg.needs_review = True
                 if fallback_image is not None:
                     fallback_image.close()
                 continue
@@ -2724,6 +3528,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                         vlm_dialog_path,
                         "",
                         history_items=history_items,
+                        extra_requirements=vlm_extra_requirements,
                     )
                     vlm_prompt_tokens_total += int(usage.get("prompt_tokens", 0))
                     vlm_completion_tokens_total += int(usage.get("completion_tokens", 0))
@@ -2774,6 +3579,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     vlm_dialog_path,
                     "",
                     history_items,
+                    extra_requirements=vlm_extra_requirements,
                 )
                 pending_vlm[fut] = (seg, debug_text)
 
@@ -2824,7 +3630,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
         )
     if vlm_pool is not None:
         vlm_pool.shutdown(wait=True)
-    name_ocr.close()
+    if name_ocr is not None:
+        name_ocr.close()
 
     final_json = work_dir / "segments.json"
     _log("Writing segments.json / subtitle files")
@@ -2975,6 +3782,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="Enable debug artifacts (marker_by_segment/name_by_segment and keep fine_* intermediates).",
+    )
+    parser.add_argument(
+        "--name-split-mode",
+        choices=["config", "mask", "ocr"],
+        default="config",
+        help="Name-region split verification mode. Use mask for no OCR, ocr for OCR confirmation.",
     )
     return parser
 

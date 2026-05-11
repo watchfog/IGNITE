@@ -30,3 +30,14 @@ outputs/*
 
 # Ignore vs code settings
 .vscode/*
+
+# Ignore archived files
+archive/
+!archive/.gitkeep
+
+# Ignore video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm

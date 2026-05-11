@@ -33,6 +33,7 @@ ROI_KEYS = [
     "name_roi",
     "dialogue_roi",
     "marker_roi",
+    "marker_2_roi",
     "subtitle_location",
     "title_ocr_roi",
     "title_translation_location",
@@ -42,12 +43,14 @@ ROI_COLORS = {
     "name_roi": "#ffbf00",
     "dialogue_roi": "#0896e0",
     "marker_roi": "#e32636",
+    "marker_2_roi": "#ff7f00",
     "subtitle_location": "#bf00ff",
     "title_ocr_roi": "#c0c0c0",
     "title_translation_location": "#36bf36",
     "title_info_location": "#ff0da6",
 }
 DEFAULT_MARKER_FORCE_THRESHOLD = 0.6
+DEFAULT_MARKER2_FORCE_THRESHOLD = 0.5
 
 
 def _load_raw_cfg(path: Path) -> dict[str, Any]:
@@ -101,16 +104,27 @@ class RoiEditorApp:
         self.anchor_from_end_var = tk.StringVar(value="3")
         self.blank_ignore_var = tk.StringVar(value="1")
         self.game_name_var = tk.StringVar(value="")
+        self.extra_requirements_var = tk.StringVar(value="")
         self.source_lang_var = tk.StringVar(value="ja")
         self.target_lang_var = tk.StringVar(value="zh-CN")
         self.vlm_models_var = tk.StringVar(value="qwen3.6-plus")
         self.vlm_model_var = tk.StringVar(value="qwen3.6-plus")
-        self.match_score_var = tk.StringVar(value="匹配分数: N/A")
+        self.match_score_var = tk.StringVar(value="Marker匹配分数: N/A")
+        self.marker2_template_paths_var = tk.StringVar(value="")
+        self.marker2_template_selected_var = tk.StringVar(value="")
+        self.marker2_shift_mode_var = tk.StringVar(value="vertical")
+        self.marker2_vshift_px_var = tk.StringVar(value="6")
+        self.marker2_vshift_step_var = tk.StringVar(value="1")
+        self.marker2_hshift_px_var = tk.StringVar(value="0")
+        self.marker2_hshift_step_var = tk.StringVar(value="1")
+        self.marker2_force_thd_var = tk.StringVar(value=str(DEFAULT_MARKER2_FORCE_THRESHOLD))
+        self.marker2_match_score_var = tk.StringVar(value="Marker2匹配分数: N/A")
         self.output_name_var = tk.StringVar(value=output_name.strip())
         self._last_auto_output_name = ""
         self._suppress_output_name_trace = False
         self.post_action_make_subtitle_var = tk.BooleanVar(value=False)
         self.skip_translation_var = tk.BooleanVar(value=False)
+        self.enable_name_ocr_var = tk.BooleanVar(value=False)
         self.debug_mode_var = tk.BooleanVar(value=False)
         self.template_center_width: int | None = None
         self.ffmpeg_path = (ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe").resolve()
@@ -221,6 +235,11 @@ class RoiEditorApp:
         ttk.Entry(top, textvariable=self.output_name_var, width=24).grid(
             row=2, column=6, columnspan=2, sticky="w", padx=(6, 0)
         )
+        ttk.Label(top, text="游戏名称").grid(row=2, column=8, sticky="e", padx=(10, 0))
+        ttk.Entry(top, textvariable=self.game_name_var, width=20).grid(
+            row=2, column=9, sticky="w", padx=(6, 4)
+        )
+        ttk.Button(top, text="编辑额外要求", command=self._edit_extra_requirements).grid(row=2, column=10, padx=2)
 
         ttk.Label(top, text="时间(秒)").grid(row=3, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.time_var, width=12).grid(row=3, column=1, sticky="w", padx=(6, 4))
@@ -234,7 +253,8 @@ class RoiEditorApp:
         ).grid(row=3, column=5, sticky="w")
         ttk.Checkbutton(top, text="Debug", variable=self.debug_mode_var).grid(row=3, column=6, sticky="w")
         ttk.Checkbutton(top, text="跳过翻译", variable=self.skip_translation_var).grid(row=3, column=7, sticky="w")
-        ttk.Button(top, text="运行流程", command=self._run_pipeline_from_gui).grid(row=3, column=8, padx=2)
+        ttk.Checkbutton(top, text="启用OCR", variable=self.enable_name_ocr_var).grid(row=3, column=8, sticky="w")
+        ttk.Button(top, text="运行流程", command=self._run_pipeline_from_gui).grid(row=3, column=9, padx=2)
 
         self.time_scale = ttk.Scale(
             top,
@@ -246,16 +266,16 @@ class RoiEditorApp:
         self.time_scale.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(6, 0))
         self.time_scale.bind("<ButtonRelease-1>", self._on_scale_release)
 
-        ttk.Label(top, text="模板路径").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="Marker模板路径").grid(row=5, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(top, textvariable=self.template_paths_var, width=86).grid(
             row=5, column=1, columnspan=3, sticky="ew", padx=(6, 4), pady=(6, 0)
         )
-        ttk.Button(top, text="选择模板", command=self._pick_templates).grid(row=5, column=4, padx=2, pady=(6, 0))
+        ttk.Button(top, text="选择Marker模板", command=self._pick_templates).grid(row=5, column=4, padx=2, pady=(6, 0))
         ttk.Button(top, text="截取 Marker", command=self._capture_marker_template).grid(
             row=5, column=5, padx=2, pady=(6, 0)
         )
 
-        ttk.Label(top, text="当前模板").grid(row=6, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="当前Marker模板").grid(row=6, column=0, sticky="w", pady=(4, 0))
         self.template_select_combo = ttk.Combobox(
             top,
             textvariable=self.template_selected_var,
@@ -267,23 +287,23 @@ class RoiEditorApp:
             row=6, column=4, columnspan=2, sticky="w", pady=(4, 0)
         )
 
-        ttk.Label(top, text="位移方向").grid(row=7, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="Marker位移方向").grid(row=7, column=0, sticky="w", pady=(4, 0))
         ttk.OptionMenu(top, self.shift_mode_var, self.shift_mode_var.get(), "vertical", "horizontal").grid(
             row=7, column=1, sticky="w", padx=(6, 4), pady=(4, 0)
         )
-        ttk.Label(top, text="上下位移(px/步长)").grid(row=7, column=2, sticky="e", pady=(4, 0))
+        ttk.Label(top, text="Marker上下位移(px/步长)").grid(row=7, column=2, sticky="e", pady=(4, 0))
         vs = ttk.Frame(top)
         vs.grid(row=7, column=3, sticky="w", pady=(4, 0))
         ttk.Entry(vs, textvariable=self.vshift_px_var, width=8).pack(side=tk.LEFT)
         ttk.Entry(vs, textvariable=self.vshift_step_var, width=8).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(top, text="左右位移(px/步长)").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="Marker左右位移(px/步长)").grid(row=8, column=0, sticky="w", pady=(4, 0))
         hs = ttk.Frame(top)
         hs.grid(row=8, column=1, sticky="w", padx=(6, 4), pady=(4, 0))
         ttk.Entry(hs, textvariable=self.hshift_px_var, width=8).pack(side=tk.LEFT)
         ttk.Entry(hs, textvariable=self.hshift_step_var, width=8).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(top, text="强制阈值").grid(row=8, column=2, sticky="e", pady=(4, 0))
+        ttk.Label(top, text="Marker强制阈值").grid(row=8, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(top, textvariable=self.force_thd_var, width=12).grid(row=8, column=3, sticky="w", pady=(4, 0))
 
         ttk.Label(top, text="OCR锚点(距尾帧数)").grid(row=9, column=0, sticky="w", pady=(4, 0))
@@ -293,23 +313,60 @@ class RoiEditorApp:
         ttk.Label(top, text="blank最小帧数").grid(row=9, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(top, textvariable=self.blank_ignore_var, width=12).grid(row=9, column=3, sticky="w", pady=(4, 0))
 
-        ttk.Label(top, text="源语言").grid(row=10, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="Marker2模板路径").grid(row=10, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.marker2_template_paths_var, width=86).grid(
+            row=10, column=1, columnspan=3, sticky="ew", padx=(6, 4), pady=(6, 0)
+        )
+        ttk.Button(top, text="选择Marker2模板", command=self._pick_marker2_templates).grid(row=10, column=4, padx=2, pady=(6, 0))
+        ttk.Button(top, text="截取 Marker2", command=self._capture_marker2_template).grid(row=10, column=5, padx=2, pady=(6, 0))
+
+        ttk.Label(top, text="当前Marker2模板").grid(row=11, column=0, sticky="w", pady=(4, 0))
+        self.marker2_template_select_combo = ttk.Combobox(
+            top,
+            textvariable=self.marker2_template_selected_var,
+            state="readonly",
+            width=72,
+        )
+        self.marker2_template_select_combo.grid(row=11, column=1, columnspan=3, sticky="ew", padx=(6, 4), pady=(4, 0))
+        ttk.Label(top, textvariable=self.marker2_match_score_var, foreground="#9a4b00").grid(
+            row=11, column=4, columnspan=2, sticky="w", pady=(4, 0)
+        )
+
+        ttk.Label(top, text="Marker2位移方向").grid(row=12, column=0, sticky="w", pady=(4, 0))
+        ttk.OptionMenu(
+            top,
+            self.marker2_shift_mode_var,
+            self.marker2_shift_mode_var.get(),
+            "vertical",
+            "horizontal",
+        ).grid(row=12, column=1, sticky="w", padx=(6, 4), pady=(4, 0))
+        ttk.Label(top, text="Marker2上下位移(px/步长)").grid(row=12, column=2, sticky="e", pady=(4, 0))
+        m2vs = ttk.Frame(top)
+        m2vs.grid(row=12, column=3, sticky="w", pady=(4, 0))
+        ttk.Entry(m2vs, textvariable=self.marker2_vshift_px_var, width=8).pack(side=tk.LEFT)
+        ttk.Entry(m2vs, textvariable=self.marker2_vshift_step_var, width=8).pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(top, text="Marker2左右位移(px/步长)").grid(row=13, column=0, sticky="w", pady=(4, 0))
+        m2hs = ttk.Frame(top)
+        m2hs.grid(row=13, column=1, sticky="w", padx=(6, 4), pady=(4, 0))
+        ttk.Entry(m2hs, textvariable=self.marker2_hshift_px_var, width=8).pack(side=tk.LEFT)
+        ttk.Entry(m2hs, textvariable=self.marker2_hshift_step_var, width=8).pack(side=tk.LEFT, padx=6)
+        ttk.Label(top, text="Marker2强制阈值").grid(row=13, column=2, sticky="e", pady=(4, 0))
+        ttk.Entry(top, textvariable=self.marker2_force_thd_var, width=12).grid(row=13, column=3, sticky="w", pady=(4, 0))
+
+        ttk.Label(top, text="源语言").grid(row=14, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(top, textvariable=self.source_lang_var, width=12).grid(
-            row=10, column=1, sticky="w", padx=(6, 4), pady=(4, 0)
+            row=14, column=1, sticky="w", padx=(6, 4), pady=(4, 0)
         )
-        ttk.Label(top, text="目标语言").grid(row=10, column=2, sticky="e", pady=(4, 0))
-        ttk.Entry(top, textvariable=self.target_lang_var, width=12).grid(row=10, column=3, sticky="w", pady=(4, 0))
-        ttk.Label(top, text="游戏名称").grid(row=10, column=4, sticky="e", pady=(4, 0))
-        ttk.Entry(top, textvariable=self.game_name_var, width=24).grid(
-            row=10, column=5, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0)
-        )
-        ttk.Label(top, text="VLM模型(逗号分隔)").grid(row=11, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="目标语言").grid(row=14, column=2, sticky="e", pady=(4, 0))
+        ttk.Entry(top, textvariable=self.target_lang_var, width=12).grid(row=14, column=3, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="VLM模型(逗号分隔)").grid(row=15, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(top, textvariable=self.vlm_models_var, width=86).grid(
-            row=11, column=1, columnspan=5, sticky="ew", padx=(6, 4), pady=(4, 0)
+            row=15, column=1, columnspan=5, sticky="ew", padx=(6, 4), pady=(4, 0)
         )
-        ttk.Label(top, text="当前VLM模型").grid(row=12, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(top, text="当前VLM模型").grid(row=16, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(top, textvariable=self.vlm_model_var, width=40).grid(
-            row=12, column=1, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0)
+            row=16, column=1, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0)
         )
 
         top.columnconfigure(1, weight=1)
@@ -320,7 +377,7 @@ class RoiEditorApp:
             info,
             text=(
                 "用法：先选择 ROI 组件，再在画面上按住左键拖动框选。"
-                "当前帧匹配分数会自动刷新。"
+                "当前帧Marker/Marker2匹配分数会自动刷新。"
             ),
         ).pack(anchor="w")
         ttk.Label(info, textvariable=self.status_var, foreground="#1f5f99").pack(anchor="w")
@@ -347,6 +404,7 @@ class RoiEditorApp:
 
     def _bind_live_updates(self) -> None:
         self.template_paths_var.trace_add("write", lambda *_: self._on_template_paths_changed())
+        self.marker2_template_paths_var.trace_add("write", lambda *_: self._on_marker2_template_paths_changed())
         for var in [
             self.template_selected_var,
             self.shift_mode_var,
@@ -356,17 +414,35 @@ class RoiEditorApp:
             self.hshift_step_var,
         ]:
             var.trace_add("write", lambda *_: self._update_match_score())
+        for var in [
+            self.marker2_template_selected_var,
+            self.marker2_shift_mode_var,
+            self.marker2_vshift_px_var,
+            self.marker2_vshift_step_var,
+            self.marker2_hshift_px_var,
+            self.marker2_hshift_step_var,
+            self.marker2_force_thd_var,
+        ]:
+            var.trace_add("write", lambda *_: self._update_marker2_match_score())
         self.vlm_models_var.trace_add("write", lambda *_: self._sync_current_model_from_list())
         self.output_name_var.trace_add("write", lambda *_: self._on_output_name_changed())
         for var in [
             self.video_path_var,
             self.template_paths_var,
+            self.marker2_template_paths_var,
             self.shift_mode_var,
             self.vshift_px_var,
             self.vshift_step_var,
             self.hshift_px_var,
             self.hshift_step_var,
             self.force_thd_var,
+            self.marker2_template_selected_var,
+            self.marker2_shift_mode_var,
+            self.marker2_vshift_px_var,
+            self.marker2_vshift_step_var,
+            self.marker2_hshift_px_var,
+            self.marker2_hshift_step_var,
+            self.marker2_force_thd_var,
             self.anchor_from_end_var,
             self.blank_ignore_var,
             self.game_name_var,
@@ -375,13 +451,14 @@ class RoiEditorApp:
             self.vlm_models_var,
             self.vlm_model_var,
             self.output_name_var,
+            self.extra_requirements_var,
         ]:
             var.trace_add("write", lambda *_: self._schedule_profile_preview_refresh())
 
     def _pick_video(self) -> None:
         p = filedialog.askopenfilename(
             title="选择视频",
-            filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi"), ("所有文件", "*.*")],
+            filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
         )
         if p:
             vp = Path(p).resolve()
@@ -440,6 +517,7 @@ class RoiEditorApp:
             "video_path": "",
             "roi": {},
             "marker": self._default_marker_payload(),
+            "marker_2": self._default_marker2_payload(),
             "general": {
                 "blank_ignore_under_frames": 1,
             },
@@ -455,6 +533,11 @@ class RoiEditorApp:
             "horizontal_shift_step": 1,
             "force_threshold": DEFAULT_MARKER_FORCE_THRESHOLD,
         }
+
+    def _default_marker2_payload(self) -> dict[str, Any]:
+        payload = self._default_marker_payload()
+        payload["force_threshold"] = DEFAULT_MARKER2_FORCE_THRESHOLD
+        return payload
 
     def _selected_video_cfg_path(self) -> str:
         raw_video = self.video_path_var.get().strip()
@@ -474,6 +557,7 @@ class RoiEditorApp:
 
     def _remove_imported_marker_config(self, payload: dict[str, Any]) -> None:
         payload["marker"] = self._default_marker_payload()
+        payload["marker_2"] = self._default_marker2_payload()
 
     def _create_new_profile(self) -> None:
         default_dir = (ROOT / "config").resolve()
@@ -528,7 +612,7 @@ class RoiEditorApp:
         self._remove_imported_marker_config(payload)
 
         out = Path(save_path).resolve()
-        _save_raw_cfg(out, payload)
+        _save_raw_cfg(out, self._ordered_profile_payload(payload))
         self.config_path_var.set(str(out.as_posix()))
         self.status_var.set(f"已导入并新建配置: {out.as_posix()}")
         self._load_config_only()
@@ -662,6 +746,17 @@ class RoiEditorApp:
         self.template_center_width = int(marker_cfg.get("template_center_width")) if marker_cfg.get("template_center_width") is not None else None
         force_thd = marker_cfg.get("force_threshold", DEFAULT_MARKER_FORCE_THRESHOLD)
         self.force_thd_var.set(str(force_thd))
+        marker2_cfg = self.cfg_merged.get("marker_2", {})
+        marker2_tpl_list = [str(x) for x in (marker2_cfg.get("template_paths") or [])] if isinstance(marker2_cfg.get("template_paths"), list) else []
+        self.marker2_template_paths_var.set(";".join(marker2_tpl_list))
+        self.marker2_shift_mode_var.set(
+            "horizontal" if str(marker2_cfg.get("shift_mode", "vertical")).lower() == "horizontal" else "vertical"
+        )
+        self.marker2_vshift_px_var.set(str(int(marker2_cfg.get("vertical_shift_px", 6))))
+        self.marker2_vshift_step_var.set(str(int(marker2_cfg.get("vertical_shift_step", 1))))
+        self.marker2_hshift_px_var.set(str(int(marker2_cfg.get("horizontal_shift_px", 0))))
+        self.marker2_hshift_step_var.set(str(int(marker2_cfg.get("horizontal_shift_step", 1))))
+        self.marker2_force_thd_var.set(str(marker2_cfg.get("force_threshold", DEFAULT_MARKER2_FORCE_THRESHOLD)))
         self.anchor_from_end_var.set(
             str(max(1, self._int_or_default(str(marker_cfg.get("ocr_anchor_from_end_frames", 3)), 3)))
         )
@@ -671,6 +766,7 @@ class RoiEditorApp:
         )
         game_cfg = self.cfg_merged.get("game", {})
         self.game_name_var.set(str(game_cfg.get("name", "")))
+        self.extra_requirements_var.set(str(game_cfg.get("extra_requirements", "") or ""))
         self.source_lang_var.set(str(game_cfg.get("source_language", "ja")))
         self.target_lang_var.set(str(game_cfg.get("target_language", "zh-CN")))
         tr_cfg = self.cfg_merged.get("translation", {})
@@ -715,11 +811,13 @@ class RoiEditorApp:
             self._ensure_output_name_default()
 
         self._refresh_template_selector()
+        self._refresh_marker2_template_selector()
         self._reset_history()
         self.status_var.set(f"配置已加载: {cfg_path.as_posix()}")
         self._load_profile_text_from_file()
         self._refresh_canvas()
         self._update_match_score()
+        self._update_marker2_match_score()
 
     def _reload_video(self) -> None:
         raw = self.video_path_var.get().strip()
@@ -794,6 +892,61 @@ class RoiEditorApp:
         self.root.wait_window(win)
         return choice["mode"]
 
+    def _edit_extra_requirements(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("编辑额外要求")
+        win.geometry("640x360")
+        win.transient(self.root)
+
+        text_frame = ttk.Frame(win, padding=8)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        lbl = ttk.Label(text_frame, text="为翻译添加的额外要求（可多行）:")
+        lbl.pack(anchor="w")
+        txt = tk.Text(text_frame, wrap=tk.WORD, height=15)
+        txt.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        cur = str(self.extra_requirements_var.get() or "")
+        if cur:
+            txt.insert("1.0", cur)
+
+        btns = ttk.Frame(text_frame)
+        btns.pack(fill=tk.X, pady=(8, 0))
+
+        def _on_ok() -> None:
+            val = txt.get("1.0", tk.END).rstrip("\n")
+            self.extra_requirements_var.set(val)
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _on_cancel() -> None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text="确定", command=_on_ok).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="取消", command=_on_cancel).pack(side=tk.RIGHT)
+        win.protocol("WM_DELETE_WINDOW", _on_cancel)
+        win.bind("<Escape>", lambda _e: _on_cancel())
+        self.root.update_idletasks()
+        win.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        ww = win.winfo_width()
+        wh = win.winfo_height()
+        px = rx + max(0, (rw - ww) // 2)
+        py = ry + max(0, (rh - wh) // 2)
+        win.geometry(f"{ww}x{wh}+{px}+{py}")
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        win.focus_set()
+        self.root.wait_window(win)
+
     def _repair_video_with_ffmpeg(self) -> None:
         raw = self.video_path_var.get().strip()
         if not raw:
@@ -821,7 +974,7 @@ class RoiEditorApp:
                 initialdir=str(src.parent),
                 initialfile=f"{src.stem}_repaired{src.suffix}",
                 defaultextension=src.suffix or ".mp4",
-                filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi"), ("所有文件", "*.*")],
+                filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
             )
             if not save_path:
                 return
@@ -878,6 +1031,11 @@ class RoiEditorApp:
 
     def _run_ffmpeg_repair_pipeline(self, src: Path, out: Path) -> tuple[bool, str]:
         out.parent.mkdir(parents=True, exist_ok=True)
+        faststart_args = (
+            ["-movflags", "+faststart"]
+            if out.suffix.lower() in {".mp4", ".m4v", ".mov"}
+            else []
+        )
         cmd_remux = [
             str(self.ffmpeg_path),
             "-y",
@@ -893,8 +1051,7 @@ class RoiEditorApp:
             "0",
             "-c",
             "copy",
-            "-movflags",
-            "+faststart",
+            *faststart_args,
             str(out),
         ]
         ok, detail = self._run_ffmpeg_cmd(cmd_remux)
@@ -928,8 +1085,7 @@ class RoiEditorApp:
             "aac",
             "-b:a",
             "192k",
-            "-movflags",
-            "+faststart",
+            *faststart_args,
             str(out),
         ]
         ok2, detail2 = self._run_ffmpeg_cmd(cmd_transcode)
@@ -1029,6 +1185,8 @@ class RoiEditorApp:
                 errs.append(f"配置加载失败：{exc}")
 
         required_rois = ["name_roi", "dialogue_roi", "marker_roi"]
+        if not bool(self.enable_name_ocr_var.get()):
+            required_rois.append("marker_2_roi")
         for key in required_rois:
             rect = self.rois.get(key)
             if not rect or len(rect) != 4:
@@ -1037,6 +1195,10 @@ class RoiEditorApp:
             x0, y0, x1, y1 = rect
             if int(x1) - int(x0) < 2 or int(y1) - int(y0) < 2:
                 errs.append(f"区域无效（过小）：{key}")
+        if not bool(self.enable_name_ocr_var.get()):
+            marker2_paths = self._parse_marker2_template_paths()
+            if not marker2_paths:
+                errs.append("未启用OCR时必须配置 Marker2 模板。")
 
         self._ensure_output_name_default()
         if not self._sanitize_output_name(self.output_name_var.get()):
@@ -1256,6 +1418,12 @@ class RoiEditorApp:
             cmd.append("--skip-translation")
         if bool(self.debug_mode_var.get()):
             cmd.append("--debug")
+        cmd.extend(
+            [
+                "--name-split-mode",
+                "ocr" if bool(self.enable_name_ocr_var.get()) else "mask",
+            ]
+        )
         return cmd
 
     def _open_video(self, video_path: str) -> None:
@@ -1494,6 +1662,7 @@ class RoiEditorApp:
             self._refresh_canvas()
             if update_match_score:
                 self._update_match_score()
+                self._update_marker2_match_score()
         finally:
             self._is_seeking = False
 
@@ -1624,6 +1793,7 @@ class RoiEditorApp:
                     self._set_frame(rgb)
                     self._refresh_canvas()
                     self._update_match_score()
+                    self._update_marker2_match_score()
 
                 self.root.after(0, _apply)
 
@@ -1723,6 +1893,12 @@ class RoiEditorApp:
 
     def _parse_template_paths(self) -> list[str]:
         raw = self.template_paths_var.get().strip()
+        return self._parse_template_paths_text(raw)
+
+    def _parse_marker2_template_paths(self) -> list[str]:
+        return self._parse_template_paths_text(self.marker2_template_paths_var.get().strip())
+
+    def _parse_template_paths_text(self, raw: str) -> list[str]:
         if not raw:
             return []
         out: list[str] = []
@@ -1736,6 +1912,10 @@ class RoiEditorApp:
         self._refresh_template_selector()
         self._update_match_score()
 
+    def _on_marker2_template_paths_changed(self) -> None:
+        self._refresh_marker2_template_selector()
+        self._update_marker2_match_score()
+
     def _refresh_template_selector(self) -> None:
         vals = self._parse_template_paths()
         self.template_select_combo.configure(values=vals)
@@ -1745,6 +1925,15 @@ class RoiEditorApp:
         if not vals:
             self.template_selected_var.set("")
 
+    def _refresh_marker2_template_selector(self) -> None:
+        vals = self._parse_marker2_template_paths()
+        self.marker2_template_select_combo.configure(values=vals)
+        cur = self.marker2_template_selected_var.get().strip()
+        if vals and cur not in vals:
+            self.marker2_template_selected_var.set(vals[0])
+        if not vals:
+            self.marker2_template_selected_var.set("")
+
     def _to_abs_template_path(self, path_text: str) -> Path:
         p = Path(path_text)
         if p.is_absolute():
@@ -1753,7 +1942,7 @@ class RoiEditorApp:
 
     def _pick_templates(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="选择 marker 模板（可多选）",
+            title="选择 Marker 模板（可多选）",
             filetypes=[("图像文件", "*.png *.jpg *.jpeg *.bmp *.webp"), ("所有文件", "*.*")],
         )
         if not paths:
@@ -1761,9 +1950,44 @@ class RoiEditorApp:
         vals = [self._to_cfg_path(Path(p).resolve()) for p in paths]
         self.template_paths_var.set(";".join(vals))
         self._record_history()
-        self.status_var.set(f"已选择模板: {len(vals)}")
+        self.status_var.set(f"已选择Marker模板: {len(vals)}")
+
+    def _pick_marker2_templates(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="选择 Marker2 模板（可多选）",
+            filetypes=[("图像文件", "*.png *.jpg *.jpeg *.bmp *.webp"), ("所有文件", "*.*")],
+        )
+        if not paths:
+            return
+        vals = [self._to_cfg_path(Path(p).resolve()) for p in paths]
+        self.marker2_template_paths_var.set(";".join(vals))
+        self._record_history()
+        self.status_var.set(f"已选择 Marker2 模板: {len(vals)}")
 
     def _capture_marker_template(self) -> None:
+        self._capture_template_for_roi(
+            roi_key="marker_roi",
+            target_var=self.template_paths_var,
+            prefix="marker_template",
+            title="保存 marker 模板",
+        )
+
+    def _capture_marker2_template(self) -> None:
+        self._capture_template_for_roi(
+            roi_key="marker_2_roi",
+            target_var=self.marker2_template_paths_var,
+            prefix="marker2_template",
+            title="保存 marker2 模板",
+        )
+
+    def _capture_template_for_roi(
+        self,
+        *,
+        roi_key: str,
+        target_var: tk.StringVar,
+        prefix: str,
+        title: str,
+    ) -> None:
         if self.frame_rgb_full is None:
             self.status_var.set("当前没有可用帧。")
             return
@@ -1777,9 +2001,9 @@ class RoiEditorApp:
             messagebox.showwarning("未打开 Profile", "当前 profile 不存在，请先加载有效的 profile。", parent=self.root)
             self.status_var.set("profile 不存在。")
             return
-        rect = self.rois.get("marker_roi")
+        rect = self.rois.get(roi_key)
         if not rect:
-            self.status_var.set("marker_roi 尚未设置。")
+            self.status_var.set(f"{roi_key} 尚未设置。")
             return
         x0, y0, x1, y1 = rect
         h, w = self.frame_rgb_full.shape[:2]
@@ -1788,7 +2012,7 @@ class RoiEditorApp:
         y0 = max(0, min(y0, h - 1))
         y1 = max(0, min(y1, h))
         if x1 <= x0 or y1 <= y0:
-            self.status_var.set("marker_roi 无效。")
+            self.status_var.set(f"{roi_key} 无效。")
             return
 
         crop = self.frame_rgb_full[y0:y1, x0:x1].copy()
@@ -1796,10 +2020,10 @@ class RoiEditorApp:
         default_dir = (ROOT / "config" / profile_name).resolve()
         created_default_dir = not default_dir.exists()
         default_dir.mkdir(parents=True, exist_ok=True)
-        default_name = f"marker_template_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        default_name = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
 
         save_path = filedialog.asksaveasfilename(
-            title="保存 marker 模板",
+            title=title,
             defaultextension=".png",
             initialdir=str(default_dir),
             initialfile=default_name,
@@ -1814,11 +2038,11 @@ class RoiEditorApp:
             self._remove_empty_created_dir(default_dir, created_default_dir)
             self.status_var.set(f"模板保存失败: {out}")
             return
-        paths = self._parse_template_paths()
+        paths = self._parse_template_paths_text(target_var.get())
         rel = self._to_cfg_path(out)
         if rel not in paths:
             paths.append(rel)
-            self.template_paths_var.set(";".join(paths))
+            target_var.set(";".join(paths))
             self._record_history()
         self.status_var.set(f"模板已保存: {out}")
 
@@ -1836,6 +2060,14 @@ class RoiEditorApp:
             "rois": {k: list(v) for k, v in self.rois.items()},
             "template_paths": self.template_paths_var.get(),
             "template_selected": self.template_selected_var.get(),
+            "marker2_template_paths": self.marker2_template_paths_var.get(),
+            "marker2_template_selected": self.marker2_template_selected_var.get(),
+            "marker2_force_thd": self.marker2_force_thd_var.get(),
+            "marker2_shift_mode": self.marker2_shift_mode_var.get(),
+            "marker2_vshift_px": self.marker2_vshift_px_var.get(),
+            "marker2_vshift_step": self.marker2_vshift_step_var.get(),
+            "marker2_hshift_px": self.marker2_hshift_px_var.get(),
+            "marker2_hshift_step": self.marker2_hshift_step_var.get(),
             "shift_mode": self.shift_mode_var.get(),
             "vshift_px": self.vshift_px_var.get(),
             "vshift_step": self.vshift_step_var.get(),
@@ -1850,6 +2082,14 @@ class RoiEditorApp:
             self.rois = {k: list(v) for k, v in (st.get("rois") or {}).items()}
             self.template_paths_var.set(str(st.get("template_paths", "")))
             self.template_selected_var.set(str(st.get("template_selected", "")))
+            self.marker2_template_paths_var.set(str(st.get("marker2_template_paths", "")))
+            self.marker2_template_selected_var.set(str(st.get("marker2_template_selected", "")))
+            self.marker2_force_thd_var.set(str(st.get("marker2_force_thd", DEFAULT_MARKER2_FORCE_THRESHOLD)))
+            self.marker2_shift_mode_var.set(str(st.get("marker2_shift_mode", "vertical")))
+            self.marker2_vshift_px_var.set(str(st.get("marker2_vshift_px", "6")))
+            self.marker2_vshift_step_var.set(str(st.get("marker2_vshift_step", "1")))
+            self.marker2_hshift_px_var.set(str(st.get("marker2_hshift_px", "0")))
+            self.marker2_hshift_step_var.set(str(st.get("marker2_hshift_step", "1")))
             self.shift_mode_var.set(str(st.get("shift_mode", "vertical")))
             self.vshift_px_var.set(str(st.get("vshift_px", "6")))
             self.vshift_step_var.set(str(st.get("vshift_step", "1")))
@@ -1858,6 +2098,7 @@ class RoiEditorApp:
             self.force_thd_var.set(str(st.get("force_thd", DEFAULT_MARKER_FORCE_THRESHOLD)))
             self._refresh_canvas()
             self._update_match_score()
+            self._update_marker2_match_score()
             self._schedule_profile_preview_refresh()
         finally:
             self._applying_history = False
@@ -1915,12 +2156,43 @@ class RoiEditorApp:
         return max(0.0, min(1.0, f))
 
     def _compute_match_score(self) -> float | None:
+        return self._compute_template_match_score(
+            roi_key="marker_roi",
+            selected=self.template_selected_var.get().strip(),
+            shift_mode=self.shift_mode_var.get(),
+            vertical_shift_px=self._int_or_default(self.vshift_px_var.get(), 0),
+            vertical_shift_step=max(1, self._int_or_default(self.vshift_step_var.get(), 1)),
+            horizontal_shift_px=self._int_or_default(self.hshift_px_var.get(), 0),
+            horizontal_shift_step=max(1, self._int_or_default(self.hshift_step_var.get(), 1)),
+        )
+
+    def _compute_marker2_match_score(self) -> float | None:
+        return self._compute_template_match_score(
+            roi_key="marker_2_roi",
+            selected=self.marker2_template_selected_var.get().strip(),
+            shift_mode=self.marker2_shift_mode_var.get(),
+            vertical_shift_px=self._int_or_default(self.marker2_vshift_px_var.get(), 0),
+            vertical_shift_step=max(1, self._int_or_default(self.marker2_vshift_step_var.get(), 1)),
+            horizontal_shift_px=self._int_or_default(self.marker2_hshift_px_var.get(), 0),
+            horizontal_shift_step=max(1, self._int_or_default(self.marker2_hshift_step_var.get(), 1)),
+        )
+
+    def _compute_template_match_score(
+        self,
+        *,
+        roi_key: str,
+        selected: str,
+        shift_mode: str,
+        vertical_shift_px: int,
+        vertical_shift_step: int,
+        horizontal_shift_px: int,
+        horizontal_shift_step: int,
+    ) -> float | None:
         if self.frame_rgb_full is None:
             return None
-        rect = self.rois.get("marker_roi")
+        rect = self.rois.get(roi_key)
         if not rect:
             return None
-        selected = self.template_selected_var.get().strip()
         if not selected:
             return None
 
@@ -1942,11 +2214,11 @@ class RoiEditorApp:
         matcher = MarkerTemplateMatcher(
             template_paths=[tpl],
             center_width=self.template_center_width,
-            vertical_shift_px=self._int_or_default(self.vshift_px_var.get(), 0),
-            vertical_shift_step=max(1, self._int_or_default(self.vshift_step_var.get(), 1)),
-            horizontal_shift_px=self._int_or_default(self.hshift_px_var.get(), 0),
-            horizontal_shift_step=max(1, self._int_or_default(self.hshift_step_var.get(), 1)),
-            shift_mode=self.shift_mode_var.get(),
+            vertical_shift_px=vertical_shift_px,
+            vertical_shift_step=vertical_shift_step,
+            horizontal_shift_px=horizontal_shift_px,
+            horizontal_shift_step=horizontal_shift_step,
+            shift_mode=shift_mode,
         )
         return float(matcher.score(roi_gray))
 
@@ -1954,12 +2226,25 @@ class RoiEditorApp:
         try:
             score = self._compute_match_score()
         except Exception as exc:
-            self.match_score_var.set(f"匹配分数: N/A ({exc})")
+            self.match_score_var.set(f"Marker匹配分数: N/A ({exc})")
             return
         if score is None:
-            self.match_score_var.set("匹配分数: N/A")
+            self.match_score_var.set("Marker匹配分数: N/A")
             return
-        self.match_score_var.set(f"匹配分数: {score:.4f}")
+        self.match_score_var.set(f"Marker匹配分数: {score:.4f}")
+
+    def _update_marker2_match_score(self) -> None:
+        try:
+            score = self._compute_marker2_match_score()
+        except Exception as exc:
+            self.marker2_match_score_var.set(f"Marker2匹配分数: N/A ({exc})")
+            return
+        if score is None:
+            self.marker2_match_score_var.set("Marker2匹配分数: N/A")
+            return
+        thd = self._float_or_none(self.marker2_force_thd_var.get())
+        suffix = f" / 阈值 {thd:.3f}" if thd is not None else ""
+        self.marker2_match_score_var.set(f"Marker2匹配分数: {score:.4f}{suffix}")
 
     def _refresh_canvas(self) -> None:
         self.canvas.delete("all")
@@ -2024,7 +2309,26 @@ class RoiEditorApp:
         if not isinstance(data, dict):
             data = {}
         self._apply_current_state_to_payload(data)
-        return data
+        return self._ordered_profile_payload(data)
+
+    def _ordered_profile_payload(self, data: dict[str, Any]) -> dict[str, Any]:
+        preferred = [
+            "extends",
+            "game",
+            "output_name",
+            "video_path",
+            "roi",
+            "marker",
+            "marker_2",
+        ]
+        out: dict[str, Any] = {}
+        for key in preferred:
+            if key in data:
+                out[key] = data[key]
+        for key, value in data.items():
+            if key not in out:
+                out[key] = value
+        return out
 
     def _apply_current_state_to_payload(self, data: dict[str, Any]) -> None:
         raw_video = self.video_path_var.get().strip()
@@ -2076,6 +2380,30 @@ class RoiEditorApp:
         else:
             marker["force_threshold"] = force_thd
 
+        data.setdefault("marker_2", {})
+        marker2 = data["marker_2"]
+        if not isinstance(marker2, dict):
+            marker2 = {}
+            data["marker_2"] = marker2
+        marker2_tpl_paths = self._parse_marker2_template_paths()
+        if marker2_tpl_paths:
+            marker2["template_paths"] = marker2_tpl_paths
+        else:
+            marker2.pop("template_paths", None)
+        marker2.pop("template_path", None)
+        marker2.pop("high_res_template_path", None)
+        marker2["use_template"] = True
+        marker2["shift_mode"] = "horizontal" if self.marker2_shift_mode_var.get() == "horizontal" else "vertical"
+        marker2["vertical_shift_px"] = self._int_or_default(self.marker2_vshift_px_var.get(), 0)
+        marker2["vertical_shift_step"] = max(1, self._int_or_default(self.marker2_vshift_step_var.get(), 1))
+        marker2["horizontal_shift_px"] = self._int_or_default(self.marker2_hshift_px_var.get(), 0)
+        marker2["horizontal_shift_step"] = max(1, self._int_or_default(self.marker2_hshift_step_var.get(), 1))
+        marker2_thd = self._float_or_none(self.marker2_force_thd_var.get())
+        if marker2_thd is None:
+            marker2.pop("force_threshold", None)
+        else:
+            marker2["force_threshold"] = marker2_thd
+
         data.setdefault("general", {})
         if not isinstance(data["general"], dict):
             data["general"] = {}
@@ -2085,6 +2413,11 @@ class RoiEditorApp:
         if not isinstance(data["game"], dict):
             data["game"] = {}
         data["game"]["name"] = str(self.game_name_var.get().strip())
+        extra_req = str(self.extra_requirements_var.get() or "").strip()
+        if extra_req:
+            data["game"]["extra_requirements"] = extra_req
+        else:
+            data["game"].pop("extra_requirements", None)
         data["game"]["source_language"] = str(self.source_lang_var.get().strip() or "ja")
         data["game"]["target_language"] = str(self.target_lang_var.get().strip() or "zh-CN")
         data["output_name"] = self._sanitize_output_name(self.output_name_var.get())

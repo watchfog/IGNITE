@@ -86,6 +86,19 @@ marker:
   vertical_shift_px: 6
   vertical_shift_step: 1
 
+marker_2:
+  # Optional second in-dialogue marker used to split marker segments into
+  # blank -> dialogue when OCR is disabled.
+  use_template: true
+  template_paths: []
+  force_threshold: 0.5
+  shift_mode: vertical
+  horizontal_shift_px: 0
+  horizontal_shift_step: 1
+  template_center_width: null
+  vertical_shift_px: 6
+  vertical_shift_step: 1
+
 ocr:
   # OCR backend. Current recommended default is RapidOCR.
   engine: rapidocr
@@ -100,6 +113,16 @@ ocr:
   name_presence_mode: fast_mask
   name_presence_threshold_on: 0.018
   name_presence_threshold_off: 0.012
+  # Name text is a single left-aligned horizontal line. These guards suppress
+  # background-change false positives in the name ROI.
+  name_presence_min_components: 2
+  name_presence_max_components: 120
+  name_presence_max_x_min_ratio: 0.34
+  name_presence_max_y_span_ratio: 0.62
+  name_presence_min_aspect_ratio: 0.85
+  name_presence_max_largest_component_ratio: 0.82
+  name_presence_min_rise_delta: 0.002
+  name_ocr_allow_mask_fallback: false
   # Whether to fall back to OCR when fast presence detection is uncertain.
   name_presence_ocr_fallback: true
 

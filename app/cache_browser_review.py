@@ -73,6 +73,9 @@ class CacheReviewApp:
         self.entries: list[dict[str, Any]] = []
         self.cache_payload: dict[str, Any] = {}
         self.current_index = 0
+        self.suspect_indices: list[int] = []
+        self.suspect_info_var = tk.StringVar(value="存疑: 0")
+        self.neighbor_preview_texts: dict[str, tk.Text] = {}
 
         self.cap: cv2.VideoCapture | None = None
         self.video_w = 0
@@ -160,6 +163,9 @@ class CacheReviewApp:
         nav.grid(row=3, column=0, columnspan=10, sticky="ew", pady=(6, 0))
         ttk.Button(nav, text="上一段 (←)", command=self._prev_segment).pack(side=tk.LEFT, padx=2)
         ttk.Button(nav, text="下一段 (→)", command=self._next_segment).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav, text="上一个存疑", command=self._prev_suspect).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Button(nav, text="下一个存疑", command=self._next_suspect).pack(side=tk.LEFT, padx=2)
+        ttk.Label(nav, textvariable=self.suspect_info_var, foreground="#9a4b00").pack(side=tk.LEFT, padx=(6, 2))
         ttk.Label(nav, text="跳转段号").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(nav, textvariable=self.goto_var, width=10).pack(side=tk.LEFT)
         ttk.Button(nav, text="跳转", command=self._jump_segment).pack(side=tk.LEFT, padx=2)
@@ -228,6 +234,10 @@ class CacheReviewApp:
         ttk.Button(frame_bar, text="下一帧", command=self._next_frame).pack(side=tk.LEFT)
         ttk.Button(frame_bar, text="前10帧", command=self._prev_10_frames).pack(side=tk.LEFT, padx=(12, 6))
         ttk.Button(frame_bar, text="后10帧", command=self._next_10_frames).pack(side=tk.LEFT)
+        ttk.Button(frame_bar, text="设为段开始", command=self._set_segment_start_to_current_time).pack(side=tk.LEFT, padx=(12,6))
+        ttk.Button(frame_bar, text="设为段结束", command=self._set_segment_end_to_current_time).pack(side=tk.LEFT)
+        ttk.Button(frame_bar, text="设为标题开始", command=self._set_title_start_to_current_time).pack(side=tk.LEFT, padx=(12,6))
+        ttk.Button(frame_bar, text="设为标题结束", command=self._set_title_end_to_current_time).pack(side=tk.LEFT)
 
         roi_bar = ttk.Frame(left, padding=(0, 6, 0, 0))
         roi_bar.pack(fill=tk.X)
@@ -242,6 +252,16 @@ class CacheReviewApp:
         review_panel = ttk.Frame(stack)
         stack.add(json_panel, weight=3)
         stack.add(review_panel, weight=4)
+
+        ttk.Label(json_panel, text="前后段 Cache 预览").pack(anchor="w")
+        neighbor_preview = ttk.Frame(json_panel)
+        neighbor_preview.pack(fill=tk.X, pady=(4, 6))
+        for key, label in (("prev", "上一段"), ("current", "当前段"), ("next", "下一段")):
+            box = ttk.LabelFrame(neighbor_preview, text=label, padding=4)
+            box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0 if key == "prev" else 4, 0))
+            txt = tk.Text(box, height=8, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED)
+            txt.pack(fill=tk.BOTH, expand=True)
+            self.neighbor_preview_texts[key] = txt
 
         ttk.Label(json_panel, text="当前段 JSON（可编辑）").pack(anchor="w")
         self.json_text = tk.Text(json_panel, height=16, wrap=tk.NONE, undo=True, font=("Consolas", 10))
@@ -458,9 +478,130 @@ class CacheReviewApp:
         else:
             raise RuntimeError("cache json 格式不支持")
         self.current_index = min(self.current_index, max(0, len(self.entries) - 1))
+        self._rebuild_suspect_indices()
         self._init_title_time_defaults()
         self.status_var.set(f"已加载缓存: {self.cache_path}，共 {len(self.entries)} 段")
         self._show_segment(self.current_index)
+
+    def _entry_translation_review_reasons(self, entry: dict[str, Any]) -> list[str]:
+        dialogue_type = str(entry.get("dialogue_type", "") or "").strip().lower()
+        if dialogue_type in {"blank_no_name", "blank"}:
+            return []
+        translated = str(entry.get("translation_subtitle", "") or "").strip()
+        debug_text = str(entry.get("debug_subtitle", "") or "").strip()
+        reasons: list[str] = []
+        if not translated:
+            reasons.append("translation_missing")
+        elif debug_text and translated == debug_text:
+            reasons.append("translation_fallback_debug_text")
+        elif translated.startswith("[DEBUG]"):
+            reasons.append("translation_fallback_debug_text")
+        return reasons
+
+    def _entry_review_reasons(self, entry: dict[str, Any]) -> list[str]:
+        items: list[Any] = []
+        for raw in (entry.get("review_reason"), entry.get("review_reasons")):
+            if isinstance(raw, list):
+                items.extend(raw)
+            elif raw is not None:
+                items.append(raw)
+        items.extend(self._entry_translation_review_reasons(entry))
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            s = str(item or "").strip()
+            if not s or s in seen:
+                continue
+            out.append(s)
+            seen.add(s)
+        return out
+
+    def _entry_is_suspect(self, entry: dict[str, Any]) -> bool:
+        if bool(entry.get("needs_review", False)) or bool(entry.get("suspect", False)):
+            return True
+        return bool(self._entry_review_reasons(entry))
+
+    def _entry_with_review_metadata(self, entry: dict[str, Any]) -> dict[str, Any]:
+        reasons = self._entry_review_reasons(entry)
+        if self._entry_is_suspect(entry) or reasons:
+            entry["needs_review"] = True
+            entry["review_reason"] = reasons
+        return entry
+
+    def _rebuild_suspect_indices(self) -> None:
+        self.suspect_indices = [
+            i for i, e in enumerate(self.entries)
+            if isinstance(e, dict) and self._entry_is_suspect(e)
+        ]
+        self._update_suspect_info()
+
+    def _update_suspect_info(self) -> None:
+        total = len(self.suspect_indices)
+        if not total:
+            self.suspect_info_var.set("存疑: 0")
+            return
+        pos = 0
+        for j, idx in enumerate(self.suspect_indices, start=1):
+            if idx == self.current_index:
+                pos = j
+                break
+        if pos:
+            self.suspect_info_var.set(f"存疑: {pos}/{total}")
+        else:
+            self.suspect_info_var.set(f"存疑: {total}")
+
+    def _clip_preview_text(self, value: Any, limit: int = 150) -> str:
+        text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[: max(0, limit - 3)]}..."
+
+    def _entry_preview_summary(self, idx: int | None) -> str:
+        if not self.entries:
+            return "(无 cache)"
+        if idx is None or idx < 0 or idx >= len(self.entries):
+            return "(无)"
+        entry = self.entries[idx]
+        try:
+            st, ed = self._entry_times(idx)
+            time_text = f"{st:.2f}-{ed:.2f}s"
+        except Exception:
+            time_text = "-"
+        reasons = self._entry_review_reasons(entry)
+        lines = [
+            f"idx: {idx + 1}/{len(self.entries)}",
+            f"segment_id: {entry.get('segment_id', idx + 1)}",
+            f"time: {time_text}",
+            f"type: {entry.get('dialogue_type', '')}",
+            f"speaker: {self._clip_preview_text(entry.get('speaker', ''), 80)}",
+            f"original: {self._clip_preview_text(entry.get('text_original', ''), 180)}",
+            f"translation: {self._clip_preview_text(entry.get('translation_subtitle', ''), 180)}",
+        ]
+        debug_text = self._clip_preview_text(entry.get("debug_subtitle", ""), 140)
+        if debug_text:
+            lines.append(f"debug: {debug_text}")
+        if self._entry_is_suspect(entry):
+            lines.append("needs_review: true")
+            if reasons:
+                lines.append(f"reason: {self._clip_preview_text(', '.join(reasons), 220)}")
+        return "\n".join(lines)
+
+    def _update_neighbor_preview(self) -> None:
+        if not self.neighbor_preview_texts:
+            return
+        indices = {
+            "prev": self._neighbor_index_by_segment_id(-1),
+            "current": self.current_index,
+            "next": self._neighbor_index_by_segment_id(1),
+        }
+        for key, idx in indices.items():
+            txt = self.neighbor_preview_texts.get(key)
+            if txt is None:
+                continue
+            txt.configure(state=tk.NORMAL)
+            txt.delete("1.0", tk.END)
+            txt.insert("1.0", self._entry_preview_summary(idx))
+            txt.configure(state=tk.DISABLED)
 
     def _seg_numeric_id(self, entry: dict[str, Any]) -> int | None:
         raw = entry.get("segment_id")
@@ -613,13 +754,18 @@ class CacheReviewApp:
         if old_seg_id is not None and new_seg_id != old_seg_id:
             parsed["segment_id"] = old_seg_id
             self.status_var.set(f"提示：segment_id 不应修改，已恢复为 {old_seg_id}")
+        parsed = self._entry_with_review_metadata(parsed)
         self.entries[self.current_index] = parsed
+        self._rebuild_suspect_indices()
         self._update_seg_info(self.current_index)
+        self._update_neighbor_preview()
         if self.status_var.get().startswith("提示：segment_id"):
             return
         self.status_var.set(f"已更新第 {self.current_index + 1} 段（内存）")
 
     def _save_cache_file(self) -> None:
+        self.entries = [self._entry_with_review_metadata(e) for e in self.entries]
+        self._rebuild_suspect_indices()
         self.cache_payload["entries"] = self.entries
         self.cache_path.write_text(json.dumps(self.cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         sync_msg = self._sync_latest_cache_file()
@@ -928,11 +1074,18 @@ class CacheReviewApp:
             roi = self.review_rois.get(roi_key)
             if not roi:
                 raise RuntimeError(f"未找到ROI: {roi_key}")
-            crop = self._crop(roi)
+            capture_sec = (float(st) + float(ed)) / 2.0
+            ok, frame_bgr = self._read_frame_ffmpeg_once(capture_sec)
+            if not ok or frame_bgr is None:
+                ok, frame_bgr = self._read_frame_safe(capture_sec, prefer_fast=True)
+            if not ok or frame_bgr is None:
+                raise RuntimeError(f"无法读取标题中间时间帧: {capture_sec:.3f}s")
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            crop = self._crop_from_frame(frame_rgb, roi)
             out_dir = self.cache_path.parent / "review_tmp"
             out_dir.mkdir(parents=True, exist_ok=True)
             ts = int(time.time())
-            img_path = out_dir / f"title_roi_{ts}.png"
+            img_path = out_dir / f"title_roi_{capture_sec:.3f}_{ts}.png"
             cv2.imwrite(str(img_path), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
             original_text, translated_text, usage = tr.translate_single_image_ja_to_zh_cn_structured_with_tag(
                 image_path=img_path,
@@ -959,7 +1112,7 @@ class CacheReviewApp:
                 0,
                 lambda: (
                     self._show_segment(idx),
-                    self._show_review_result(title_entry, usage, "Title 段已插入/更新（内存）"),
+                    self._show_review_result(title_entry, usage, f"Title 段已插入/更新（截图时间 {capture_sec:.3f}s，内存）"),
                 ),
             )
 
@@ -977,12 +1130,21 @@ class CacheReviewApp:
             return
         e = self.entries[idx]
         st, ed = self._entry_times(idx)
-        self.seg_info_var.set(f"段 {idx + 1}/{len(self.entries)} | segment_id={e.get('segment_id', idx + 1)} | {st:.2f}-{ed:.2f}s")
+        info = f"段 {idx + 1}/{len(self.entries)} | segment_id={e.get('segment_id', idx + 1)} | {st:.2f}-{ed:.2f}s"
+        reasons = self._entry_review_reasons(e)
+        if self._entry_is_suspect(e):
+            info += " | 存疑"
+            if reasons:
+                info += f": {', '.join(reasons[:3])}"
+                if len(reasons) > 3:
+                    info += "..."
+        self.seg_info_var.set(info)
 
     def _show_segment(self, idx: int, request_prefetch: bool = True) -> None:
         if not self.entries:
             self.json_text.delete("1.0", tk.END)
             self.json_text.insert("1.0", "{}")
+            self._update_neighbor_preview()
             return
         self._set_current_segment_ui(idx, request_prefetch=False)
         self._seek_to_segment(idx, request_prefetch=request_prefetch)
@@ -991,14 +1153,17 @@ class CacheReviewApp:
         if not self.entries:
             self.json_text.delete("1.0", tk.END)
             self.json_text.insert("1.0", "{}")
+            self._update_neighbor_preview()
             return
         idx = max(0, min(idx, len(self.entries) - 1))
         self.current_index = idx
         seg_id = self.entries[idx].get("segment_id")
         self.goto_var.set(str(seg_id if seg_id is not None else (idx + 1)))
         self._update_seg_info(idx)
+        self._update_suspect_info()
         self.json_text.delete("1.0", tk.END)
         self.json_text.insert("1.0", json.dumps(self.entries[idx], ensure_ascii=False, indent=2))
+        self._update_neighbor_preview()
         if request_prefetch:
             self._request_prefetch(idx)
 
@@ -1020,6 +1185,7 @@ class CacheReviewApp:
             self._segment_anchor_sec(idx),
             request_prefetch=request_prefetch,
             prefetch_center_idx=idx,
+            sync_segment=False,
         )
 
     def _segment_anchor_sec(self, idx: int) -> float:
@@ -1040,13 +1206,64 @@ class CacheReviewApp:
         target_aligned = frame_idx / fps_safe
         return max(st, target_aligned)
 
+    def _nav_sort_key(self, idx: int) -> tuple[int, int, int]:
+        entry = self.entries[idx]
+        seg_num = self._seg_numeric_id(entry)
+        if seg_num is None:
+            return (1, idx, idx)
+        return (0, seg_num, idx)
+
+    def _indices_by_segment_id(self, indices: list[int] | None = None) -> list[int]:
+        if indices is None:
+            indices = list(range(len(self.entries)))
+        return sorted(indices, key=self._nav_sort_key)
+
+    def _neighbor_index_by_segment_id(self, direction: int) -> int | None:
+        if not self.entries:
+            return None
+        order = self._indices_by_segment_id()
+        try:
+            pos = order.index(self.current_index)
+        except ValueError:
+            pos = max(0, min(self.current_index, len(order) - 1))
+        target_pos = pos + int(direction)
+        if target_pos < 0 or target_pos >= len(order):
+            return None
+        return order[target_pos]
+
+    def _adjacent_index_by_segment_id(self, direction: int) -> int:
+        neighbor = self._neighbor_index_by_segment_id(direction)
+        return self.current_index if neighbor is None else neighbor
+
     def _prev_segment(self) -> None:
         self._save_current_entry()
-        self._show_segment(self.current_index - 1, request_prefetch=True)
+        self._show_segment(self._adjacent_index_by_segment_id(-1), request_prefetch=True)
 
     def _next_segment(self) -> None:
         self._save_current_entry()
-        self._show_segment(self.current_index + 1, request_prefetch=True)
+        self._show_segment(self._adjacent_index_by_segment_id(1), request_prefetch=True)
+
+    def _jump_suspect(self, direction: int) -> None:
+        self._save_current_entry()
+        self._rebuild_suspect_indices()
+        if not self.suspect_indices:
+            self.status_var.set("没有存疑段")
+            return
+        ordered = self._indices_by_segment_id(self.suspect_indices)
+        cur_key = self._nav_sort_key(int(self.current_index))
+        if direction >= 0:
+            candidates = [idx for idx in ordered if self._nav_sort_key(idx) > cur_key]
+            target = candidates[0] if candidates else ordered[0]
+        else:
+            candidates = [idx for idx in ordered if self._nav_sort_key(idx) < cur_key]
+            target = candidates[-1] if candidates else ordered[-1]
+        self._show_segment(target, request_prefetch=True)
+
+    def _prev_suspect(self) -> None:
+        self._jump_suspect(-1)
+
+    def _next_suspect(self) -> None:
+        self._jump_suspect(1)
 
     def _jump_segment(self) -> None:
         self._save_current_entry()
@@ -1143,6 +1360,58 @@ class CacheReviewApp:
 
     def _prev_10_frames(self) -> None:
         self._step_frames(-10)
+
+    def _set_segment_start_to_current_time(self) -> None:
+        if not self.entries:
+            return
+        idx = self.current_index
+        try:
+            val = float(self.current_sec or 0.0)
+        except Exception:
+            return
+        entry = dict(self.entries[idx])
+        entry["time_start"] = float(val)
+        # preserve other metadata
+        self.entries[idx] = self._entry_with_review_metadata(entry)
+        # update UI
+        self.json_text.delete("1.0", tk.END)
+        self.json_text.insert("1.0", json.dumps(self.entries[idx], ensure_ascii=False, indent=2))
+        self._update_seg_info(idx)
+        self._update_neighbor_preview()
+        self.status_var.set(f"已将第 {idx + 1} 段开始时间更新为 {val:.3f}s（内存）")
+
+    def _set_segment_end_to_current_time(self) -> None:
+        if not self.entries:
+            return
+        idx = self.current_index
+        try:
+            val = float(self.current_sec or 0.0)
+        except Exception:
+            return
+        entry = dict(self.entries[idx])
+        entry["time_end"] = float(val)
+        self.entries[idx] = self._entry_with_review_metadata(entry)
+        self.json_text.delete("1.0", tk.END)
+        self.json_text.insert("1.0", json.dumps(self.entries[idx], ensure_ascii=False, indent=2))
+        self._update_seg_info(idx)
+        self._update_neighbor_preview()
+        self.status_var.set(f"已将第 {idx + 1} 段结束时间更新为 {val:.3f}s（内存）")
+
+    def _set_title_start_to_current_time(self) -> None:
+        try:
+            val = float(self.current_sec or 0.0)
+        except Exception:
+            return
+        self.title_start_var.set(f"{val:.3f}")
+        self.status_var.set(f"已将标题开始时间设置为 {val:.3f}s")
+
+    def _set_title_end_to_current_time(self) -> None:
+        try:
+            val = float(self.current_sec or 0.0)
+        except Exception:
+            return
+        self.title_end_var.set(f"{val:.3f}")
+        self.status_var.set(f"已将标题结束时间设置为 {val:.3f}s")
 
     def _canvas_to_src(self, x: int, y: int) -> tuple[int, int]:
         rx = x - self._offset_x
@@ -1525,6 +1794,7 @@ class CacheReviewApp:
         update_scale: bool,
         request_prefetch: bool,
         prefetch_center_idx: int | None,
+        sync_segment: bool,
     ) -> None:
         self._precise_req_id += 1
         req_id = int(self._precise_req_id)
@@ -1555,7 +1825,8 @@ class CacheReviewApp:
                         self.time_scale.set(target_sec)
                     finally:
                         self._suppress_scale_callback = False
-                self._sync_segment_ui_by_time(target_sec)
+                if sync_segment:
+                    self._sync_segment_ui_by_time(target_sec)
                 if request_prefetch:
                     center = self.current_index if prefetch_center_idx is None else int(prefetch_center_idx)
                     self._request_prefetch(center)
@@ -1572,6 +1843,7 @@ class CacheReviewApp:
         request_prefetch: bool = False,
         prefetch_center_idx: int | None = None,
         force_ffmpeg: bool = False,
+        sync_segment: bool = True,
     ) -> None:
         sec = max(0.0, min(float(sec), max(0.0, self.duration_sec)))
         fps = max(1.0, float(self.fps or 25.0))
@@ -1584,6 +1856,7 @@ class CacheReviewApp:
                 update_scale=bool(update_scale),
                 request_prefetch=bool(request_prefetch),
                 prefetch_center_idx=prefetch_center_idx,
+                sync_segment=bool(sync_segment),
             )
             return
 
@@ -1620,7 +1893,8 @@ class CacheReviewApp:
                     self.time_scale.set(sec)
                 finally:
                     self._suppress_scale_callback = False
-            self._sync_segment_ui_by_time(sec)
+            if sync_segment:
+                self._sync_segment_ui_by_time(sec)
             if (not prefer_fast) and request_prefetch:
                 center = self.current_index if prefetch_center_idx is None else int(prefetch_center_idx)
                 self._request_prefetch(center)
@@ -1718,18 +1992,21 @@ class CacheReviewApp:
         self.review_rois = {k: list(v) for k, v in self.default_rois.items()}
         self._refresh_canvas()
 
-    def _crop(self, roi: list[int]) -> Any:
-        if self.current_frame_rgb is None:
-            raise RuntimeError("当前无帧")
+    def _crop_from_frame(self, frame_rgb: Any, roi: list[int]) -> Any:
         x0, y0, x1, y1 = [int(v) for v in roi]
-        h, w = self.current_frame_rgb.shape[:2]
+        h, w = frame_rgb.shape[:2]
         x0 = max(0, min(x0, w - 1))
         x1 = max(0, min(x1, w))
         y0 = max(0, min(y0, h - 1))
         y1 = max(0, min(y1, h))
         if x1 <= x0 or y1 <= y0:
             raise RuntimeError(f"ROI无效: {roi}")
-        return self.current_frame_rgb[y0:y1, x0:x1].copy()
+        return frame_rgb[y0:y1, x0:x1].copy()
+
+    def _crop(self, roi: list[int]) -> Any:
+        if self.current_frame_rgb is None:
+            raise RuntimeError("当前无帧")
+        return self._crop_from_frame(self.current_frame_rgb, roi)
 
     def _review_by_new_crops(self) -> None:
         def _job() -> None:

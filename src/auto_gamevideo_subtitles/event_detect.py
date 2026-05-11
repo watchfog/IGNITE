@@ -120,6 +120,62 @@ class FrameMetric:
     name_path: Path | None = None
 
 
+@dataclass
+class TextMaskStats:
+    presence: float
+    component_count: int
+    x_min_ratio: float
+    x_max_ratio: float
+    x_span_ratio: float
+    y_span_ratio: float
+    largest_component_ratio: float
+
+
+def extract_text_mask_stats(gray: np.ndarray, mode: str = "text") -> tuple[np.ndarray, TextMaskStats]:
+    mask = _to_text_mask(gray, mode=mode)
+    presence = mask_presence_score(mask)
+    ys, xs = np.nonzero(mask > 0)
+    if len(xs) == 0:
+        return mask, TextMaskStats(
+            presence=presence,
+            component_count=0,
+            x_min_ratio=0.0,
+            x_max_ratio=0.0,
+            x_span_ratio=0.0,
+            y_span_ratio=0.0,
+            largest_component_ratio=0.0,
+        )
+
+    h, w = mask.shape[:2]
+    x_min = int(xs.min())
+    x_max = int(xs.max())
+    x_span = (x_max - x_min + 1) / max(1, int(w))
+    y_span = (int(ys.max()) - int(ys.min()) + 1) / max(1, int(h))
+
+    component_count = 1
+    largest = int(mask.sum())
+    if cv2 is not None:
+        num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(
+            (mask > 0).astype(np.uint8),
+            connectivity=8,
+        )
+        areas = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels)]
+        component_count = len(areas)
+        largest = max(areas) if areas else 0
+
+    total = int(mask.sum())
+    largest_ratio = float(largest / max(1, total))
+    return mask, TextMaskStats(
+        presence=presence,
+        component_count=component_count,
+        x_min_ratio=float(x_min / max(1, int(w))),
+        x_max_ratio=float(x_max / max(1, int(w))),
+        x_span_ratio=float(x_span),
+        y_span_ratio=float(y_span),
+        largest_component_ratio=largest_ratio,
+    )
+
+
 class MarkerTemplateMatcher:
     def __init__(
         self,

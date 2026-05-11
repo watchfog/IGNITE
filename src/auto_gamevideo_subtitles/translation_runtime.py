@@ -139,7 +139,7 @@ class DeepSeekTranslator:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是一个游戏文本翻译助手。",
+                    "content": f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。\n译文需要保留原文的换行符和格式，禁止添加和原文无关的内容。",
                 },
                 {
                     "role": "user",
@@ -281,6 +281,15 @@ class BailianVlmTranslator:
                 pass
         return msg
 
+    def _image_input_log_value(self, image_input: str | Path | None) -> str:
+        if image_input is None:
+            return ""
+        s = str(image_input)
+        if s.startswith("data:"):
+            mime = s[5:].split(";", 1)[0] or "unknown"
+            return f"<data-url mime={mime} chars={len(s)}>"
+        return str(Path(s).resolve())
+
     def translate_image_ja_to_zh_cn(self, image_path: str | Path, speaker: str) -> str:
         speaker_name, original_text, translated, usage = self.translate_image_ja_to_zh_cn_structured_with_tag(
             image_path=image_path,
@@ -405,18 +414,24 @@ class BailianVlmTranslator:
         request_tag: str = "",
         history_items: list[dict[str, str]] | None = None,
         custom_prompt: str = "",
+        extra_requirements: str = "",
     ) -> tuple[str, str, str, dict[str, int]]:
         game_hint = f"图像中的文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         system_prompt = (
-            "你是一个视觉小说场景的OCR与翻译助手。"
-            "接下来会给你两张图像，图片1是当前说话人姓名区域，图片2是对话文本区域。"
-            f"{game_hint}请识别图像1中的{self.source_language}说话人名，以及图像2中的{self.source_language}对话文本，并翻译为{self.target_language}译文输出。"
-            "说话人信息仅用于语气和背景参考，不要把说话人信息输出到译文中。"
-            "speaker_name 字段保持原文，不需要翻译。"
-            "请保留换行和原有格式(如果原文有两行,则输出的译文也需要两行)。"
-            "绝对禁止添加与原文无关的内容。"
-            "输出必须且仅能是符合Schema的JSON。"
+            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。"
+            f"接下来会给你两张图像，图片1是当前说话人{self.source_language}姓名，图片2是{self.source_language}对话文本。"
+            f"请识别图像1中的{self.source_language}说话人信息，结合你对{self.game_name}的了解用于理解说话人的背景和性格。说话人信息仅用于参考，不要把说话人信息输出到译文中。"
+            f"之后识别图像2中的{self.source_language}对话文本，并结合你对{self.game_name}的了解和识别到的说话人信息翻译为{self.target_language}译文。原文也可能为纯英文，此时不需要翻译，直接输出原文作为译文即可。"
+            "翻译必须在语义通顺的情况下尽可能保留原文的换行与符号，绝对禁止添加与原文无关的内容。"
+            "输出要求为：必须且仅能是符合Schema的JSON，包括speaker_name、original_text、translated_text三个字段。"
+            f"speaker_name 字段为说话人姓名，保持{self.source_language}原文，不需要翻译。original_text 字段为图像2中识别的{self.source_language}原文文本。translated_text 字段为将original_text翻译成{self.target_language}的译文。"
         )
+        # Only include extra requirements sentence when provided
+        extra_requirements_text = str(extra_requirements or "").strip()
+        if extra_requirements_text:
+            system_prompt = system_prompt.replace(
+                "输出要求为：", f"翻译需要满足：{extra_requirements_text}。输出要求为："
+            )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
         refs: list[str] = []
@@ -428,13 +443,8 @@ class BailianVlmTranslator:
                 )
         history_text = "\n".join(refs) if refs else "(none)"
         user_text = (
-            f"当前说话人（OCR参考文本）：{speaker}\n"
-            "下面会提供两张图片，以及图片前的若干句对话参考。"
-            "图片1：当前说话人（name_roi）。"
-            "图片2：当前对话文本（dialogue_roi）。"
-            "这些参考对话仅用于提高措辞和术语一致性，不一定与当前图片内容直接相关，且与当前对话之间可能存在间隔。\n"
-            f"前文参考：\n{history_text}\n"
-            "请返回JSON，字段为：speaker_name、original_text、translated_text。"
+            "下面会提供两张图片用于识别和翻译，"
+            "图片1：当前说话人。图片2：当前对话文本。"
         )
         custom = str(custom_prompt or "").strip()
         if custom:
@@ -474,9 +484,9 @@ class BailianVlmTranslator:
                     "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "event": "request",
                     "request_tag": request_tag,
-                    "speaker_image_path": str(speaker_image_input if isinstance(speaker_image_input, str) and not speaker_image_input.startswith("data:") else Path(speaker_image_input).resolve() if speaker_image_input else ""),
-                    "dialogue_image_path": str(Path(image_path).resolve() if not str(image_path).startswith("data:") else image_path),
-                    "image_path": str(Path(image_path).resolve() if not str(image_path).startswith("data:") else image_path),
+                    "speaker_image_path": self._image_input_log_value(speaker_image_input),
+                    "dialogue_image_path": self._image_input_log_value(image_path),
+                    "image_path": self._image_input_log_value(image_path),
                     "speaker": speaker,
                     "history_count": len(history_items or []),
                     "prompt_preview": {
@@ -781,7 +791,7 @@ class BailianVlmTranslator:
                     "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "event": "request",
                     "request_tag": request_tag,
-                    "image_path": str(Path(image_path).resolve()),
+                    "image_path": self._image_input_log_value(image_path),
                     "history_count": len(history_items or []),
                     "prompt_preview": {
                         "model": payload.get("model"),
@@ -967,6 +977,8 @@ class BailianVlmTranslator:
             pass
 
     def _to_data_url(self, image_path: str | Path) -> str:
+        if str(image_path).startswith("data:"):
+            return str(image_path)
         p = Path(image_path)
         raw = p.read_bytes()
         suffix = p.suffix.lower()
