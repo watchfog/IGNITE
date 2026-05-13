@@ -38,6 +38,7 @@ from .state_machine import StateMachineConfig, segment_from_metrics
 from .subtitle_export import write_ass, write_srt
 from .translation_runtime import (
     BailianVlmTranslator,
+    _has_kanji_overlap_from_original,
     _normalize_quotes_for_subtitle,
     load_api_key,
 )
@@ -109,6 +110,15 @@ def _vlm_translate_task(
     if last_err is not None:
         raise last_err
     raise RuntimeError("VLM request failed without an exception")
+
+
+def _mark_kanji_overlap_for_review(seg: DialogueSegment) -> None:
+    if _has_kanji_overlap_from_original(seg.text_original, seg.translation_subtitle, min_len=5):
+        seg.needs_review = True
+        seg.review_reason = _merge_review_reasons(
+            seg.review_reason,
+            ["translation_kanji_overlap_with_original"],
+        )
 
 
 def _roi_from_cfg(cfg: dict[str, Any], key: str) -> Roi:
@@ -214,6 +224,7 @@ def _cleanup_intermediate_artifacts(work_dir: Path) -> None:
         "fine_*_dialogue",
         "fine_*_name",
         "fine_*_marker",
+        "fine_*_marker2",
         # Legacy name kept for backward cleanup compatibility.
         "fine_*_full",
         "fine_*_full_temp",
@@ -829,19 +840,24 @@ def _translation_cache_review_reasons(
     dialogue_type: str,
     translation_subtitle: Any,
     debug_subtitle: Any,
+    original_text: Any = "",
 ) -> list[str]:
     dt = str(dialogue_type or "").strip().lower()
-    if dt in {"blank_no_name", "blank"}:
+    if dt in {"blank_no_name", "blank", "title"}:
         return []
     text = _normalize_quotes_for_subtitle(str(translation_subtitle or "").strip())
+    original = str(original_text or "").strip()
     debug = str(debug_subtitle or "").strip()
+    reasons: list[str] = []
     if not text:
-        return ["translation_missing"]
-    if debug and text == debug:
-        return ["translation_fallback_debug_text"]
-    if text.startswith("[DEBUG]"):
-        return ["translation_fallback_debug_text"]
-    return []
+        reasons.append("translation_missing")
+    elif debug and text == debug:
+        reasons.append("translation_fallback_debug_text")
+    elif text.startswith("[DEBUG]"):
+        reasons.append("translation_fallback_debug_text")
+    if _has_kanji_overlap_from_original(original, text, min_len=5):
+        reasons.append("translation_kanji_overlap_with_original")
+    return reasons
 
 
 def _cache_entry_with_review_metadata(entry: dict[str, Any]) -> dict[str, Any]:
@@ -853,6 +869,7 @@ def _cache_entry_with_review_metadata(entry: dict[str, Any]) -> dict[str, Any]:
             str(out.get("dialogue_type", "") or ""),
             out.get("translation_subtitle", ""),
             out.get("debug_subtitle", ""),
+            out.get("text_original", ""),
         ),
     )
     if bool(out.get("needs_review", False)) or reasons:
@@ -892,7 +909,7 @@ def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, Any]], dict
             "needs_review": bool(e.get("needs_review", False)),
             "review_reason": _merge_review_reasons(
                 e.get("review_reason"),
-                _translation_cache_review_reasons(dt, text, dbg),
+                _translation_cache_review_reasons(dt, text, dbg, original),
             ),
         }
         by_full_key[k1] = payload
@@ -926,7 +943,12 @@ def _dump_translation_cache(
         }
         reasons = _merge_review_reasons(
             seg.review_reason,
-            _translation_cache_review_reasons(seg.dialogue_type, seg.translation_subtitle, dbg),
+            _translation_cache_review_reasons(
+                seg.dialogue_type,
+                seg.translation_subtitle,
+                dbg,
+                seg.text_original,
+            ),
         )
         if seg.needs_review or reasons:
             entry["needs_review"] = True
@@ -2369,6 +2391,22 @@ def _split_segment_by_marker2(
             f"threshold={float(threshold):.4f}"
         ]
 
+    def _blank_near_threshold_review_reason(start_f: int, end_f: int) -> list[str]:
+        if end_f < start_f:
+            return []
+        vals = [_score(fid) for fid in range(start_f, end_f + 1)]
+        if not vals:
+            return []
+        max_score = max(vals)
+        low = 0.1
+        high = float(threshold)
+        if low <= max_score < high:
+            return [
+                f"marker2_blank_near_threshold:score=[{min(vals):.4f},{max_score:.4f}] "
+                f"review_band=[{low:.4f},{high:.4f}) threshold={high:.4f}"
+            ]
+        return []
+
     def _blank_confirm(start_f: int, end_f: int) -> bool:
         if end_f < start_f:
             return True
@@ -2477,6 +2515,7 @@ def _split_segment_by_marker2(
             st=frame_start,
             ed=dialog_start - 1,
             has_name=False,
+            review_reasons=_blank_near_threshold_review_reason(frame_start, dialog_start - 1),
         ),
         _build_refined_subsegment(
             raw=raw,
@@ -2720,7 +2759,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         else:
             _log("Marker templates not found, fallback to mask mode.")
 
-    marker2_threshold = float(marker2_cfg.get("force_threshold", marker2_cfg.get("presence_threshold", 0.5)))
+    marker2_threshold = float(marker2_cfg.get("force_threshold", marker2_cfg.get("presence_threshold", 0.2)))
     if bool(marker2_cfg.get("use_template", True)):
         marker2_templates = _collect_marker_templates(marker2_cfg)
         if marker2_templates:
@@ -3395,6 +3434,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 if bool(cached_item.get("needs_review", False)) or cached_reasons:
                     seg.needs_review = True
                     seg.review_reason = _merge_review_reasons(seg.review_reason, cached_reasons)
+                _mark_kanji_overlap_for_review(seg)
                 cache_hit_count += 1
                 _log(
                     f"[VLM] segment {seg.segment_id}: cache hit, skip image load and request"
@@ -3543,6 +3583,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     seg.text_original = original_text
                     if translated and translated.strip():
                         seg.translation_subtitle = translated
+                        _mark_kanji_overlap_for_review(seg)
                     else:
                         seg.translation_subtitle = debug_text
                         seg.review_reason.append("vlm_translation_empty")
@@ -3602,6 +3643,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 seg.text_original = original_text
                 if translated and translated.strip():
                     seg.translation_subtitle = translated
+                    _mark_kanji_overlap_for_review(seg)
                 else:
                     seg.translation_subtitle = dbg
                     seg.review_reason.append("vlm_translation_empty")

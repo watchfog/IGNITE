@@ -91,7 +91,7 @@ marker_2:
   # blank -> dialogue when OCR is disabled.
   use_template: true
   template_paths: []
-  force_threshold: 0.5
+  force_threshold: 0.2
   shift_mode: vertical
   horizontal_shift_px: 0
   horizontal_shift_step: 1

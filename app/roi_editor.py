@@ -50,7 +50,7 @@ ROI_COLORS = {
     "title_info_location": "#ff0da6",
 }
 DEFAULT_MARKER_FORCE_THRESHOLD = 0.6
-DEFAULT_MARKER2_FORCE_THRESHOLD = 0.5
+DEFAULT_MARKER2_FORCE_THRESHOLD = 0.2
 
 
 def _load_raw_cfg(path: Path) -> dict[str, Any]:

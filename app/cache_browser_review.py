@@ -28,6 +28,7 @@ if str(SRC) not in sys.path:
 from auto_gamevideo_subtitles.config import load_config  # noqa: E402
 from auto_gamevideo_subtitles.translation_runtime import (  # noqa: E402
     BailianVlmTranslator,
+    _has_kanji_overlap_from_original,
     _normalize_quotes_for_subtitle,
     load_api_key,
 )
@@ -59,6 +60,7 @@ class CacheReviewApp:
         self.roi_key_var = tk.StringVar(value="dialogue_roi")
         self.title_start_var = tk.StringVar(value="0.00")
         self.title_end_var = tk.StringVar(value="2.00")
+        self.title_capture_var = tk.StringVar(value="1.00")
         self.title_info_var = tk.StringVar(value="")
         self.review_web_search_var = tk.BooleanVar(value=False)
         self.embed_ffmpeg_path_var = tk.StringVar(value="")
@@ -169,8 +171,7 @@ class CacheReviewApp:
         ttk.Label(nav, text="跳转段号").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(nav, textvariable=self.goto_var, width=10).pack(side=tk.LEFT)
         ttk.Button(nav, text="跳转", command=self._jump_segment).pack(side=tk.LEFT, padx=2)
-        ttk.Button(nav, text="保存当前段", command=self._save_current_entry).pack(side=tk.LEFT, padx=(12, 2))
-        ttk.Button(nav, text="保存全部", command=self._save_cache_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav, text="保存全部", command=self._save_cache_file).pack(side=tk.LEFT, padx=(12, 2))
         ttk.Button(
             nav,
             text="生成字幕（当前Cache）",
@@ -188,12 +189,19 @@ class CacheReviewApp:
         ttk.Entry(title_bar, textvariable=self.title_start_var, width=14).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Label(title_bar, text="标题结束(秒)").pack(side=tk.LEFT)
         ttk.Entry(title_bar, textvariable=self.title_end_var, width=14).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(title_bar, text="截图时间(秒)").pack(side=tk.LEFT)
+        ttk.Entry(title_bar, textvariable=self.title_capture_var, width=14).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Label(title_bar, text="翻译信息").pack(side=tk.LEFT)
-        ttk.Entry(title_bar, textvariable=self.title_info_var, width=48).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Entry(title_bar, textvariable=self.title_info_var, width=36).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(
             title_bar,
-            text="插入/更新Title(title_ocr_roi+VLM)",
+            text="识别并翻译Title",
             command=self._insert_title_segment_from_roi,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            title_bar,
+            text="直接插入Title空白段",
+            command=self._insert_blank_title_segment,
         ).pack(side=tk.LEFT, padx=2)
         ttk.Button(
             title_bar,
@@ -291,8 +299,10 @@ class CacheReviewApp:
     def _bind_keys(self) -> None:
         self.root.bind("<Left>", self._on_prev_segment_shortcut)
         self.root.bind("<Right>", self._on_next_segment_shortcut)
-        self.root.bind("<Control-s>", lambda _e: self._save_current_entry())
-        self.root.bind("<Control-S>", lambda _e: self._save_current_entry())
+        self.root.bind("<Control-s>", lambda _e: self._save_cache_file())
+        self.root.bind("<Control-S>", lambda _e: self._save_cache_file())
+        self.title_start_var.trace_add("write", lambda *_: self._update_title_capture_default())
+        self.title_end_var.trace_add("write", lambda *_: self._update_title_capture_default())
 
     def _is_focus_on_input_widget(self) -> bool:
         widget = self.root.focus_get()
@@ -356,6 +366,10 @@ class CacheReviewApp:
             "translation_subtitle": normalized,
             "debug_subtitle": base_entry.get("debug_subtitle", ""),
         }
+        reasons = self._entry_review_reasons(out)
+        if reasons:
+            out["needs_review"] = True
+            out["review_reason"] = reasons
         return out
 
     def _run_bg(self, title: str, fn: Callable[[], None], *, show_review_progress: bool = False) -> None:
@@ -485,9 +499,10 @@ class CacheReviewApp:
 
     def _entry_translation_review_reasons(self, entry: dict[str, Any]) -> list[str]:
         dialogue_type = str(entry.get("dialogue_type", "") or "").strip().lower()
-        if dialogue_type in {"blank_no_name", "blank"}:
+        if dialogue_type in {"blank_no_name", "blank", "title"}:
             return []
         translated = str(entry.get("translation_subtitle", "") or "").strip()
+        original = str(entry.get("text_original", "") or "").strip()
         debug_text = str(entry.get("debug_subtitle", "") or "").strip()
         reasons: list[str] = []
         if not translated:
@@ -496,6 +511,8 @@ class CacheReviewApp:
             reasons.append("translation_fallback_debug_text")
         elif translated.startswith("[DEBUG]"):
             reasons.append("translation_fallback_debug_text")
+        if _has_kanji_overlap_from_original(original, translated, min_len=5):
+            reasons.append("translation_kanji_overlap_with_original")
         return reasons
 
     def _entry_review_reasons(self, entry: dict[str, Any]) -> list[str]:
@@ -643,15 +660,25 @@ class CacheReviewApp:
             ed = st
         self.title_start_var.set(f"{max(0.0, st):.2f}")
         self.title_end_var.set(f"{max(0.0, ed):.2f}")
+        self._update_title_capture_default()
         self.title_info_var.set(str(title.get("speaker", "") or ""))
         if show_status:
             self.status_var.set("已从 cache 的标题段读取标题时间和翻译信息")
         return True
 
+    def _update_title_capture_default(self) -> None:
+        try:
+            st = self._parse_time_input(self.title_start_var.get())
+            ed = self._parse_time_input(self.title_end_var.get())
+        except Exception:
+            return
+        self.title_capture_var.set(f"{((float(st) + float(ed)) / 2.0):.3f}")
+
     def _init_title_time_defaults(self) -> None:
         if not self.entries:
             self.title_start_var.set("0.00")
             self.title_end_var.set("2.00")
+            self._update_title_capture_default()
             self.title_info_var.set("")
             return
         if self._load_title_fields_from_cache(show_status=False):
@@ -677,6 +704,7 @@ class CacheReviewApp:
         base_end = max(base_start + 2.0, base_start)
         self.title_start_var.set(f"{base_start:.2f}")
         self.title_end_var.set(f"{base_end:.2f}")
+        self._update_title_capture_default()
 
     def _resolve_video_from_cache(self) -> None:
         if self.video_path and self.video_path.exists():
@@ -763,7 +791,9 @@ class CacheReviewApp:
             return
         self.status_var.set(f"已更新第 {self.current_index + 1} 段（内存）")
 
-    def _save_cache_file(self) -> None:
+    def _save_cache_file(self, *, apply_current: bool = True) -> None:
+        if apply_current:
+            self._save_current_entry()
         self.entries = [self._entry_with_review_metadata(e) for e in self.entries]
         self._rebuild_suspect_indices()
         self.cache_payload["entries"] = self.entries
@@ -775,10 +805,23 @@ class CacheReviewApp:
         try:
             out_dir = self._resolve_output_dir_from_cache(self.cache_path)
             latest = out_dir / "translation_cache_latest.json"
-            shutil.copy2(self.cache_path, latest)
+            latest.parent.mkdir(parents=True, exist_ok=True)
+            src = self.cache_path.resolve()
+            dst = latest.resolve()
+            if src == dst:
+                return f"(latest已是当前文件: {latest})"
+            shutil.copy2(src, dst)
             return f"(已同步: {latest})"
         except Exception as exc:
             return f"(同步 latest 失败: {exc})"
+
+    def _autosave_cache_for_action(self, action: str) -> bool:
+        try:
+            self._save_cache_file()
+            return True
+        except Exception as exc:
+            self.status_var.set(f"{action}前自动保存失败: {exc}")
+            return False
 
     def _resolve_output_dir_from_cache(self, cache_path: Path) -> Path:
         cur = cache_path.parent
@@ -806,7 +849,7 @@ class CacheReviewApp:
 
     def _generate_subtitles_for_current_cache(self) -> Path:
         self._save_current_entry()
-        self._save_cache_file()
+        self._save_cache_file(apply_current=False)
 
         cache_path = self.cache_path.resolve()
         if not cache_path.exists():
@@ -842,6 +885,9 @@ class CacheReviewApp:
         return output_dir
 
     def _generate_subtitles_from_cache(self) -> None:
+        if not self._autosave_cache_for_action("生成字幕"):
+            return
+
         def _job() -> None:
             output_dir = self._generate_subtitles_for_current_cache()
             self._set_status_threadsafe(f"字幕已生成: {output_dir}")
@@ -860,10 +906,12 @@ class CacheReviewApp:
         self.embed_output_path_var.set(str(self._default_embed_output_path()))
 
     def _open_embed_subtitles_dialog(self) -> None:
+        if not self._autosave_cache_for_action("生成内嵌字幕视频"):
+            return
         self._refresh_embed_defaults()
         win = tk.Toplevel(self.root)
         win.title("生成内嵌字幕视频")
-        win.geometry("880x340")
+        win.geometry("880x390")
         win.transient(self.root)
 
         body = ttk.Frame(win, padding=12)
@@ -899,17 +947,45 @@ class CacheReviewApp:
             if p:
                 self.embed_output_path_var.set(str(Path(p).resolve()))
 
+        def _set_cpu_x264() -> None:
+            self.embed_vcodec_var.set("libx264")
+            self.embed_crf_var.set("18")
+            self.embed_preset_var.set("medium")
+
+        def _set_nvenc() -> None:
+            self.embed_vcodec_var.set("h264_nvenc")
+            self.embed_crf_var.set("20")
+            self.embed_preset_var.set("p5")
+
+        def _set_qsv() -> None:
+            self.embed_vcodec_var.set("h264_qsv")
+            self.embed_crf_var.set("20")
+            self.embed_preset_var.set("medium")
+
+        def _set_amf() -> None:
+            self.embed_vcodec_var.set("h264_amf")
+            self.embed_crf_var.set("20")
+            self.embed_preset_var.set("balanced")
+
         _row(0, "ffmpeg", self.embed_ffmpeg_path_var, _browse_ffmpeg)
         _row(1, "输出视频", self.embed_output_path_var, _browse_output)
         _row(2, "视频编码(-c:v)", self.embed_vcodec_var)
-        _row(3, "CRF", self.embed_crf_var)
+        _row(3, "质量(CRF/CQ/QP)", self.embed_crf_var)
         _row(4, "Preset", self.embed_preset_var)
         _row(5, "音频编码(-c:a)", self.embed_acodec_var)
         _row(6, "额外输入参数", self.embed_extra_input_args_var)
         _row(7, "额外输出参数", self.embed_extra_output_args_var)
 
+        preset_bar = ttk.Frame(body)
+        preset_bar.grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(preset_bar, text="编码预设").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(preset_bar, text="CPU x264", command=_set_cpu_x264).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_bar, text="NVIDIA NVENC", command=_set_nvenc).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_bar, text="Intel QSV", command=_set_qsv).pack(side=tk.LEFT, padx=2)
+        ttk.Button(preset_bar, text="AMD AMF", command=_set_amf).pack(side=tk.LEFT, padx=2)
+
         btns = ttk.Frame(body)
-        btns.grid(row=8, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        btns.grid(row=9, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="重置默认值", command=self._reset_embed_defaults).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="生成", command=lambda: self._start_embed_subtitled_video(win)).pack(side=tk.LEFT, padx=4)
@@ -983,13 +1059,38 @@ class CacheReviewApp:
         if not ffmpeg.exists():
             raise RuntimeError(f"ffmpeg不存在: {ffmpeg}")
         vcodec = self.embed_vcodec_var.get().strip() or "libx264"
-        crf = self.embed_crf_var.get().strip() or "18"
+        quality = self.embed_crf_var.get().strip() or "18"
         preset = self.embed_preset_var.get().strip() or "medium"
         acodec = self.embed_acodec_var.get().strip() or "copy"
         cmd = [str(ffmpeg), "-y"]
         cmd.extend(self._split_custom_ffmpeg_args(self.embed_extra_input_args_var.get()))
         cmd.extend(["-i", str(video_path), "-vf", self._ass_filter_path(ass_path)])
-        cmd.extend(["-c:v", vcodec, "-crf", crf, "-preset", preset, "-c:a", acodec])
+        cmd.extend(["-c:v", vcodec])
+        codec_l = vcodec.lower()
+        if codec_l in {"libx264", "libx265"}:
+            if quality:
+                cmd.extend(["-crf", quality])
+            if preset:
+                cmd.extend(["-preset", preset])
+        elif codec_l.endswith("_nvenc"):
+            if preset:
+                cmd.extend(["-preset", preset])
+            if quality:
+                cmd.extend(["-rc", "vbr", "-cq", quality])
+        elif codec_l.endswith("_qsv"):
+            if preset:
+                cmd.extend(["-preset", preset])
+            if quality:
+                cmd.extend(["-global_quality", quality])
+        elif codec_l.endswith("_amf"):
+            if preset:
+                cmd.extend(["-quality", preset])
+            if quality:
+                cmd.extend(["-qp_i", quality, "-qp_p", quality])
+        else:
+            if preset:
+                cmd.extend(["-preset", preset])
+        cmd.extend(["-c:a", acodec])
         cmd.extend(self._split_custom_ffmpeg_args(self.embed_extra_output_args_var.get()))
         cmd.append(str(output_path))
         return cmd
@@ -1069,12 +1170,12 @@ class CacheReviewApp:
             ed = self._parse_time_input(self.title_end_var.get())
             if ed < st:
                 raise RuntimeError("Title End 必须大于等于 Title Start")
+            capture_sec = self._parse_time_input(self.title_capture_var.get())
 
             roi_key = "title_ocr_roi"
             roi = self.review_rois.get(roi_key)
             if not roi:
                 raise RuntimeError(f"未找到ROI: {roi_key}")
-            capture_sec = (float(st) + float(ed)) / 2.0
             ok, frame_bgr = self._read_frame_ffmpeg_once(capture_sec)
             if not ok or frame_bgr is None:
                 ok, frame_bgr = self._read_frame_safe(capture_sec, prefer_fast=True)
@@ -1106,6 +1207,7 @@ class CacheReviewApp:
                 "translation_subtitle": str(translated_text or "").strip(),
                 "debug_subtitle": "[TITLE]",
             }
+            title_entry = self._entry_with_review_metadata(title_entry)
             idx = self._upsert_title_entry(title_entry)
             self.last_review_result = dict(title_entry)
             self.root.after(
@@ -1117,6 +1219,33 @@ class CacheReviewApp:
             )
 
         self._run_bg("Title段插入", _job, show_review_progress=True)
+
+    def _insert_blank_title_segment(self) -> None:
+        try:
+            self._save_current_entry()
+            st = self._parse_time_input(self.title_start_var.get())
+            ed = self._parse_time_input(self.title_end_var.get())
+            if ed < st:
+                raise RuntimeError("Title End 必须大于等于 Title Start")
+            title_entry: dict[str, Any] = {
+                "segment_id": 0,
+                "time_start": float(st),
+                "time_end": float(ed),
+                "srt_start": self._to_srt_time(st),
+                "srt_end": self._to_srt_time(ed),
+                "dialogue_type": "title",
+                "speaker": str(self.title_info_var.get() or "").strip(),
+                "text_original": "",
+                "translation_subtitle": "",
+                "debug_subtitle": "[TITLE]",
+            }
+            title_entry = self._entry_with_review_metadata(title_entry)
+            idx = self._upsert_title_entry(title_entry)
+            self.last_review_result = dict(title_entry)
+            self._show_segment(idx)
+            self._show_review_result(title_entry, {}, "Title 空白段已插入/更新（未截图，未调用VLM，内存）")
+        except Exception as exc:
+            self.status_var.set(f"直接插入Title空白段失败: {exc}")
 
     def _entry_times(self, idx: int) -> tuple[float, float]:
         e = self.entries[idx]
@@ -2096,6 +2225,11 @@ class CacheReviewApp:
         e["text_original"] = str(self.last_review_result.get("text_original", "") or e.get("text_original", ""))
         e["translation_subtitle"] = str(self.last_review_result.get("translation_subtitle", "") or e.get("translation_subtitle", ""))
         e["debug_subtitle"] = str(self.last_review_result.get("debug_subtitle", "") or e.get("debug_subtitle", ""))
+        if bool(self.last_review_result.get("needs_review", False)):
+            e["needs_review"] = True
+        if self.last_review_result.get("review_reason"):
+            e["review_reason"] = self.last_review_result.get("review_reason")
+        self.entries[self.current_index] = self._entry_with_review_metadata(e)
         self._show_segment(self.current_index)
         self.status_var.set("已一键替换当前段（内存）")
 
@@ -2105,6 +2239,11 @@ class CacheReviewApp:
             return
         e = self.entries[self.current_index]
         e["translation_subtitle"] = str(self.last_review_result.get("translation_subtitle", "") or e.get("translation_subtitle", ""))
+        if bool(self.last_review_result.get("needs_review", False)):
+            e["needs_review"] = True
+        if self.last_review_result.get("review_reason"):
+            e["review_reason"] = self.last_review_result.get("review_reason")
+        self.entries[self.current_index] = self._entry_with_review_metadata(e)
         self._show_segment(self.current_index)
         self.status_var.set("已替换当前段译文（内存）")
 

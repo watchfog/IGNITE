@@ -81,10 +81,66 @@ def _normalize_quotes_for_subtitle(text: str) -> str:
         cleaned = s.strip('\u201c\u201d"\u300e\u300f\u300c\u300d').strip()
         s = f"\u300c{cleaned}\u300d" if cleaned else "\u300c\u300d"
 
+    # Normalize paired internal single quotes to Japanese corner quotes.
+    chars = list(s)
+    single_quote_indices = []
+    for i, ch in enumerate(chars):
+        if ch != "'" or not (0 < i < len(chars) - 1):
+            continue
+        prev_is_ascii_alnum = chars[i - 1].isascii() and chars[i - 1].isalnum()
+        next_is_ascii_alnum = chars[i + 1].isascii() and chars[i + 1].isalnum()
+        if prev_is_ascii_alnum and next_is_ascii_alnum:
+            continue
+        single_quote_indices.append(i)
+    if len(single_quote_indices) >= 2:
+        for opener, closer in zip(single_quote_indices[0::2], single_quote_indices[1::2]):
+            chars[opener] = "\u300e"
+            chars[closer] = "\u300f"
+        s = "".join(chars)
+    s = "".join(
+        "\u300e" if ch == "\u2018" and 0 < i < len(s) - 1 else
+        "\u300f" if ch == "\u2019" and 0 < i < len(s) - 1 else
+        ch
+        for i, ch in enumerate(s)
+    )
+
     # Final output rule: remove paired outer 「」 if present.
     if len(s) >= 2 and s.startswith("\u300c") and s.endswith("\u300d"):
         return s[1:-1].strip()
     return s
+
+
+def _has_kana_leak_from_original(original_text: str, translated_text: str, min_len: int = 3) -> bool:
+    if not original_text or not translated_text:
+        return False
+    n = max(1, int(min_len))
+    kana_seq = re.compile(r"[\u3041-\u3096\u309d-\u309f\u30a1-\u30fa\u30fd-\u30ff\u31f0-\u31ff\uff66-\uff9d\uff70\u30fc]+")
+    for m in kana_seq.finditer(translated_text):
+        seq = m.group(0)
+        if _has_original_subsequence(original_text, seq, n):
+            return True
+    return False
+
+
+def _has_kanji_overlap_from_original(original_text: str, translated_text: str, min_len: int = 3) -> bool:
+    if not original_text or not translated_text:
+        return False
+    n = max(1, int(min_len))
+    kanji_seq = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
+    for m in kanji_seq.finditer(translated_text):
+        seq = m.group(0)
+        if _has_original_subsequence(original_text, seq, n):
+            return True
+    return False
+
+
+def _has_original_subsequence(original_text: str, seq: str, min_len: int) -> bool:
+    if len(seq) < min_len:
+        return False
+    for i in range(0, len(seq) - min_len + 1):
+        if seq[i : i + min_len] in original_text:
+            return True
+    return False
 
 
 def _language_label_zh(lang: str) -> str:
@@ -104,69 +160,69 @@ def _language_label_zh(lang: str) -> str:
     return mapping.get(v, lang)
 
 
-class DeepSeekTranslator:
-    def __init__(
-        self,
-        api_url: str,
-        api_key: str,
-        model: str = "deepseek-chat",
-        temperature: float = 1.3,
-        game_name: str = "",
-        source_language: str = "ja",
-        target_language: str = "zh-CN",
-    ) -> None:
-        self.api_url = api_url
-        self.api_key = api_key
-        self.model = model
-        self.temperature = float(temperature)
-        self.game_name = game_name.strip()
-        self.source_language = _language_label_zh(source_language.strip() or "ja")
-        self.target_language = _language_label_zh(target_language.strip() or "zh-CN")
+# class DeepSeekTranslator:
+#     def __init__(
+#         self,
+#         api_url: str,
+#         api_key: str,
+#         model: str = "deepseek-chat",
+#         temperature: float = 1.3,
+#         game_name: str = "",
+#         source_language: str = "ja",
+#         target_language: str = "zh-CN",
+#     ) -> None:
+#         self.api_url = api_url
+#         self.api_key = api_key
+#         self.model = model
+#         self.temperature = float(temperature)
+#         self.game_name = game_name.strip()
+#         self.source_language = _language_label_zh(source_language.strip() or "ja")
+#         self.target_language = _language_label_zh(target_language.strip() or "zh-CN")
 
-    def translate_ja_to_zh_cn(self, text: str) -> str:
-        if not text.strip():
-            return ""
-        game_hint = f"，内容与{self.game_name}相关" if self.game_name else ""
-        prompt = (
-            f"将我给的{self.source_language}原文翻译为{self.target_language}{game_hint}。"
-            "注意保留换行符和格式，绝对禁止添加和原文无关的翻译。"
-            "不要解释翻译方式，直接给出译文。"
-            ""
-        )
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。\n译文需要保留原文的换行符和格式，禁止添加和原文无关的内容。",
-                },
-                {
-                    "role": "user",
-                    "content": f"{prompt}\n{text}",
-                },
-            ],
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = request.Request(
-            self.api_url,
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        with request.urlopen(req, timeout=60) as resp:
-            raw = resp.read().decode("utf-8")
-        data = json.loads(raw)
-        out = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-        )
-        return _normalize_quotes_for_subtitle(out)
+#     def translate_ja_to_zh_cn(self, text: str) -> str:
+#         if not text.strip():
+#             return ""
+#         game_hint = f"，内容与{self.game_name}相关" if self.game_name else ""
+#         prompt = (
+#             f"将我给的{self.source_language}原文翻译为{self.target_language}{game_hint}。"
+#             "注意保留换行符和格式，绝对禁止添加和原文无关的翻译。"
+#             "不要解释翻译方式，直接给出译文。"
+#             ""
+#         )
+#         payload: dict[str, Any] = {
+#             "model": self.model,
+#             "temperature": self.temperature,
+#             "messages": [
+#                 {
+#                     "role": "system",
+#                     "content": f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。\n译文需要保留原文的换行符和格式，禁止添加和原文无关的内容。",
+#                 },
+#                 {
+#                     "role": "user",
+#                     "content": f"{prompt}\n{text}",
+#                 },
+#             ],
+#         }
+#         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+#         req = request.Request(
+#             self.api_url,
+#             data=body,
+#             headers={
+#                 "Content-Type": "application/json",
+#                 "Authorization": f"Bearer {self.api_key}",
+#             },
+#             method="POST",
+#         )
+#         with request.urlopen(req, timeout=60) as resp:
+#             raw = resp.read().decode("utf-8")
+#         data = json.loads(raw)
+#         out = (
+#             data.get("choices", [{}])[0]
+#             .get("message", {})
+#             .get("content", "")
+#             .strip()
+#         )
+#         return _normalize_quotes_for_subtitle(out)
 
 
 class BailianVlmTranslator:
@@ -418,19 +474,19 @@ class BailianVlmTranslator:
     ) -> tuple[str, str, str, dict[str, int]]:
         game_hint = f"图像中的文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         system_prompt = (
-            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。"
-            f"接下来会给你两张图像，图片1是当前说话人{self.source_language}姓名，图片2是{self.source_language}对话文本。"
-            f"请识别图像1中的{self.source_language}说话人信息，结合你对{self.game_name}的了解用于理解说话人的背景和性格。说话人信息仅用于参考，不要把说话人信息输出到译文中。"
-            f"之后识别图像2中的{self.source_language}对话文本，并结合你对{self.game_name}的了解和识别到的说话人信息翻译为{self.target_language}译文。原文也可能为纯英文，此时不需要翻译，直接输出原文作为译文即可。"
-            "翻译必须在语义通顺的情况下尽可能保留原文的换行与符号，绝对禁止添加与原文无关的内容。"
-            "输出要求为：必须且仅能是符合Schema的JSON，包括speaker_name、original_text、translated_text三个字段。"
-            f"speaker_name 字段为说话人姓名，保持{self.source_language}原文，不需要翻译。original_text 字段为图像2中识别的{self.source_language}原文文本。translated_text 字段为将original_text翻译成{self.target_language}的译文。"
+            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的日文文本翻译为中文。"
+            f"接下来会给你两张图像，图片1是当前说话人日文姓名，图片2是日文对话文本。"
+            f"请识别图像1中的日文说话人名，结合你对{self.game_name}的了解用于理解说话人的背景和性格辅助翻译。不要把说话人信息输出到译文中。"
+            f"之后识别图像2中的日文对话文本，并结合你对{self.game_name}的了解和说话人信息翻译为中文译文。当出现英文时不需要翻译，输出原文作为译文。"
+            "翻译必须在优先保证语义通顺的情况下保留原文的换行与符号，绝对禁止添加与原文无关的内容，保留原文使用的『』，不需要替换为‘’或''，禁止自行添加标点，禁止在句尾保留“ッ”等日文助词。"
+            "输出格式要求为：必须且仅能是符合Schema的JSON，包括speaker_name、original_text、translated_text三个字段。"
+            f"speaker_name字段为说话人姓名，保持日文原文，不需要翻译。original_text字段为图像2中识别的日文原文文本。translated_text字段为中文译文。"
         )
         # Only include extra requirements sentence when provided
         extra_requirements_text = str(extra_requirements or "").strip()
         if extra_requirements_text:
             system_prompt = system_prompt.replace(
-                "输出要求为：", f"翻译需要满足：{extra_requirements_text}。输出要求为："
+                "输出格式要求为：", f"翻译需要满足：{extra_requirements_text}。输出格式要求为："
             )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
@@ -539,7 +595,7 @@ class BailianVlmTranslator:
                 if translated_text and self._has_japanese_leak(original_text, translated_text, min_len=3):
                     if self.log_fn is not None:
                         self.log_fn(
-                            f"{tag_prefix}warning: translated text leaks >=3 continuous Japanese chars from original; retrying"
+                            f"{tag_prefix}warning: translated text leaks >=3 continuous kana chars from original; retrying"
                         )
                     translated_text = ""
                 if self.io_log_enabled:
@@ -621,25 +677,23 @@ class BailianVlmTranslator:
         src = str(original_text or "").strip()
         if not src:
             return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        game_hint = (
-            f"文本内容与{self.game_name}相关，请结合相关知识提升术语一致性。"
-            if self.game_name
-            else ""
-        )
+        game_hint = f"文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         custom = str(custom_prompt or "").strip()
         system_prompt = (
-            "你是一个视觉小说文本翻译助手。"
-            f"{game_hint}"
-            f"请将给定的{self.source_language}原文翻译成{self.target_language}。"
-            "保留换行和原格式，禁止添加原文无关内容。"
-            "只输出符合Schema的JSON。"
+            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。"
+            f"接下来会给你当前说话人信息和已经识别出的{self.source_language}原文文本。"
+            f"请结合你对{self.game_name}的了解和给出的说话人信息，将原文翻译为{self.target_language}译文。说话人信息仅用于参考，不要把说话人信息输出到译文中。"
+            f"{game_hint}原文也可能为纯英文，此时不需要翻译，直接输出原文作为译文即可。"
+            "翻译必须在语义通顺的情况下尽可能保留原文的换行与符号，绝对禁止添加与原文无关的内容，保留原文使用的『』，不需要替换为‘’或''。"
+            "输出格式要求为：必须且仅能是符合Schema的JSON，包括translated_text一个字段。"
+            f"translated_text 字段为将给定原文翻译成{self.target_language}的译文。"
         )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
         user_text = (
-            f"说话人（仅作语气参考，不需要输出）：{speaker}\n"
-            f"原文：\n{src}\n"
-            "请返回JSON，字段为 translated_text。"
+            f"当前说话人（仅作语气参考，不需要输出）：{speaker}\n"
+            f"当前{self.source_language}原文：\n{src}\n"
+            "请返回JSON，字段为：translated_text。"
         )
         if custom:
             user_text += f"\n附加要求：{custom}"
@@ -736,19 +790,15 @@ class BailianVlmTranslator:
         history_items: list[dict[str, str]] | None = None,
         custom_prompt: str = "",
     ) -> tuple[str, str, dict[str, int]]:
-        game_hint = (
-            f"图像中的文本内容与{self.game_name}相关，请结合该作品常见术语与表达习惯。"
-            if self.game_name
-            else ""
-        )
+        game_hint = f"图像中的文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         system_prompt = (
-            "你是视觉小说场景的OCR与翻译助手。"
-            f"{game_hint}"
-            f"请识别图像中的{self.source_language}文本，并翻译为{self.target_language}。"
-            "无需输出说话人信息。"
-            "注意保留换行和格式。"
-            "绝对禁止添加与原文无关内容。"
-            "输出必须且仅能是符合Schema的JSON。"
+            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。"
+            f"接下来会给你一张图像，图像中可能是标题或文本区域，不包含独立的说话人姓名图像。"
+            f"请识别图像中的{self.source_language}文本，并结合你对{self.game_name}的了解翻译为{self.target_language}译文。"
+            f"{game_hint}原文也可能为纯英文，此时不需要翻译，直接输出原文作为译文即可。"
+            "翻译必须在语义通顺的情况下尽可能保留原文的换行与符号，绝对禁止添加与原文无关的内容，保留原文使用的『』，不需要替换为‘’或''。"
+            "输出格式要求为：必须且仅能是符合Schema的JSON，包括original_text、translated_text两个字段。"
+            f"original_text 字段为图像中识别的{self.source_language}原文文本。translated_text 字段为将original_text翻译成{self.target_language}的译文。"
         )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
@@ -763,7 +813,7 @@ class BailianVlmTranslator:
         user_text = (
             "下面提供一张图像（标题或文本区域），请执行OCR并翻译。\n"
             "给出的前文仅作风格和术语参考，不一定与当前图像直接相关。\n"
-            f"前文参考：\n{history_text}\n"
+            # f"前文参考：\n{history_text}\n"
             "请返回JSON，字段为：original_text、translated_text。"
         )
         custom = str(custom_prompt or "").strip()
@@ -954,15 +1004,15 @@ class BailianVlmTranslator:
         }
 
     def _has_japanese_leak(self, original_text: str, translated_text: str, min_len: int = 3) -> bool:
-        if not original_text or not translated_text:
-            return False
-        n = max(1, int(min_len))
-        jp_seq = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fffー]+")
-        for m in jp_seq.finditer(translated_text):
-            seq = m.group(0)
-            if len(seq) >= n and seq in original_text:
-                return True
-        return False
+        return _has_kana_leak_from_original(original_text, translated_text, min_len=min_len)
+
+    def _has_reviewable_kanji_overlap(
+        self,
+        original_text: str,
+        translated_text: str,
+        min_len: int = 3,
+    ) -> bool:
+        return _has_kanji_overlap_from_original(original_text, translated_text, min_len=min_len)
 
     def _append_io_log(self, record: dict[str, Any]) -> None:
         if not self.io_log_enabled or self.io_log_path is None:
