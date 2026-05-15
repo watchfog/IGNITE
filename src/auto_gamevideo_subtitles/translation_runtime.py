@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib import error as urlerror
+
+from .log_utils import _log
 from urllib import request
 
 
@@ -40,7 +42,7 @@ def load_api_key(path: str | Path) -> str:
     raise ValueError(f"cannot parse api key from file: {key_path}")
 
 
-def _normalize_quotes_for_subtitle(text: str) -> str:
+def normalize_quotes_for_subtitle(text: str) -> str:
     if not text:
         return ""
     s = text.strip()
@@ -115,7 +117,7 @@ def _normalize_quotes_for_subtitle(text: str) -> str:
     return s
 
 
-def _has_kana_leak_from_original(original_text: str, translated_text: str, min_len: int = 3) -> bool:
+def has_kana_leak_from_original(original_text: str, translated_text: str, min_len: int = 3) -> bool:
     if not original_text or not translated_text:
         return False
     n = max(1, int(min_len))
@@ -127,7 +129,7 @@ def _has_kana_leak_from_original(original_text: str, translated_text: str, min_l
     return False
 
 
-def _has_kanji_overlap_from_original(original_text: str, translated_text: str, min_len: int = 3) -> bool:
+def has_kanji_overlap_from_original(original_text: str, translated_text: str, min_len: int = 3) -> bool:
     if not original_text or not translated_text:
         return False
     n = max(1, int(min_len))
@@ -227,7 +229,61 @@ def _language_label_zh(lang: str) -> str:
 #             .get("content", "")
 #             .strip()
 #         )
-#         return _normalize_quotes_for_subtitle(out)
+#         return normalize_quotes_for_subtitle(out)
+
+
+def translate_segment_with_retry(
+    seg_id: int,
+    translator: BailianVlmTranslator,
+    speaker_image_path: Path,
+    image_path: Path,
+    speaker: str,
+    history_items: list[dict[str, str]] | None = None,
+    extra_requirements: str = "",
+) -> tuple[str, str, str, dict[str, int]]:
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    attempts = max(1, int(getattr(translator, "max_retries", 0)) + 1)
+    last_err: ValueError | None = None
+    for attempt in range(1, attempts + 1):
+        _log(f"[VLM] segment {seg_id}: request started (attempt {attempt}/{attempts})")
+        try:
+            speaker_name, original_text, translated_text, usage = (
+                translator.translate_image_ja_to_zh_cn_structured_with_tag(
+                    image_path=image_path,
+                    speaker_image_path=speaker_image_path,
+                    speaker=speaker,
+                    request_tag=f"segment {seg_id}",
+                    history_items=history_items,
+                    extra_requirements=extra_requirements,
+                )
+            )
+            pt = _safe_int(usage.get("prompt_tokens", 0))
+            ct = _safe_int(usage.get("completion_tokens", 0))
+            tt = _safe_int(usage.get("total_tokens", pt + ct), pt + ct)
+            _log(
+                f"[VLM] segment {seg_id}: request succeeded "
+                f"(orig_chars={len(original_text)}, trans_chars={len(translated_text)}, "
+                f"tokens_in={pt}, tokens_out={ct}, tokens_total={tt})"
+            )
+            return speaker_name, original_text, translated_text, usage
+        except ValueError as exc:
+            last_err = exc
+            detail = str(exc).strip() or repr(exc)
+            if attempt >= attempts:
+                break
+            _log(
+                f"[VLM] segment {seg_id}: ValueError on attempt {attempt}/{attempts}: "
+                f"{detail}; retrying"
+            )
+            time.sleep(max(0.0, float(getattr(translator, "retry_delay_sec", 0.0))))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("VLM request failed without an exception")
 
 
 class BailianVlmTranslator:
@@ -425,7 +481,7 @@ class BailianVlmTranslator:
                 text = self._extract_text(data).strip()
                 text = self._strip_thinking_content(text)
                 if text:
-                    return _normalize_quotes_for_subtitle(text)
+                    return normalize_quotes_for_subtitle(text)
                 empty_count += 1
                 if self.log_fn is not None:
                     self.log_fn(
@@ -596,7 +652,7 @@ class BailianVlmTranslator:
                 speaker_name = self._strip_thinking_content(speaker_name).strip()
                 original_text = self._strip_thinking_content(original_text).strip()
                 translated_text = self._strip_thinking_content(translated_text).strip()
-                translated_text = _normalize_quotes_for_subtitle(translated_text)
+                translated_text = normalize_quotes_for_subtitle(translated_text)
                 if translated_text and self._has_japanese_leak(original_text, translated_text, min_len=3):
                     if self.log_fn is not None:
                         self.log_fn(
@@ -752,7 +808,7 @@ class BailianVlmTranslator:
                                 parsed = {}
                 translated = str((parsed or {}).get("translated_text", "")).strip()
                 translated = self._strip_thinking_content(translated)
-                translated = _normalize_quotes_for_subtitle(translated)
+                translated = normalize_quotes_for_subtitle(translated)
                 if translated and self._has_japanese_leak(src, translated, min_len=3):
                     translated = ""
                 if translated:
@@ -903,7 +959,7 @@ class BailianVlmTranslator:
                 translated_text = str((obj or {}).get("translated_text", "")).strip()
                 original_text = self._strip_thinking_content(original_text)
                 translated_text = self._strip_thinking_content(translated_text)
-                translated_text = _normalize_quotes_for_subtitle(translated_text)
+                translated_text = normalize_quotes_for_subtitle(translated_text)
                 if translated_text and self._has_japanese_leak(original_text, translated_text, min_len=3):
                     translated_text = ""
                 if self.io_log_enabled:
@@ -1009,7 +1065,7 @@ class BailianVlmTranslator:
         }
 
     def _has_japanese_leak(self, original_text: str, translated_text: str, min_len: int = 3) -> bool:
-        return _has_kana_leak_from_original(original_text, translated_text, min_len=min_len)
+        return has_kana_leak_from_original(original_text, translated_text, min_len=min_len)
 
     def _has_reviewable_kanji_overlap(
         self,
@@ -1017,7 +1073,7 @@ class BailianVlmTranslator:
         translated_text: str,
         min_len: int = 3,
     ) -> bool:
-        return _has_kanji_overlap_from_original(original_text, translated_text, min_len=min_len)
+        return has_kanji_overlap_from_original(original_text, translated_text, min_len=min_len)
 
     def _append_io_log(self, record: dict[str, Any]) -> None:
         if not self.io_log_enabled or self.io_log_path is None:

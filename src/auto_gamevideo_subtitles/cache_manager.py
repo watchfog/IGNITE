@@ -8,7 +8,7 @@ from typing import Any
 
 from .models import DialogueSegment
 from .review_utils import _merge_review_reasons
-from .translation_runtime import _has_kanji_overlap_from_original, _normalize_quotes_for_subtitle
+from .translation_runtime import has_kanji_overlap_from_original, normalize_quotes_for_subtitle
 
 
 def _load_json(path: Path) -> Any:
@@ -35,7 +35,7 @@ def _translation_cache_review_reasons(
     dt = str(dialogue_type or "").strip().lower()
     if dt in {"blank_no_name", "blank", "title"}:
         return []
-    text = _normalize_quotes_for_subtitle(str(translation_subtitle or "").strip())
+    text = normalize_quotes_for_subtitle(str(translation_subtitle or "").strip())
     original = str(original_text or "").strip()
     debug = str(debug_subtitle or "").strip()
     reasons: list[str] = []
@@ -45,7 +45,7 @@ def _translation_cache_review_reasons(
         reasons.append("translation_fallback_debug_text")
     elif text.startswith("[DEBUG]"):
         reasons.append("translation_fallback_debug_text")
-    if _has_kanji_overlap_from_original(original, text, min_len=5):
+    if has_kanji_overlap_from_original(original, text, min_len=5):
         reasons.append("translation_kanji_overlap_with_original")
     return reasons
 
@@ -83,7 +83,7 @@ def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, Any]], dict
     for e in entries:
         if not isinstance(e, dict):
             continue
-        text = _normalize_quotes_for_subtitle(str(e.get("translation_subtitle", "") or "").strip())
+        text = normalize_quotes_for_subtitle(str(e.get("translation_subtitle", "") or "").strip())
         original = str(e.get("text_original", "") or "").strip()
         if not text:
             continue
@@ -178,7 +178,7 @@ def _segments_from_cache_entries(entries: list[dict[str, Any]]) -> tuple[list[Di
     for i, e in enumerate(entries, start=1):
         ts = float(e.get("time_start", 0.0))
         te = float(e.get("time_end", ts))
-        text = _normalize_quotes_for_subtitle(str(e.get("translation_subtitle", "") or ""))
+        text = normalize_quotes_for_subtitle(str(e.get("translation_subtitle", "") or ""))
         dbg = str(e.get("debug_subtitle", "") or "")
         sid = int(e.get("segment_id", i) or i)
         dt = str(e.get("dialogue_type", "speaker_dialogue") or "speaker_dialogue")

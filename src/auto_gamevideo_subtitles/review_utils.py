@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import DialogueSegment
-from .translation_runtime import _has_kanji_overlap_from_original
+from .translation_runtime import has_kanji_overlap_from_original
 
 
 def _coerce_review_reasons(value: Any) -> list[str]:
@@ -84,7 +84,7 @@ def _first_true_run_bounds(flags: list[bool], min_run: int = 1) -> tuple[int, in
 
 
 def _mark_kanji_overlap_for_review(seg: DialogueSegment) -> None:
-    if _has_kanji_overlap_from_original(seg.text_original, seg.translation_subtitle, min_len=5):
+    if has_kanji_overlap_from_original(seg.text_original, seg.translation_subtitle, min_len=5):
         seg.needs_review = True
         seg.review_reason = _merge_review_reasons(
             seg.review_reason,
