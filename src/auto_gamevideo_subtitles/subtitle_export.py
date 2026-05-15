@@ -36,7 +36,7 @@ def _format_multiline_bracket_indent(text: str, *, ass_mode: bool = False) -> st
     fw = 0
     hw = 0
     for ch in lines[0]:
-        if ch in "\uff08\u3010\u3014\uff5f":
+        if ch in "（【〔｟":
             fw += 1
         elif ch in "([":
             hw += 1

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import copy
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 import io
-import json
 import shutil
 import subprocess
 import threading
@@ -16,6 +14,17 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from .cache_manager import (
+    _dump_translation_cache,
+    _extract_title_entries,
+    _find_latest_translation_cache,
+    _load_cache_entries,
+    _load_json,
+    _load_translation_cache,
+    _save_json,
+    _segments_from_cache_entries,
+    _subtitle_cache_key,
+)
 from .config import load_config
 from .event_detect import (
     FrameMetric,
@@ -32,14 +41,29 @@ from .ffmpeg_utils import (
     ffprobe_video,
     extract_frame_to_memory,
 )
+from .image_utils import (
+    _assert_crop_size,
+    _crop_and_save,
+    _crop_image_to_base64,
+    _image_to_base64,
+    _timestamp_to_frame_number,
+    _try_load_cached_full_frame,
+    _try_load_cached_roi_frame_with_status,
+)
 from .models import DialogueSegment, Roi
 from .ocr_engines import build_ocr_engine
+from .review_utils import (
+    _attach_review_metadata,
+    _coerce_review_reasons,
+    _fill_short_false_gaps,
+    _first_true_run_bounds,
+    _mark_kanji_overlap_for_review,
+    _merge_review_reasons,
+)
 from .state_machine import StateMachineConfig, segment_from_metrics
 from .subtitle_export import write_ass, write_srt
 from .translation_runtime import (
     BailianVlmTranslator,
-    _has_kanji_overlap_from_original,
-    _normalize_quotes_for_subtitle,
     load_api_key,
 )
 
@@ -110,15 +134,6 @@ def _vlm_translate_task(
     if last_err is not None:
         raise last_err
     raise RuntimeError("VLM request failed without an exception")
-
-
-def _mark_kanji_overlap_for_review(seg: DialogueSegment) -> None:
-    if _has_kanji_overlap_from_original(seg.text_original, seg.translation_subtitle, min_len=5):
-        seg.needs_review = True
-        seg.review_reason = _merge_review_reasons(
-            seg.review_reason,
-            ["translation_kanji_overlap_with_original"],
-        )
 
 
 def _roi_from_cfg(cfg: dict[str, Any], key: str) -> Roi:
@@ -253,88 +268,6 @@ def _cleanup_intermediate_artifacts(work_dir: Path) -> None:
                     time.sleep(0.25)
             if not ok:
                 _log(f"Warning: failed to cleanup intermediate {p}: {last_exc}")
-
-
-def _crop_and_save(frame_path: Path, roi: Roi, output_path: Path) -> None:
-    with Image.open(frame_path) as im:
-        x1 = max(0, min(int(roi.x1), im.width - 1))
-        y1 = max(0, min(int(roi.y1), im.height - 1))
-        x2 = max(0, min(int(roi.x2), im.width))
-        y2 = max(0, min(int(roi.y2), im.height))
-        if x2 <= x1 or y2 <= y1:
-            raise RuntimeError(f"Invalid crop roi: {roi}")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        im.crop((x1, y1, x2, y2)).save(output_path)
-
-
-def _crop_image_to_base64(image: Image.Image, roi: Roi) -> str:
-    """Crop an in-memory PIL Image and convert to base64 PNG data URL."""
-    import base64
-    import io
-    
-    x1 = max(0, min(int(roi.x1), image.width - 1))
-    y1 = max(0, min(int(roi.y1), image.height - 1))
-    x2 = max(0, min(int(roi.x2), image.width))
-    y2 = max(0, min(int(roi.y2), image.height))
-    if x2 <= x1 or y2 <= y1:
-        raise RuntimeError(f"Invalid crop roi: {roi}")
-    
-    cropped = image.crop((x1, y1, x2, y2))
-    buffer = io.BytesIO()
-    cropped.save(buffer, format="PNG")
-    b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
-
-
-def _image_to_base64(image: Image.Image) -> str:
-    """Convert an in-memory PIL Image to base64 PNG data URL."""
-    import base64
-    import io
-
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
-
-
-def _timestamp_to_frame_number(timestamp: float, start_sec: float, fps: float) -> int:
-    """Convert timestamp to frame number (1-indexed for ffmpeg %06d pattern)."""
-    frame_index = int(round((timestamp - start_sec) * fps))
-    return max(0, frame_index + 1)  # ffmpeg numbering starts at 1
-
-
-def _try_load_cached_full_frame(
-    timestamp: float,
-    cache_dir: Path,
-    start_sec: float,
-    fps: float,
-) -> Image.Image | None:
-    """Try to load a full frame from cache. Returns None if not found."""
-    frame_num = _timestamp_to_frame_number(timestamp, start_sec, fps)
-    frame_path = cache_dir / f"{frame_num:06d}.png"
-    if frame_path.exists():
-        try:
-            return Image.open(frame_path).convert("RGB")
-        except Exception:
-            return None
-    return None
-
-
-def _try_load_cached_roi_frame_with_status(
-    timestamp: float,
-    cache_dir: Path,
-    start_sec: float,
-    fps: float,
-) -> tuple[Image.Image | None, str, int]:
-    """Load cached ROI frame from image cache with explicit status for logging."""
-    frame_num = _timestamp_to_frame_number(timestamp, start_sec, fps)
-    frame_path = cache_dir / f"{frame_num:06d}.png"
-    if not frame_path.exists():
-        return None, "miss_not_found", frame_num
-    try:
-        return Image.open(frame_path).convert("RGB"), "hit", frame_num
-    except Exception:
-        return None, "miss_read_error", frame_num
 
 
 def _background_score_marker_and_prune_dialogue_cache(
@@ -723,64 +656,6 @@ def _auto_marker_threshold(scores: list[float], fallback: float) -> float:
     return float(max(0.25, min(0.85, mixed)))
 
 
-def _group_active_ranges(
-    metrics: list[FrameMetric],
-    presence_threshold: float,
-    diff_threshold: float,
-    name_presence_threshold: float,
-    name_diff_threshold: float,
-    marker_presence_threshold: float,
-    marker_diff_threshold: float,
-    merge_gap_sec: float,
-    pad_sec: float,
-) -> list[tuple[float, float]]:
-    if not metrics:
-        return []
-    ranges: list[tuple[float, float]] = []
-    st: float | None = None
-    ed: float | None = None
-    last_split_at = -1.0
-    prev_marker_on = False
-    for m in metrics:
-        name_active = m.name_presence >= name_presence_threshold
-        marker_on = m.marker_presence >= marker_presence_threshold
-
-        if not name_active:
-            if st is not None and ed is not None and (m.timestamp - ed) > merge_gap_sec:
-                ranges.append((max(0.0, st - pad_sec), ed + pad_sec))
-                st = None
-                ed = None
-            prev_marker_on = marker_on
-            continue
-
-        if st is None:
-            st = m.timestamp
-            ed = m.timestamp
-            prev_marker_on = marker_on
-            continue
-
-        marker_toggled = marker_on != prev_marker_on
-        if marker_toggled and (m.timestamp - last_split_at) >= 0.4 and (ed - st) >= 0.35:
-            ranges.append((max(0.0, st - pad_sec), ed + pad_sec))
-            st = m.timestamp
-            ed = m.timestamp
-            last_split_at = m.timestamp
-            prev_marker_on = marker_on
-            continue
-
-        if (m.timestamp - ed) <= merge_gap_sec:
-            ed = m.timestamp
-        else:
-            ranges.append((max(0.0, st - pad_sec), ed + pad_sec))
-            st = m.timestamp
-            ed = m.timestamp
-        prev_marker_on = marker_on
-
-    if st is not None and ed is not None:
-        ranges.append((max(0.0, st - pad_sec), ed + pad_sec))
-    return ranges
-
-
 def _pick_sample_indices(frame_indices: list[int], max_candidates: int) -> list[int]:
     if not frame_indices:
         return []
@@ -789,15 +664,6 @@ def _pick_sample_indices(frame_indices: list[int], max_candidates: int) -> list[
         return unique
     picks = np.linspace(0, len(unique) - 1, max_candidates, dtype=int)
     return [unique[i] for i in picks]
-
-
-def _save_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _backup_subtitles_to_work(output_dir: Path, work_dir: Path) -> None:
@@ -817,220 +683,6 @@ def _backup_subtitles_to_work(output_dir: Path, work_dir: Path) -> None:
             shutil.copy2(src, dst)
         except Exception as exc:
             _log(f"Warning: failed to backup subtitle {name} to work dir: {exc.__class__.__name__}")
-
-
-def _srt_time(sec: float) -> str:
-    ms = int(round(float(sec) * 1000))
-    hh = ms // 3600000
-    ms -= hh * 3600000
-    mm = ms // 60000
-    ms -= mm * 60000
-    ss = ms // 1000
-    ms -= ss * 1000
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
-
-def _subtitle_cache_key(segment_id: int, time_start: float, time_end: float, dialogue_type: str) -> str:
-    st = int(round(float(time_start) * 1000))
-    ed = int(round(float(time_end) * 1000))
-    return f"id={int(segment_id)}|{st}-{ed}|{dialogue_type}"
-
-
-def _translation_cache_review_reasons(
-    dialogue_type: str,
-    translation_subtitle: Any,
-    debug_subtitle: Any,
-    original_text: Any = "",
-) -> list[str]:
-    dt = str(dialogue_type or "").strip().lower()
-    if dt in {"blank_no_name", "blank", "title"}:
-        return []
-    text = _normalize_quotes_for_subtitle(str(translation_subtitle or "").strip())
-    original = str(original_text or "").strip()
-    debug = str(debug_subtitle or "").strip()
-    reasons: list[str] = []
-    if not text:
-        reasons.append("translation_missing")
-    elif debug and text == debug:
-        reasons.append("translation_fallback_debug_text")
-    elif text.startswith("[DEBUG]"):
-        reasons.append("translation_fallback_debug_text")
-    if _has_kanji_overlap_from_original(original, text, min_len=5):
-        reasons.append("translation_kanji_overlap_with_original")
-    return reasons
-
-
-def _cache_entry_with_review_metadata(entry: dict[str, Any]) -> dict[str, Any]:
-    out = copy.deepcopy(entry)
-    out.pop("srt_start", None)
-    out.pop("srt_end", None)
-    reasons = _merge_review_reasons(
-        out.get("review_reason"),
-        out.get("review_reasons"),
-        _translation_cache_review_reasons(
-            str(out.get("dialogue_type", "") or ""),
-            out.get("translation_subtitle", ""),
-            out.get("debug_subtitle", ""),
-            out.get("text_original", ""),
-        ),
-    )
-    if bool(out.get("needs_review", False)) or reasons:
-        out["needs_review"] = True
-        out["review_reason"] = reasons
-    return out
-
-
-def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    if not path.exists():
-        return {}, {}
-    try:
-        raw = _load_json(path)
-    except Exception:
-        return {}, {}
-    entries = raw.get("entries", []) if isinstance(raw, dict) else []
-    by_full_key: dict[str, dict[str, Any]] = {}
-    by_time_type: dict[str, dict[str, Any]] = {}
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        text = _normalize_quotes_for_subtitle(str(e.get("translation_subtitle", "") or "").strip())
-        original = str(e.get("text_original", "") or "").strip()
-        if not text:
-            continue
-        sid = int(e.get("segment_id", 0) or 0)
-        ts = float(e.get("time_start", 0.0) or 0.0)
-        te = float(e.get("time_end", 0.0) or 0.0)
-        dt = str(e.get("dialogue_type", "") or "")
-        dbg = str(e.get("debug_subtitle", "") or "")
-        k1 = _subtitle_cache_key(sid, ts, te, dt)
-        k2 = _subtitle_cache_key(0, ts, te, dt)
-        payload = {
-            "speaker": str(e.get("speaker", "") or ""),
-            "text_original": original,
-            "translation_subtitle": text,
-            "needs_review": bool(e.get("needs_review", False)),
-            "review_reason": _merge_review_reasons(
-                e.get("review_reason"),
-                _translation_cache_review_reasons(dt, text, dbg, original),
-            ),
-        }
-        by_full_key[k1] = payload
-        by_time_type[k2] = payload
-    return by_full_key, by_time_type
-
-
-def _dump_translation_cache(
-    path: Path,
-    video_path: str,
-    config_path: str,
-    segments: list[DialogueSegment],
-    debug_texts: list[str],
-    prefix_entries: list[dict[str, Any]] | None = None,
-) -> None:
-    entries: list[dict[str, Any]] = []
-    if prefix_entries:
-        entries.extend(_cache_entry_with_review_metadata(e) for e in prefix_entries)
-    for seg, dbg in zip(segments, debug_texts):
-        entry = {
-            "segment_id": seg.segment_id,
-            "time_start": seg.time_start,
-            "time_end": seg.time_end,
-            "dialogue_type": seg.dialogue_type,
-            "speaker": seg.speaker,
-            "text_original": seg.text_original,
-            "translation_subtitle": seg.translation_subtitle,
-            "debug_subtitle": dbg,
-        }
-        reasons = _merge_review_reasons(
-            seg.review_reason,
-            _translation_cache_review_reasons(
-                seg.dialogue_type,
-                seg.translation_subtitle,
-                dbg,
-                seg.text_original,
-            ),
-        )
-        if seg.needs_review or reasons:
-            entry["needs_review"] = True
-            entry["review_reason"] = reasons
-        entries.append(entry)
-    payload = {
-        "version": 1,
-        "video": str(video_path),
-        "config_path": str(config_path),
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "entries": entries,
-    }
-    _save_json(path, payload)
-
-
-def _load_cache_entries(path: Path) -> list[dict[str, Any]]:
-    raw = _load_json(path)
-    entries = raw.get("entries", []) if isinstance(raw, dict) else []
-    return [e for e in entries if isinstance(e, dict)]
-
-
-def _extract_title_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for e in entries:
-        try:
-            sid = int(e.get("segment_id", -1) or -1)
-        except Exception:
-            sid = -1
-        if sid == 0:
-            out.append(copy.deepcopy(e))
-    return out
-
-
-def _segments_from_cache_entries(entries: list[dict[str, Any]]) -> tuple[list[DialogueSegment], list[DialogueSegment]]:
-    segs: list[DialogueSegment] = []
-    dbg_segs: list[DialogueSegment] = []
-    for i, e in enumerate(entries, start=1):
-        ts = float(e.get("time_start", 0.0))
-        te = float(e.get("time_end", ts))
-        text = _normalize_quotes_for_subtitle(str(e.get("translation_subtitle", "") or ""))
-        dbg = str(e.get("debug_subtitle", "") or "")
-        sid = int(e.get("segment_id", i) or i)
-        dt = str(e.get("dialogue_type", "speaker_dialogue") or "speaker_dialogue")
-        seg = DialogueSegment(
-            segment_id=sid,
-            frame_start=0,
-            frame_end=0,
-            time_start=ts,
-            time_end=te,
-            speaker=str(e.get("speaker", "") or ""),
-            speaker_confidence=0.0,
-            text_original=str(e.get("text_original", "") or ""),
-            text_ocr_confidence=0.0,
-            translation_subtitle=text,
-            dialogue_type=dt,
-            line_count_detected=max(1, text.count("\n") + 1) if text else 1,
-        )
-        dseg = copy.deepcopy(seg)
-        dseg.translation_subtitle = dbg
-        segs.append(seg)
-        dbg_segs.append(dseg)
-    return segs, dbg_segs
-
-
-def _assert_crop_size(paths: list[Path], roi: Roi, tag: str) -> None:
-    if not paths:
-        return
-    try:
-        with Image.open(paths[0]) as im:
-            w, h = im.size
-    except Exception:
-        return
-    if abs(w - roi.width) > 1 or abs(h - roi.height) > 1:
-        raise RuntimeError(
-            f"{tag} crop size mismatch: got {w}x{h}, expected {roi.width}x{roi.height} (tolerance=1px). "
-            "Please check ROI config and ffmpeg crop filter."
-        )
-    if (w, h) != (roi.width, roi.height):
-        _log(
-            f"Warning: {tag} crop is {w}x{h}, ROI is {roi.width}x{roi.height}; "
-            "within 1px tolerance."
-        )
 
 
 class NameOcrRunner:
@@ -1294,26 +946,6 @@ def _export_marker_frames_for_segment(
             pass
 
 
-def _find_latest_translation_cache(base_work_dir: Path) -> Path | None:
-    try:
-        runs = [p for p in base_work_dir.glob("run_*") if p.is_dir()]
-    except Exception:
-        return None
-    if not runs:
-        return None
-    candidates: list[Path] = []
-    for r in runs:
-        c = r / "translation_cache.json"
-        if c.exists():
-            candidates.append(c)
-    if not candidates:
-        return None
-    try:
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-    except Exception:
-        return candidates[-1]
-
-
 def _name_mask_debug_label(gray: np.ndarray, ocr_cfg: dict[str, Any]) -> str:
     _mask, st = extract_text_mask_stats(gray, mode="name")
     score = float(st.presence)
@@ -1386,47 +1018,6 @@ def _export_name_frames_for_segment(
             pass
 
 
-def _coerce_review_reasons(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        items = value
-    else:
-        items = [value]
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in items:
-        s = str(item or "").strip()
-        if not s or s in seen:
-            continue
-        out.append(s)
-        seen.add(s)
-    return out
-
-
-def _merge_review_reasons(*values: Any) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        for reason in _coerce_review_reasons(value):
-            if reason in seen:
-                continue
-            out.append(reason)
-            seen.add(reason)
-    return out
-
-
-def _attach_review_metadata(
-    payload: dict[str, Any],
-    reasons: list[str],
-    force_review: bool = False,
-) -> dict[str, Any]:
-    if reasons or force_review:
-        payload["needs_review"] = True
-        payload["review_reason"] = reasons
-    return payload
-
-
 def _build_refined_subsegment(
     raw: dict[str, Any],
     marker_seg_id: int,
@@ -1459,42 +1050,6 @@ def _build_refined_subsegment(
         "marker_seg_id": marker_seg_id,
     }
     return _attach_review_metadata(out, reasons, force_review=bool(raw.get("needs_review", False)))
-
-
-def _fill_short_false_gaps(flags: list[bool], max_gap: int) -> None:
-    if max_gap <= 0 or len(flags) < 3:
-        return
-    p = 0
-    while p < len(flags):
-        if flags[p]:
-            p += 1
-            continue
-        q = p
-        while q < len(flags) and (not flags[q]):
-            q += 1
-        gap_len = q - p
-        left_on = p > 0 and flags[p - 1]
-        right_on = q < len(flags) and flags[q]
-        if left_on and right_on and gap_len <= max_gap:
-            for t in range(p, q):
-                flags[t] = True
-        p = q
-
-
-def _first_true_run_bounds(flags: list[bool], min_run: int = 1) -> tuple[int, int] | None:
-    min_len = max(1, int(min_run))
-    p = 0
-    while p < len(flags):
-        if not flags[p]:
-            p += 1
-            continue
-        q = p
-        while q < len(flags) and flags[q]:
-            q += 1
-        if (q - p) >= min_len:
-            return p, q - 1
-        p = q
-    return None
 
 
 def _head_probe_hits_ocr(

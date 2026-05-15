@@ -54,17 +54,17 @@ def _normalize_quotes_for_subtitle(text: str) -> str:
     for p in paired_patterns:
         m = re.match(p, s)
         if m:
-            s = f"\u300c{m.group(1).strip()}\u300d"
+            s = f"「{m.group(1).strip()}」"
             break
 
     # Boundary-only mismatch check:
     # only care whether first/last quote symbol is paired at boundaries.
     first = s[0] if s else ""
     last = s[-1] if s else ""
-    openers = {'\u201c', '\u300e', '\u300c', '"'}
-    closers = {'\u201d', '\u300f', '\u300d', '"'}
-    pair_map = {'\u201c': '\u201d', '\u300e': '\u300f', '\u300c': '\u300d', '"': '"'}
-    rev_pair_map = {'\u201d': '\u201c', '\u300f': '\u300e', '\u300d': '\u300c', '"': '"'}
+    openers = {'"', '『', '「', '"'}
+    closers = {'"', '』', '」', '"'}
+    pair_map = {'"': '"', '『': '』', '「': '」', '"': '"'}
+    rev_pair_map = {'"': '"', '』': '『', '」': '「', '"': '"'}
 
     starts_with_opener = first in openers
     ends_with_closer = last in closers
@@ -78,8 +78,8 @@ def _normalize_quotes_for_subtitle(text: str) -> str:
             boundary_mismatch = True
 
     if boundary_mismatch:
-        cleaned = s.strip('\u201c\u201d"\u300e\u300f\u300c\u300d').strip()
-        s = f"\u300c{cleaned}\u300d" if cleaned else "\u300c\u300d"
+        cleaned = s.strip('"' + '"' + '"『』「」').strip()
+        s = f"「{cleaned}」" if cleaned else "「」"
 
     # Normalize paired internal single quotes to Japanese corner quotes.
     chars = list(s)
@@ -94,23 +94,23 @@ def _normalize_quotes_for_subtitle(text: str) -> str:
         single_quote_indices.append(i)
     if len(single_quote_indices) >= 2:
         for opener, closer in zip(single_quote_indices[0::2], single_quote_indices[1::2]):
-            chars[opener] = "\u300e"
-            chars[closer] = "\u300f"
+            chars[opener] = "『"
+            chars[closer] = "』"
         s = "".join(chars)
     s = "".join(
-        "\u300e" if ch == "\u2018" and 0 < i < len(s) - 1 else
-        "\u300f" if ch == "\u2019" and 0 < i < len(s) - 1 else
+        "『" if ch == "'" and 0 < i < len(s) - 1 else
+        "』" if ch == "'" and 0 < i < len(s) - 1 else
         ch
         for i, ch in enumerate(s)
     )
 
     # Final output rule: remove paired outer 「」 if present.
-    if len(s) >= 2 and s.startswith("\u300c") and s.endswith("\u300d"):
+    if len(s) >= 2 and s.startswith("「") and s.endswith("」"):
         s = s[1:-1].strip()
 
     # Normalize half-width brackets to full-width
     if len(s) >= 2 and s[0] == "(" and s[-1] == ")":
-        s = "\uff08" + s[1:-1] + "\uff09"
+        s = "（" + s[1:-1] + "）"
 
     return s
 
@@ -151,16 +151,16 @@ def _has_original_subsequence(original_text: str, seq: str, min_len: int) -> boo
 def _language_label_zh(lang: str) -> str:
     v = (lang or "").strip().lower().replace("_", "-")
     mapping = {
-        "ja": "\u65e5\u8bed",
-        "jpn": "\u65e5\u8bed",
-        "jp": "\u65e5\u8bed",
-        "japanese": "\u65e5\u8bed",
-        "zh": "\u7b80\u4f53\u4e2d\u6587",
-        "zh-cn": "\u7b80\u4f53\u4e2d\u6587",
-        "zh-hans": "\u7b80\u4f53\u4e2d\u6587",
-        "zh-sg": "\u7b80\u4f53\u4e2d\u6587",
-        "chinese": "\u7b80\u4f53\u4e2d\u6587",
-        "simplified chinese": "\u7b80\u4f53\u4e2d\u6587",
+        "ja": "日语",
+        "jpn": "日语",
+        "jp": "日语",
+        "japanese": "日语",
+        "zh": "简体中文",
+        "zh-cn": "简体中文",
+        "zh-hans": "简体中文",
+        "zh-sg": "简体中文",
+        "chinese": "简体中文",
+        "simplified chinese": "简体中文",
     }
     return mapping.get(v, lang)
 
