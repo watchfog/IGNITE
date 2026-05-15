@@ -27,6 +27,30 @@ def _ass_time(sec: float) -> str:
     return f"{hh:d}:{mm:02d}:{ss:02d}.{cs:02d}"
 
 
+def _format_multiline_bracket_indent(text: str, *, ass_mode: bool = False) -> str:
+    if "\n" not in text:
+        return text
+    lines = text.split("\n")
+    if len(lines) < 2 or not lines[0]:
+        return text
+    fw = 0
+    hw = 0
+    for ch in lines[0]:
+        if ch in "\uff08\u3010\u3014\uff5f":
+            fw += 1
+        elif ch in "([":
+            hw += 1
+        else:
+            break
+    if fw == 0 and hw == 0:
+        return text
+    if ass_mode:
+        indent = "\\h" * hw + "\u3000" * fw
+    else:
+        indent = " " * hw + "\u3000" * fw
+    return "\n".join([lines[0]] + [indent + ln for ln in lines[1:]])
+
+
 def write_srt(segments: list[DialogueSegment], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,6 +70,7 @@ def write_srt(segments: list[DialogueSegment], path: str | Path) -> None:
             text = "\n".join(lines_out)
         if not text.strip():
             continue
+        text = _format_multiline_bracket_indent(text)
         lines.extend(
             [
                 str(idx),
@@ -101,7 +126,9 @@ def write_ass(
     ]
     events: list[str] = []
     for seg in segments:
-        text = (seg.translation_subtitle or seg.text_original).replace("\n", "\\N")
+        raw = seg.translation_subtitle or seg.text_original
+        raw = _format_multiline_bracket_indent(raw, ass_mode=True)
+        text = raw.replace("\n", "\\N")
         is_title = str(seg.dialogue_type or "").strip().lower() == "title"
         if is_title:
             speaker_text = str(seg.speaker or "").replace("\n", "\\N").strip()

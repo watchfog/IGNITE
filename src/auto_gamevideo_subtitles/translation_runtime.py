@@ -106,7 +106,12 @@ def _normalize_quotes_for_subtitle(text: str) -> str:
 
     # Final output rule: remove paired outer 「」 if present.
     if len(s) >= 2 and s.startswith("\u300c") and s.endswith("\u300d"):
-        return s[1:-1].strip()
+        s = s[1:-1].strip()
+
+    # Normalize half-width brackets to full-width
+    if len(s) >= 2 and s[0] == "(" and s[-1] == ")":
+        s = "\uff08" + s[1:-1] + "\uff09"
+
     return s
 
 
