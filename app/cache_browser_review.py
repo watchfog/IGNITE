@@ -358,8 +358,6 @@ class CacheReviewApp:
             "segment_id": base_entry.get("segment_id"),
             "time_start": base_entry.get("time_start"),
             "time_end": base_entry.get("time_end"),
-            "srt_start": base_entry.get("srt_start"),
-            "srt_end": base_entry.get("srt_end"),
             "dialogue_type": base_entry.get("dialogue_type", "speaker_dialogue"),
             "speaker": str(speaker or base_entry.get("speaker", "")),
             "text_original": str(original or ""),
@@ -491,6 +489,9 @@ class CacheReviewApp:
             self.entries = self.cache_payload["entries"]
         else:
             raise RuntimeError("cache json 格式不支持")
+        for e in self.entries:
+            e.pop("srt_start", None)
+            e.pop("srt_end", None)
         self.current_index = min(self.current_index, max(0, len(self.entries) - 1))
         self._rebuild_suspect_indices()
         self._init_title_time_defaults()
@@ -1111,17 +1112,6 @@ class CacheReviewApp:
         ms = int((m.group(4) or "0").ljust(3, "0")[:3])
         return max(0.0, hh * 3600 + mm * 60 + ss + ms / 1000.0)
 
-    def _to_srt_time(self, sec: float) -> str:
-        x = max(0.0, float(sec))
-        total_ms = int(round(x * 1000.0))
-        hh = total_ms // 3_600_000
-        rem = total_ms % 3_600_000
-        mm = rem // 60_000
-        rem = rem % 60_000
-        ss = rem // 1_000
-        ms = rem % 1_000
-        return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
-
     def _upsert_title_entry(self, entry: dict[str, Any]) -> int:
         def _safe_int(v: Any, default: int = 1) -> int:
             try:
@@ -1199,8 +1189,6 @@ class CacheReviewApp:
                 "segment_id": 0,
                 "time_start": float(st),
                 "time_end": float(ed),
-                "srt_start": self._to_srt_time(st),
-                "srt_end": self._to_srt_time(ed),
                 "dialogue_type": "title",
                 "speaker": str(self.title_info_var.get() or "").strip(),
                 "text_original": str(original_text or "").strip(),
@@ -1231,8 +1219,6 @@ class CacheReviewApp:
                 "segment_id": 0,
                 "time_start": float(st),
                 "time_end": float(ed),
-                "srt_start": self._to_srt_time(st),
-                "srt_end": self._to_srt_time(ed),
                 "dialogue_type": "title",
                 "speaker": str(self.title_info_var.get() or "").strip(),
                 "text_original": "",

@@ -862,6 +862,8 @@ def _translation_cache_review_reasons(
 
 def _cache_entry_with_review_metadata(entry: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(entry)
+    out.pop("srt_start", None)
+    out.pop("srt_end", None)
     reasons = _merge_review_reasons(
         out.get("review_reason"),
         out.get("review_reasons"),
@@ -933,8 +935,6 @@ def _dump_translation_cache(
             "segment_id": seg.segment_id,
             "time_start": seg.time_start,
             "time_end": seg.time_end,
-            "srt_start": _srt_time(seg.time_start),
-            "srt_end": _srt_time(seg.time_end),
             "dialogue_type": seg.dialogue_type,
             "speaker": seg.speaker,
             "text_original": seg.text_original,
