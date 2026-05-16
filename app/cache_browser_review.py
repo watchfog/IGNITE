@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,10 +26,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from auto_gamevideo_subtitles.config import load_config  # noqa: E402
+from auto_gamevideo_subtitles.event_detect import MarkerTemplateMatcher  # noqa: E402
 from auto_gamevideo_subtitles.translation_runtime import (  # noqa: E402
     BailianVlmTranslator,
-    _has_kanji_overlap_from_original,
-    _normalize_quotes_for_subtitle,
+    has_kanji_overlap_from_original,
+    normalize_quotes_for_subtitle,
     load_api_key,
 )
 
@@ -50,10 +51,11 @@ class CacheReviewApp:
 
         self.root = tk.Tk()
         self.root.title("字幕校对工具 - IGNITE")
-        self.root.geometry("1700x1020")
+        self.root.geometry("1900x1020")
 
         self.status_var = tk.StringVar(value="就绪")
         self.seg_info_var = tk.StringVar(value="-")
+        self.marker_score_var = tk.StringVar(value="")
         self.review_meta_var = tk.StringVar(value="")
         self.goto_var = tk.StringVar(value="1")
         self.time_var = tk.StringVar(value="0.00")
@@ -128,6 +130,12 @@ class CacheReviewApp:
         self.translator: BailianVlmTranslator | None = None
         self.last_review_result: dict[str, Any] | None = None
         self._busy = False
+        self.marker_score_cache: dict[str, Any] | None = None
+        self._marker_matcher: MarkerTemplateMatcher | None = None
+        self._marker2_matcher: MarkerTemplateMatcher | None = None
+        self._marker_roi: list[int] | None = None
+        self._marker2_roi: list[int] | None = None
+        self._merge_undo: dict[str, Any] | None = None
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -217,8 +225,8 @@ class CacheReviewApp:
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         left = ttk.Frame(body)
         right = ttk.Frame(body)
-        body.add(left, weight=3)
-        body.add(right, weight=2)
+        body.add(left, weight=4)
+        body.add(right, weight=1)
 
         self.canvas = tk.Canvas(left, bg="#111111", highlightthickness=1, highlightbackground="#444")
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -252,6 +260,7 @@ class CacheReviewApp:
         ttk.Label(roi_bar, text="拖拽编辑ROI").pack(side=tk.LEFT)
         ttk.OptionMenu(roi_bar, self.roi_key_var, self.roi_key_var.get(), *ROI_KEYS).pack(side=tk.LEFT, padx=6)
         ttk.Button(roi_bar, text="恢复默认ROI", command=self._reset_rois).pack(side=tk.LEFT, padx=2)
+        ttk.Label(roi_bar, textvariable=self.marker_score_var, foreground="#9a4b00").pack(side=tk.LEFT, padx=(16, 0))
 
         # Right panel: vertical stack (JSON on top, review on bottom)
         stack = ttk.Panedwindow(right, orient=tk.VERTICAL)
@@ -262,12 +271,17 @@ class CacheReviewApp:
         stack.add(review_panel, weight=4)
 
         ttk.Label(json_panel, text="前后段 Cache 预览").pack(anchor="w")
+        merge_bar = ttk.Frame(json_panel)
+        merge_bar.pack(fill=tk.X, pady=(2, 0))
+        ttk.Button(merge_bar, text="合并上一段", command=self._merge_with_prev).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(merge_bar, text="合并下一段", command=self._merge_with_next).pack(side=tk.LEFT, padx=2)
+        ttk.Button(merge_bar, text="撤回合并", command=self._undo_merge).pack(side=tk.LEFT, padx=2)
         neighbor_preview = ttk.Frame(json_panel)
         neighbor_preview.pack(fill=tk.X, pady=(4, 6))
-        for key, label in (("prev", "上一段"), ("current", "当前段"), ("next", "下一段")):
+        for key, label in (("prev", "上一段"), ("next", "下一段")):
             box = ttk.LabelFrame(neighbor_preview, text=label, padding=4)
             box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0 if key == "prev" else 4, 0))
-            txt = tk.Text(box, height=8, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED)
+            txt = tk.Text(box, height=6, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED)
             txt.pack(fill=tk.BOTH, expand=True)
             self.neighbor_preview_texts[key] = txt
 
@@ -353,7 +367,7 @@ class CacheReviewApp:
         original: str,
         translated: str,
     ) -> dict[str, Any]:
-        normalized = _normalize_quotes_for_subtitle(str(translated or "").strip())
+        normalized = normalize_quotes_for_subtitle(str(translated or "").strip())
         out: dict[str, Any] = {
             "segment_id": base_entry.get("segment_id"),
             "time_start": base_entry.get("time_start"),
@@ -421,8 +435,82 @@ class CacheReviewApp:
             self.default_rois = {k: list(v) for k, v in loaded.items()}
             if not self.review_rois:
                 self.review_rois = {k: list(v) for k, v in loaded.items()}
+        self._marker_roi = roi_cfg.get("marker_roi")
+        if not isinstance(self._marker_roi, list) or len(self._marker_roi) != 4:
+            self._marker_roi = None
+        self._marker2_roi = roi_cfg.get("marker_2_roi")
+        if not isinstance(self._marker2_roi, list) or len(self._marker2_roi) != 4:
+            self._marker2_roi = None
+        self._init_marker_matchers()
+        self._load_marker_score_cache()
         self.status_var.set(f"已加载配置: {p}")
         self._refresh_canvas()
+
+    def _init_marker_matchers(self) -> None:
+        self._marker_matcher = None
+        self._marker2_matcher = None
+        marker_cfg = self.cfg.get("marker", {})
+        marker_tpl_paths = marker_cfg.get("template_paths")
+        if isinstance(marker_tpl_paths, list) and marker_tpl_paths:
+            try:
+                self._marker_matcher = MarkerTemplateMatcher(
+                    template_paths=[str(p) for p in marker_tpl_paths],
+                    center_width=marker_cfg.get("template_center_width"),
+                    vertical_shift_px=int(marker_cfg.get("vertical_shift_px", 6)),
+                    vertical_shift_step=int(marker_cfg.get("vertical_shift_step", 1)),
+                    horizontal_shift_px=int(marker_cfg.get("horizontal_shift_px", 0)),
+                    horizontal_shift_step=int(marker_cfg.get("horizontal_shift_step", 1)),
+                    shift_mode=str(marker_cfg.get("shift_mode", "vertical")),
+                )
+            except Exception:
+                self._marker_matcher = None
+        marker2_cfg = self.cfg.get("marker_2", {})
+        marker2_tpl_paths = marker2_cfg.get("template_paths")
+        if isinstance(marker2_tpl_paths, list) and marker2_tpl_paths:
+            try:
+                self._marker2_matcher = MarkerTemplateMatcher(
+                    template_paths=[str(p) for p in marker2_tpl_paths],
+                    center_width=marker2_cfg.get("template_center_width"),
+                    vertical_shift_px=int(marker2_cfg.get("vertical_shift_px", 6)),
+                    vertical_shift_step=int(marker2_cfg.get("vertical_shift_step", 1)),
+                    horizontal_shift_px=int(marker2_cfg.get("horizontal_shift_px", 0)),
+                    horizontal_shift_step=int(marker2_cfg.get("horizontal_shift_step", 1)),
+                    shift_mode=str(marker2_cfg.get("shift_mode", "vertical")),
+                )
+            except Exception:
+                self._marker2_matcher = None
+
+    def _load_marker_score_cache(self) -> None:
+        self.marker_score_cache = None
+        cache_parent = self.cache_path.parent
+        while cache_parent != cache_parent.parent:
+            if cache_parent.name == "work":
+                work_dir = cache_parent
+                break
+            cache_parent = cache_parent.parent
+        else:
+            try:
+                latest = self.cache_path.parent / "marker_score_cache.json"
+                if latest.exists():
+                    self.marker_score_cache = json.loads(latest.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            return
+        for p in sorted(work_dir.glob("run_*"), reverse=True):
+            score_file = p / "marker_score_cache.json"
+            if score_file.exists():
+                try:
+                    self.marker_score_cache = json.loads(score_file.read_text(encoding="utf-8"))
+                    return
+                except Exception:
+                    continue
+        # Fallback: try alongside current cache
+        score_file = self.cache_path.parent / "marker_score_cache.json"
+        if score_file.exists():
+            try:
+                self.marker_score_cache = json.loads(score_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
 
     def _build_translator(self) -> BailianVlmTranslator:
         want_web_search = bool(self.review_web_search_var.get())
@@ -477,6 +565,73 @@ class CacheReviewApp:
         )
         return self.translator
 
+    def _get_cached_marker_score(self, sec: float) -> tuple[float | None, float | None]:
+        """Return (marker_score, marker2_score) from cache, or (None, None)."""
+        if not self.marker_score_cache:
+            return None, None
+        ranges = self.marker_score_cache.get("ranges")
+        if not isinstance(ranges, list):
+            return None, None
+        sec = max(0.0, float(sec))
+        for r in ranges:
+            start_sec = float(r.get("start_sec", 0.0))
+            end_sec = float(r.get("end_sec", start_sec))
+            if sec < start_sec or sec > end_sec:
+                continue
+            scan_fps = float(r.get("scan_fps", 10.0))
+            scores = r.get("scores")
+            if not isinstance(scores, list) or not scores:
+                continue
+            idx = int(round((sec - start_sec) * scan_fps))
+            if 0 <= idx < len(scores):
+                return float(scores[idx]), None
+        return None, None
+
+    def _compute_marker_scores_on_the_fly(self) -> tuple[float | None, float | None]:
+        """Compute marker/marker2 scores from the currently displayed frame."""
+        if self.current_frame_rgb is None:
+            return None, None
+        try:
+            img = Image.fromarray(self.current_frame_rgb)
+        except Exception:
+            return None, None
+        ms = None
+        m2s = None
+        if self._marker_matcher is not None and self._marker_roi is not None:
+            try:
+                x1, y1, x2, y2 = self._marker_roi
+                crop = img.crop((x1, y1, x2, y2))
+                gray = np.asarray(crop.convert("L"), dtype=np.uint8)
+                ms = float(self._marker_matcher.score(gray))
+            except Exception:
+                ms = None
+        if self._marker2_matcher is not None and self._marker2_roi is not None:
+            try:
+                x1, y1, x2, y2 = self._marker2_roi
+                crop = img.crop((x1, y1, x2, y2))
+                gray = np.asarray(crop.convert("L"), dtype=np.uint8)
+                m2s = float(self._marker2_matcher.score(gray))
+            except Exception:
+                m2s = None
+        return ms, m2s
+
+    def _update_marker_score_display(self, sec: float) -> None:
+        ms_cache, m2s_cache = self._get_cached_marker_score(sec)
+        ms = ms_cache
+        m2s = m2s_cache
+        if ms is None or m2s is None:
+            ms_fly, m2s_fly = self._compute_marker_scores_on_the_fly()
+            if ms is None:
+                ms = ms_fly
+            if m2s is None:
+                m2s = m2s_fly
+        parts: list[str] = []
+        if ms is not None:
+            parts.append(f"Marker: {ms:.3f}")
+        if m2s is not None:
+            parts.append(f"Marker2: {m2s:.3f}")
+        self.marker_score_var.set(" | ".join(parts) if parts else "")
+
     def _load_cache(self) -> None:
         p = Path(self.cache_var.get().strip() or self.cache_path).resolve()
         self.cache_path = p
@@ -512,7 +667,7 @@ class CacheReviewApp:
             reasons.append("translation_fallback_debug_text")
         elif translated.startswith("[DEBUG]"):
             reasons.append("translation_fallback_debug_text")
-        if _has_kanji_overlap_from_original(original, translated, min_len=5):
+        if has_kanji_overlap_from_original(original, translated, min_len=5):
             reasons.append("translation_kanji_overlap_with_original")
         return reasons
 
@@ -590,14 +745,10 @@ class CacheReviewApp:
             f"idx: {idx + 1}/{len(self.entries)}",
             f"segment_id: {entry.get('segment_id', idx + 1)}",
             f"time: {time_text}",
-            f"type: {entry.get('dialogue_type', '')}",
             f"speaker: {self._clip_preview_text(entry.get('speaker', ''), 80)}",
             f"original: {self._clip_preview_text(entry.get('text_original', ''), 180)}",
             f"translation: {self._clip_preview_text(entry.get('translation_subtitle', ''), 180)}",
         ]
-        debug_text = self._clip_preview_text(entry.get("debug_subtitle", ""), 140)
-        if debug_text:
-            lines.append(f"debug: {debug_text}")
         if self._entry_is_suspect(entry):
             lines.append("needs_review: true")
             if reasons:
@@ -609,7 +760,6 @@ class CacheReviewApp:
             return
         indices = {
             "prev": self._neighbor_index_by_segment_id(-1),
-            "current": self.current_index,
             "next": self._neighbor_index_by_segment_id(1),
         }
         for key, idx in indices.items():
@@ -792,6 +942,280 @@ class CacheReviewApp:
             return
         self.status_var.set(f"已更新第 {self.current_index + 1} 段（内存）")
 
+    def _merge_with_prev(self) -> None:
+        if self.current_index <= 0 or not self.entries:
+            self.status_var.set("已是第一段，无法向前合并")
+            return
+        self._merge_segments(self.current_index - 1, self.current_index, self.current_index, "上一段")
+
+    def _merge_with_next(self) -> None:
+        if self.current_index >= len(self.entries) - 1 or not self.entries:
+            self.status_var.set("已是最后一段，无法向后合并")
+            return
+        self._merge_segments(self.current_index, self.current_index + 1, self.current_index, "下一段")
+
+    def _merge_segments(self, idx_a: int, idx_b: int, current_idx: int, label: str) -> None:
+        self._save_current_entry()
+        entry_a = dict(self.entries[idx_a])
+        entry_b = dict(self.entries[idx_b])
+        ts_a = float(entry_a.get("time_start", 0.0))
+        te_a = float(entry_a.get("time_end", 0.0))
+        ts_b = float(entry_b.get("time_start", 0.0))
+        te_b = float(entry_b.get("time_end", 0.0))
+        a_label = f"seg={entry_a.get('segment_id', idx_a + 1)} ({ts_a:.2f}s-{te_a:.2f}s)"
+        b_label = f"seg={entry_b.get('segment_id', idx_b + 1)} ({ts_b:.2f}s-{te_b:.2f}s)"
+        dt_a = str(entry_a.get("dialogue_type", "speaker_dialogue") or "speaker_dialogue").strip()
+        dt_b = str(entry_b.get("dialogue_type", "speaker_dialogue") or "speaker_dialogue").strip()
+        non_blank = [dt for dt in (dt_a, dt_b) if dt != "blank_no_name"]
+        default_dt = non_blank[0] if non_blank else dt_a
+        dt_choices: list[str] | None = None
+        if dt_a != dt_b:
+            seen: set[str] = set()
+            dt_choices = []
+            for dt in (dt_a, dt_b):
+                if dt not in seen:
+                    seen.add(dt)
+                    dt_choices.append(dt)
+            if dt_choices[0] != default_dt and len(dt_choices) > 1:
+                dt_choices.sort(key=lambda x: (x == "blank_no_name", x))
+        dbg_a = str(entry_a.get("debug_subtitle", "") or "")
+        dbg_b = str(entry_b.get("debug_subtitle", "") or "")
+        current_dbg = str(self.entries[current_idx].get("debug_subtitle", "") or "")
+        choices = self._ask_merge_options(
+            entry_a, entry_b, a_label, b_label,
+            seg_id=self.entries[current_idx].get("segment_id", current_idx + 1),
+            st=min(ts_a, ts_b), ed=max(te_a, te_b),
+            dialogue_type=default_dt,
+            dt_choices=dt_choices,
+            dbg_a=dbg_a, dbg_b=dbg_b, current_dbg=current_dbg,
+        )
+        if choices is None:
+            return
+        speaker = choices["speaker"]
+        original = choices["original"]
+        translation = choices["translation"]
+        dialogue_type = choices.get("dialogue_type", default_dt)
+        if dialogue_type == "blank_no_name":
+            speaker = ""
+            original = ""
+            translation = ""
+            debug = dbg_a if dt_a == "blank_no_name" else dbg_b
+        else:
+            debug = current_dbg
+        st = min(ts_a, ts_b)
+        ed = max(te_a, te_b)
+        merged: dict[str, Any] = {
+            "segment_id": self.entries[current_idx].get("segment_id", current_idx + 1),
+            "time_start": float(st),
+            "time_end": float(ed),
+            "dialogue_type": dialogue_type,
+            "speaker": speaker,
+            "text_original": original,
+            "translation_subtitle": translation,
+            "debug_subtitle": debug,
+        }
+        merged = self._entry_with_review_metadata(merged)
+        self._merge_undo = {
+            "entries": [dict(entry_a), dict(entry_b)],
+            "idx_a": idx_a,
+            "idx_b": idx_b,
+            "current_idx": current_idx,
+        }
+        new_entries = self.entries[:idx_a] + [merged] + self.entries[idx_b + 1:]
+        self.entries = new_entries
+        self._rebuild_suspect_indices()
+        self.current_index = max(0, min(idx_a, len(self.entries) - 1))
+        self._show_segment(self.current_index)
+        self.status_var.set(f"已合并 {label} → seg={merged.get('segment_id')} ({st:.2f}s-{ed:.2f}s)（可撤回）")
+
+    def _ask_merge_options(
+        self,
+        entry_a: dict[str, Any],
+        entry_b: dict[str, Any],
+        a_label: str,
+        b_label: str,
+        *,
+        seg_id: int | str,
+        st: float,
+        ed: float,
+        dialogue_type: str,
+        dt_choices: list[str] | None = None,
+        dbg_a: str = "",
+        dbg_b: str = "",
+        current_dbg: str = "",
+    ) -> dict[str, str] | None:
+        result: dict[str, str | None] = {"speaker": None, "original": None, "translation": None, "dialogue_type": None}
+        win = tk.Toplevel(self.root)
+        win.title("合并选项")
+        win.geometry("680x400")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        spk_a = str(entry_a.get("speaker", "") or "").strip()
+        spk_b = str(entry_b.get("speaker", "") or "").strip()
+        orig_a = str(entry_a.get("text_original", "") or "").strip()
+        orig_b = str(entry_b.get("text_original", "") or "").strip()
+        trans_a = str(entry_a.get("translation_subtitle", "") or "").strip()
+        trans_b = str(entry_b.get("translation_subtitle", "") or "").strip()
+
+        body = ttk.Frame(win, padding=8)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(body, text=f"A: {a_label}").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ttk.Label(body, text=f"B: {b_label}").grid(row=1, column=0, columnspan=2, sticky="w")
+
+        left = ttk.Frame(body)
+        left.grid(row=2, column=0, sticky="nw", pady=(8, 0))
+        right = ttk.Frame(body)
+        right.grid(row=2, column=1, sticky="nsew", padx=(16, 0), pady=(8, 0))
+        body.columnconfigure(0, weight=0)
+        body.columnconfigure(1, weight=1)
+
+        vars_speaker = tk.StringVar(value="合并")
+        vars_content = tk.StringVar(value="合并")
+        options = ["合并", "保留A", "保留B"]
+
+        row = 0
+        for name, var in [("Speaker", vars_speaker), ("原文+译文", vars_content)]:
+            ttk.Label(left, text=name).grid(row=row, column=0, sticky="w", pady=(4, 0))
+            ttk.Combobox(left, textvariable=var, values=options, state="readonly", width=14).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+            row += 1
+
+        vars_type: tk.StringVar | None = None
+        if dt_choices and len(dt_choices) > 1:
+            vars_type = tk.StringVar(value=dialogue_type)
+            ttk.Label(left, text="类型").grid(row=row, column=0, sticky="w", pady=(4, 0))
+            ttk.Combobox(left, textvariable=vars_type, values=dt_choices, state="readonly", width=14).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+            row += 1
+
+        ttk.Label(right, text="预览").pack(anchor="w")
+        preview_text = tk.Text(right, height=14, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED, bg="#f5f5f5")
+        preview_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        def _refresh_preview(*_: object) -> None:
+            def _pick(var: tk.StringVar, a_val: str, b_val: str) -> str:
+                v = var.get()
+                if v == "保留A":
+                    return a_val
+                if v == "保留B":
+                    return b_val
+                if a_val and b_val:
+                    return a_val + "\n" + b_val
+                return a_val or b_val
+            dt = vars_type.get() if vars_type else dialogue_type
+            if dt == "blank_no_name":
+                s = ""
+                o = ""
+                t = ""
+                d = dbg_a if entry_a.get("dialogue_type", "") == "blank_no_name" else dbg_b
+            else:
+                s = _pick(vars_speaker, spk_a, spk_b)
+                o = _pick(vars_content, orig_a, orig_b)
+                t = _pick(vars_content, trans_a, trans_b)
+                d = current_dbg
+            payload = {
+                "segment_id": seg_id,
+                "time_start": st,
+                "time_end": ed,
+                "dialogue_type": dt,
+                "speaker": s,
+                "text_original": o,
+                "translation_subtitle": t,
+                "debug_subtitle": d,
+            }
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            preview_text.configure(state=tk.NORMAL)
+            preview_text.delete("1.0", tk.END)
+            preview_text.insert("1.0", text)
+            preview_text.configure(state=tk.DISABLED)
+
+        vars_speaker.trace_add("write", _refresh_preview)
+        vars_content.trace_add("write", _refresh_preview)
+        if vars_type:
+            vars_type.trace_add("write", _refresh_preview)
+
+        btns = ttk.Frame(body)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+
+        def _on_ok() -> None:
+            def _pick(var: tk.StringVar, a_val: str, b_val: str) -> str:
+                v = var.get()
+                if v == "保留A":
+                    return a_val
+                if v == "保留B":
+                    return b_val
+                if a_val and b_val:
+                    return a_val + "\n" + b_val
+                return a_val or b_val
+            result["speaker"] = _pick(vars_speaker, spk_a, spk_b)
+            result["original"] = _pick(vars_content, orig_a, orig_b)
+            result["translation"] = _pick(vars_content, trans_a, trans_b)
+            if vars_type:
+                result["dialogue_type"] = vars_type.get()
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _on_cancel() -> None:
+            result["speaker"] = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btns, text="确认合并", command=_on_ok).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btns, text="取消", command=_on_cancel).pack(side=tk.RIGHT, padx=2)
+        win.protocol("WM_DELETE_WINDOW", _on_cancel)
+        win.bind("<Escape>", lambda _e: _on_cancel())
+        _refresh_preview()
+        self.root.update_idletasks()
+        win.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        ww = win.winfo_width()
+        wh = win.winfo_height()
+        px = rx + max(0, (rw - ww) // 2)
+        py = ry + max(0, (rh - wh) // 2)
+        win.geometry(f"{ww}x{wh}+{px}+{py}")
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        win.focus_set()
+        self.root.wait_window(win)
+        dt = result.get("dialogue_type") or ""
+        if dt == "blank_no_name":
+            if result["original"] is None:
+                return None
+        elif result["speaker"] is None:
+            return None
+        return {
+            "speaker": result["speaker"] or "",
+            "original": result["original"] or "",
+            "translation": result["translation"] or "",
+            "dialogue_type": dt,
+        }
+
+    def _undo_merge(self) -> None:
+        if self._merge_undo is None:
+            self.status_var.set("没有可撤回的合并操作")
+            return
+        saved = self._merge_undo
+        idx_a = int(saved["idx_a"])
+        idx_b = int(saved["idx_b"])
+        restored_a = dict(saved["entries"][0])
+        restored_b = dict(saved["entries"][1])
+        new_entries = self.entries[:idx_a] + [restored_a, restored_b] + self.entries[idx_a + 1:]
+        self.entries = new_entries
+        self._rebuild_suspect_indices()
+        self._merge_undo = None
+        self.current_index = max(0, min(int(saved.get("current_idx", idx_a)), len(self.entries) - 1))
+        self._show_segment(self.current_index)
+        self.status_var.set("已撤回合并")
+
     def _save_cache_file(self, *, apply_current: bool = True) -> None:
         if apply_current:
             self._save_current_entry()
@@ -799,22 +1223,32 @@ class CacheReviewApp:
         self._rebuild_suspect_indices()
         self.cache_payload["entries"] = self.entries
         self.cache_path.write_text(json.dumps(self.cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        sync_msg = self._sync_latest_cache_file()
+        sync_msg = self._sync_all_cache_files()
         self.status_var.set(f"已保存: {self.cache_path} {sync_msg}".strip())
 
-    def _sync_latest_cache_file(self) -> str:
-        try:
-            out_dir = self._resolve_output_dir_from_cache(self.cache_path)
-            latest = out_dir / "translation_cache_latest.json"
-            latest.parent.mkdir(parents=True, exist_ok=True)
-            src = self.cache_path.resolve()
-            dst = latest.resolve()
-            if src == dst:
-                return f"(latest已是当前文件: {latest})"
+    def _sync_all_cache_files(self) -> str:
+        out_dir = self._resolve_output_dir_from_cache(self.cache_path)
+        latest = out_dir / "translation_cache_latest.json"
+        latest.parent.mkdir(parents=True, exist_ok=True)
+        src = self.cache_path.resolve()
+        dst = latest.resolve()
+        msgs: list[str] = []
+        if src != dst:
             shutil.copy2(src, dst)
-            return f"(已同步: {latest})"
-        except Exception as exc:
-            return f"(同步 latest 失败: {exc})"
+            msgs.append(f"(已同步: {dst})")
+        else:
+            msgs.append(f"(latest已是当前文件)")
+        source_work = self.cache_payload.get("source_work_cache")
+        if source_work and (out_dir / "work").is_dir():
+            work_path = (out_dir / source_work).resolve()
+            if work_path != src:
+                try:
+                    work_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, work_path)
+                    msgs.append(f"(已回写至: {work_path})")
+                except Exception as exc:
+                    msgs.append(f"(回写失败: {exc})")
+        return " ".join(msgs)
 
     def _autosave_cache_for_action(self, action: str) -> bool:
         try:
@@ -1184,7 +1618,7 @@ class CacheReviewApp:
                 history_items=None,
                 custom_prompt=self._get_custom_prompt(),
             )
-            translated_text = _normalize_quotes_for_subtitle(str(translated_text or "").strip())
+            translated_text = normalize_quotes_for_subtitle(str(translated_text or "").strip())
             title_entry: dict[str, Any] = {
                 "segment_id": 0,
                 "time_start": float(st),
@@ -2010,6 +2444,7 @@ class CacheReviewApp:
                     self._suppress_scale_callback = False
             if sync_segment:
                 self._sync_segment_ui_by_time(sec)
+            self._update_marker_score_display(sec)
             if (not prefer_fast) and request_prefetch:
                 center = self.current_index if prefetch_center_idx is None else int(prefetch_center_idx)
                 self._request_prefetch(center)
