@@ -330,6 +330,7 @@ class BailianVlmTranslator:
         self.io_log_enabled = bool(io_log_enabled) and (self.io_log_path is not None)
         self.enable_web_search = bool(enable_web_search)
         self._io_lock = threading.Lock()
+        self._io_pending: dict[str, dict[str, Any]] = {}
         self._opener = (
             request.build_opener(request.ProxyHandler({}))
             if disable_env_proxy
@@ -1080,8 +1081,17 @@ class BailianVlmTranslator:
             return
         try:
             self.io_log_path.parent.mkdir(parents=True, exist_ok=True)
-            line = json.dumps(record, ensure_ascii=False)
+            event = record.get("event", "")
+            tag = record.get("request_tag", "")
             with self._io_lock:
+                if event == "request":
+                    self._io_pending[tag] = record
+                    return
+                request_record = self._io_pending.pop(tag, None)
+                pair: dict[str, Any] = {"response": record}
+                if request_record is not None:
+                    pair["request"] = request_record
+                line = json.dumps(pair, ensure_ascii=False)
                 with self.io_log_path.open("a", encoding="utf-8") as f:
                     f.write(line + "\n")
         except Exception:

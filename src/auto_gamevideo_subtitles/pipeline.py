@@ -417,7 +417,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
     if vlm_io_log_enabled:
         _log(f"VLM IO log file: {vlm_io_log_path} (cleared previous if existed)")
     _log("Pipeline started.")
-    cache_dir = work_dir / "cache"
     if debug_mode:
         _log("Debug mode enabled: keep intermediate fine_* files and export segment debug folders.")
     shared_cache_path = output_dir / "translation_cache_latest.json"
@@ -607,7 +606,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     ranges = [(0.0, video_meta.duration)]
     _log("Marker mode: scan full video once.")
 
-    raw_seg_json = cache_dir / "segments_raw.json"
+    raw_seg_json = work_dir / "segments_raw.json"
     if args.resume and raw_seg_json.exists():
         _log("Loading cached segmented ranges.")
         raw_segments = _load_json(raw_seg_json)
