@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import DialogueSegment
+from .datatypes import DialogueSegment
 from .review_utils import _merge_review_reasons
 from .translation_runtime import has_kanji_overlap_from_original, normalize_quotes_for_subtitle
 
@@ -116,6 +116,7 @@ def _dump_translation_cache(
     segments: list[DialogueSegment],
     debug_texts: list[str],
     prefix_entries: list[dict[str, Any]] | None = None,
+    source_work_cache: str | None = None,
 ) -> None:
     entries: list[dict[str, Any]] = []
     if prefix_entries:
@@ -151,6 +152,8 @@ def _dump_translation_cache(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "entries": entries,
     }
+    if source_work_cache:
+        payload["source_work_cache"] = source_work_cache
     _save_json(path, payload)
 
 

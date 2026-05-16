@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import DialogueSegment
+from .datatypes import DialogueSegment
 
 
 def _srt_time(sec: float) -> str:

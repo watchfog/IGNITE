@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from .models import Roi
+from .datatypes import Roi
 
 
 def _crop_and_save(frame_path: Path, roi: Roi, output_path: Path) -> None:

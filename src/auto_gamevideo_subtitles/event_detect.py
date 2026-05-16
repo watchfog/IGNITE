@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -15,6 +16,15 @@ except Exception:  # pragma: no cover
 def load_gray(path: str | Path) -> np.ndarray:
     img = Image.open(path).convert("L")
     return np.asarray(img, dtype=np.uint8)
+
+
+def score_frame(matcher: MarkerTemplateMatcher, path: Path) -> float:
+    if path.exists():
+        try:
+            return float(matcher.score(load_gray(path)))
+        except Exception:
+            return 0.0
+    return 0.0
 
 
 def _to_text_mask(gray: np.ndarray, mode: str = "text", scale: int = 2) -> np.ndarray:
@@ -258,6 +268,123 @@ class MarkerTemplateMatcher:
                 if score > best_score:
                     best_score = score
         return best_score
+
+    def score_batch(
+        self,
+        marker_frames: list[Path],
+        marker_workers: int,
+        marker_coarse_step: int,
+        marker_refine_margin: float,
+        marker_threshold_hint: float | None,
+    ) -> tuple[list[float], dict[str, int]]:
+        def _score_one(j: int) -> tuple[int, float]:
+            return j, score_frame(self, marker_frames[j])
+
+        def _score_indices(indices: list[int]) -> dict[int, float]:
+            out: dict[int, float] = {}
+            if not indices:
+                return out
+            workers = max(1, int(marker_workers))
+            if workers <= 1:
+                for j in indices:
+                    jj, sc = _score_one(j)
+                    out[jj] = sc
+                return out
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_score_one, j) for j in indices]
+                for fut in as_completed(futs):
+                    jj, sc = fut.result()
+                    out[jj] = sc
+            return out
+
+        n = len(marker_frames)
+        marker_scores: list[float] = [0.0] * n
+        scored = [False] * n
+        step = max(1, int(marker_coarse_step))
+        computed = 0
+
+        if step <= 1 or n <= step + 1:
+            full = _score_indices(list(range(n)))
+            for j, sc in full.items():
+                marker_scores[j] = sc
+                scored[j] = True
+            computed = len(full)
+        else:
+            anchors = list(range(0, n, step))
+            if anchors[-1] != (n - 1):
+                anchors.append(n - 1)
+            anchor_map = _score_indices(anchors)
+            computed += len(anchor_map)
+            for j, sc in anchor_map.items():
+                marker_scores[j] = sc
+                scored[j] = True
+
+            if marker_threshold_hint is None:
+                thr_hint = float(np.percentile(list(anchor_map.values()) or [0.0], 70))
+            else:
+                thr_hint = float(marker_threshold_hint)
+            margin = max(0.01, float(marker_refine_margin))
+
+            refine_set: set[int] = set(anchors)
+            stable_intervals: list[tuple[int, int, float, float, bool, int]] = []
+            for ai in range(len(anchors) - 1):
+                li = anchors[ai]
+                ri = anchors[ai + 1]
+                ls = float(anchor_map.get(li, 0.0))
+                rs = float(anchor_map.get(ri, 0.0))
+                l_on = ls >= thr_hint
+                r_on = rs >= thr_hint
+                uncertain = (abs(ls - thr_hint) <= margin) or (abs(rs - thr_hint) <= margin)
+                if (l_on != r_on) or uncertain:
+                    lo = max(0, li - step)
+                    hi = min(n - 1, ri + step)
+                    refine_set.update(range(lo, hi + 1))
+                else:
+                    mid = li + ((ri - li) // 2)
+                    stable_intervals.append((li, ri, ls, rs, l_on, mid))
+
+            mids = sorted(set(x[5] for x in stable_intervals if x[5] not in anchor_map))
+            mid_map = _score_indices(mids) if mids else {}
+            computed += len(mid_map)
+
+            for li, ri, ls, rs, l_on, mid in stable_intervals:
+                ms = float(anchor_map.get(mid, mid_map.get(mid, ls)))
+                mid_uncertain = abs(ms - thr_hint) <= margin
+                mid_on = ms >= thr_hint
+                if mid_uncertain or (mid_on != l_on):
+                    lo = max(0, li - step)
+                    hi = min(n - 1, ri + step)
+                    refine_set.update(range(lo, hi + 1))
+                    continue
+                for k in range(li + 1, ri):
+                    marker_scores[k] = ls if (k - li) <= (ri - k) else rs
+                    scored[k] = True
+
+            refine_indices = [j for j in sorted(refine_set) if not scored[j]]
+            refine_map = _score_indices(refine_indices)
+            computed += len(refine_map)
+            for j, sc in refine_map.items():
+                marker_scores[j] = sc
+                scored[j] = True
+
+            last_sc = 0.0
+            for j in range(n):
+                if scored[j]:
+                    last_sc = marker_scores[j]
+                else:
+                    marker_scores[j] = last_sc
+            last_sc = marker_scores[-1] if n else 0.0
+            for j in range(n - 1, -1, -1):
+                if scored[j]:
+                    last_sc = marker_scores[j]
+                else:
+                    marker_scores[j] = last_sc
+
+        return marker_scores, {
+            "computed": int(computed),
+            "total": int(n),
+            "coarse_step": int(step),
+        }
 
     @property
     def template_count(self) -> int:

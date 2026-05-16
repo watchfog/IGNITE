@@ -34,6 +34,7 @@ ROI_KEYS = [
     "dialogue_roi",
     "marker_roi",
     "marker_2_roi",
+    "marker_2_match_roi",
     "subtitle_location",
     "title_ocr_roi",
     "title_translation_location",
@@ -44,13 +45,14 @@ ROI_COLORS = {
     "dialogue_roi": "#0896e0",
     "marker_roi": "#e32636",
     "marker_2_roi": "#ff7f00",
+    "marker_2_match_roi": "#ffbf80",
     "subtitle_location": "#bf00ff",
     "title_ocr_roi": "#c0c0c0",
     "title_translation_location": "#36bf36",
     "title_info_location": "#ff0da6",
 }
 DEFAULT_MARKER_FORCE_THRESHOLD = 0.6
-DEFAULT_MARKER2_FORCE_THRESHOLD = 0.2
+DEFAULT_MARKER2_FORCE_THRESHOLD = 0.1
 
 
 def _load_raw_cfg(path: Path) -> dict[str, Any]:
@@ -303,7 +305,7 @@ class RoiEditorApp:
         ttk.Entry(hs, textvariable=self.hshift_px_var, width=8).pack(side=tk.LEFT)
         ttk.Entry(hs, textvariable=self.hshift_step_var, width=8).pack(side=tk.LEFT, padx=6)
 
-        ttk.Label(top, text="Marker强制阈值").grid(row=8, column=2, sticky="e", pady=(4, 0))
+        ttk.Label(top, text="Marker阈值").grid(row=8, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(top, textvariable=self.force_thd_var, width=12).grid(row=8, column=3, sticky="w", pady=(4, 0))
 
         ttk.Label(top, text="OCR锚点(距尾帧数)").grid(row=9, column=0, sticky="w", pady=(4, 0))
@@ -351,7 +353,7 @@ class RoiEditorApp:
         m2hs.grid(row=13, column=1, sticky="w", padx=(6, 4), pady=(4, 0))
         ttk.Entry(m2hs, textvariable=self.marker2_hshift_px_var, width=8).pack(side=tk.LEFT)
         ttk.Entry(m2hs, textvariable=self.marker2_hshift_step_var, width=8).pack(side=tk.LEFT, padx=6)
-        ttk.Label(top, text="Marker2强制阈值").grid(row=13, column=2, sticky="e", pady=(4, 0))
+        ttk.Label(top, text="Marker2阈值").grid(row=13, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(top, textvariable=self.marker2_force_thd_var, width=12).grid(row=13, column=3, sticky="w", pady=(4, 0))
 
         ttk.Label(top, text="源语言").grid(row=14, column=0, sticky="w", pady=(4, 0))
@@ -380,6 +382,9 @@ class RoiEditorApp:
                 "当前帧Marker/Marker2匹配分数会自动刷新。"
             ),
         ).pack(anchor="w")
+        reset_bar = ttk.Frame(info)
+        reset_bar.pack(fill=tk.X)
+        ttk.Button(reset_bar, text="marker_2_match_roi 重置为 marker_2_roi", command=self._reset_marker2_match_roi).pack(side=tk.LEFT)
         ttk.Label(info, textvariable=self.status_var, foreground="#1f5f99").pack(anchor="w")
 
         canvas_frame = ttk.Frame(self.root, padding=8)
@@ -732,6 +737,8 @@ class RoiEditorApp:
                 v = roi_cfg.get("title_subtitle_roi")
             if v is None and k == "title_info_location":
                 v = roi_cfg.get("title_speaker_roi")
+            if v is None and k == "marker_2_match_roi":
+                v = roi_cfg.get("marker_2_roi")
             if isinstance(v, list) and len(v) == 4:
                 self.rois[k] = [int(v[0]), int(v[1]), int(v[2]), int(v[3])]
 
@@ -2133,6 +2140,18 @@ class RoiEditorApp:
         self._apply_state(st)
         self.status_var.set("已恢复 (Ctrl+Y)")
 
+    def _reset_marker2_match_roi(self) -> None:
+        src = self.rois.get("marker_2_roi")
+        if not src or len(src) != 4:
+            self.status_var.set("marker_2_roi 未设置，无法重置")
+            return
+        self.rois["marker_2_match_roi"] = [int(v) for v in src]
+        self.roi_key_var.set("marker_2_match_roi")
+        self._push_history()
+        self._refresh_canvas()
+        self._schedule_profile_preview_refresh()
+        self.status_var.set("已将 marker_2_match_roi 重置为 marker_2_roi")
+
     def _to_cfg_path(self, path: Path) -> str:
         try:
             return str(path.as_posix())
@@ -2352,6 +2371,11 @@ class RoiEditorApp:
         ]:
             roi.pop(key, None)
         for k, rect in self.rois.items():
+            if k == "marker_2_match_roi":
+                marker2_base = self.rois.get("marker_2_roi")
+                if marker2_base and len(marker2_base) == 4 and len(rect) == 4:
+                    if all(int(rect[i]) == int(marker2_base[i]) for i in range(4)):
+                        continue
             roi[k] = [int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])]
         if self.video_w > 0 and self.video_h > 0:
             roi["resolution_base"] = [int(self.video_w), int(self.video_h)]

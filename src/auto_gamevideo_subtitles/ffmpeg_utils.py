@@ -4,7 +4,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from .models import VideoMeta
+from .datatypes import VideoMeta
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -189,8 +189,11 @@ def extract_sequence_dialogue_name_marker(
     marker_crop_filter: str,
     start_sec: float | None = None,
     duration_sec: float | None = None,
-) -> tuple[list[Path], list[Path], list[Path]]:
-    """Extract dialogue/name/marker frame sequences in one ffmpeg run using split+crop."""
+    *,
+    marker2_output_dir: str | Path | None = None,
+    marker2_crop_filter: str | None = None,
+) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    """Extract dialogue/name/marker(/marker2) frame sequences in one ffmpeg run using split+crop."""
     dialogue_output_dir = Path(dialogue_output_dir)
     name_output_dir = Path(name_output_dir)
     marker_output_dir = Path(marker_output_dir)
@@ -198,16 +201,31 @@ def extract_sequence_dialogue_name_marker(
     name_output_dir.mkdir(parents=True, exist_ok=True)
     marker_output_dir.mkdir(parents=True, exist_ok=True)
 
+    has_marker2 = bool(marker2_output_dir and marker2_crop_filter)
+    if has_marker2:
+        marker2_output_dir = Path(marker2_output_dir)  # type: ignore[arg-type]
+        marker2_output_dir.mkdir(parents=True, exist_ok=True)
+
     dialogue_pattern = dialogue_output_dir / "%06d.png"
     name_pattern = name_output_dir / "%06d.png"
     marker_pattern = marker_output_dir / "%06d.png"
 
-    filter_complex = (
-        f"[0:v]fps={fps:.6f},split=3[vfull][vname][vmarker];"
-        f"[vfull]{dialogue_crop_filter}[fullout];"
-        f"[vname]{name_crop_filter}[nameout];"
-        f"[vmarker]{marker_crop_filter}[markerout]"
-    )
+    if has_marker2:
+        marker2_pattern = marker2_output_dir / "%06d.png"  # type: ignore[union-attr]
+        filter_complex = (
+            f"[0:v]fps={fps:.6f},split=4[vfull][vname][vmarker][vmarker2];"
+            f"[vfull]{dialogue_crop_filter}[fullout];"
+            f"[vname]{name_crop_filter}[nameout];"
+            f"[vmarker]{marker_crop_filter}[markerout];"
+            f"[vmarker2]{marker2_crop_filter}[marker2out]"
+        )
+    else:
+        filter_complex = (
+            f"[0:v]fps={fps:.6f},split=3[vfull][vname][vmarker];"
+            f"[vfull]{dialogue_crop_filter}[fullout];"
+            f"[vname]{name_crop_filter}[nameout];"
+            f"[vmarker]{marker_crop_filter}[markerout]"
+        )
 
     cmd = [str(ffmpeg_path), "-y"]
     if start_sec is not None:
@@ -219,21 +237,20 @@ def extract_sequence_dialogue_name_marker(
         [
             "-filter_complex",
             filter_complex,
-            "-map",
-            "[fullout]",
-            str(dialogue_pattern),
-            "-map",
-            "[nameout]",
-            str(name_pattern),
-            "-map",
-            "[markerout]",
-            str(marker_pattern),
+            "-map", "[fullout]", str(dialogue_pattern),
+            "-map", "[nameout]", str(name_pattern),
+            "-map", "[markerout]", str(marker_pattern),
         ]
     )
+    if has_marker2:
+        cmd.extend(["-map", "[marker2out]", str(marker2_pattern)])
+
     _run(cmd)
 
+    marker2_paths = sorted(marker2_output_dir.glob("*.png")) if has_marker2 else []
     return (
         sorted(dialogue_output_dir.glob("*.png")),
         sorted(name_output_dir.glob("*.png")),
         sorted(marker_output_dir.glob("*.png")),
+        marker2_paths,
     )

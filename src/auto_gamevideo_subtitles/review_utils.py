@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import DialogueSegment
+from .datatypes import DialogueSegment
 from .translation_runtime import has_kanji_overlap_from_original
 
 

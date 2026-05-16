@@ -47,7 +47,7 @@ def _split_segment_by_name_ocr(
     fast_check_frames: int = 5,
     fast_min_hits: int = 4,
     coarse_step_frames: int = 6,
-    smooth_blank_gap_frames: int = 1,
+    smooth_blank_gap_frames: int = 2,
     min_blank_frames: int = 2,
     blank_verify_frames: int = 3,
     blank_verify_min_hits: int = 1,

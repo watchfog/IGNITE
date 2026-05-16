@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .models import OcrResult
+from .datatypes import OcrResult
 
 
 _RAPIDOCR_LOG_FILTER_INSTALLED = False

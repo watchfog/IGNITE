@@ -5,17 +5,16 @@ general:
   # Whether to enable online search capability in Bailian VLM requests.
   # Keep false unless the selected model / account path explicitly supports it.
   enable_web_search: false
+  # Fuzzy cache matching tolerance in frames (at scan_fps).
+  # 0 = exact match only. 6 = tolerate ±6 frame shift.
+  cache_fuzz_frames: 6
 
 video:
   # Override source FPS when the container metadata is wrong.
   # null means use FPS reported by the video file.
   fps_override: null
-  # Sampling interval when no dialogue activity is detected.
-  sample_interval_idle: 0.8
-  # Sampling interval when dialogue is active and precise detection is needed.
-  sample_interval_active: 0.08
-  # Sampling interval used in relatively stable dialogue regions.
-  sample_interval_stable: 0.25
+  # Sample every N frames. 1 means every frame.
+  frame_stride: 1
 
 scan:
   # Extra padding added before/after coarse detected ranges before refinement.
@@ -55,7 +54,7 @@ state_machine:
 
   # Coarse-to-fine name blank / appearance verification.
   name_coarse_step_frames: 6
-  name_smooth_blank_gap_frames: 1
+  name_smooth_blank_gap_frames: 2
   name_min_blank_frames: 1
   name_blank_verify_frames: 3
   name_blank_verify_min_hits: 2
@@ -91,13 +90,16 @@ marker_2:
   # blank -> dialogue when OCR is disabled.
   use_template: true
   template_paths: []
-  force_threshold: 0.2
+  force_threshold: 0.1
   shift_mode: vertical
   horizontal_shift_px: 0
   horizontal_shift_step: 1
   template_center_width: null
   vertical_shift_px: 6
   vertical_shift_step: 1
+  # Larger matching ROI for fallback when marker2 drifts outside marker_2_roi.
+  # Defaults to same as roi.marker_2_roi if not set. Configurable via roi_editor.
+  match_roi: null
 
 ocr:
   # OCR backend. Current recommended default is RapidOCR.

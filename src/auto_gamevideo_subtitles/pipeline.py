@@ -57,16 +57,14 @@ from .image_utils import (
 )
 from .log_utils import _log, set_log_file
 from .marker_ops import (
-    _auto_marker_threshold,
     _background_score_marker_and_prune_dialogue_cache,
     _build_refined_subsegment,
-    _compute_marker_scores,
     _final_prune_dialogue_cache_by_scores,
     _pick_marker_anchor_frame,
     _prune_dialogue_cache_to_anchor_frames,
     _split_segment_by_marker2,
 )
-from .models import DialogueSegment, Roi
+from .datatypes import DialogueSegment, Roi
 from .name_ocr_runner import NameOcrRunner
 from .name_splitter import (
     _head_probe_hits_ocr,
@@ -256,7 +254,7 @@ def _metrics_from_frame_lists(
                 }
             )
     elif marker_frames and marker_matcher is not None:
-        marker_scores, stats = _compute_marker_scores(
+        marker_scores, stats = marker_matcher.score_batch(
             marker_frames=marker_frames,
             marker_matcher=marker_matcher,
             marker_workers=marker_workers,
@@ -502,7 +500,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
     marker2_roi = (
         _roi_from_cfg(cfg, "marker_2_roi")
         if isinstance(cfg.get("roi", {}).get("marker_2_roi"), list)
-        else marker_roi
+        else None
+    )
+    marker2_match_roi = (
+        _roi_from_cfg(cfg, "marker_2_match_roi")
+        if isinstance(cfg.get("roi", {}).get("marker_2_match_roi"), list)
+        else marker2_roi
     )
     subtitle_location = cfg["roi"].get("subtitle_location", cfg["roi"].get("subtitle_roi"))
     if not isinstance(subtitle_location, list) or len(subtitle_location) != 4:
@@ -569,10 +572,18 @@ def run_pipeline(args: argparse.Namespace) -> int:
         else:
             _log("Marker templates not found, fallback to mask mode.")
 
-    marker2_threshold = float(marker2_cfg.get("force_threshold", marker2_cfg.get("presence_threshold", 0.2)))
+    marker2_threshold = float(marker2_cfg.get("force_threshold", marker2_cfg.get("presence_threshold", 0.1)))
     if bool(marker2_cfg.get("use_template", True)):
         marker2_templates = _collect_marker_templates(marker2_cfg)
         if marker2_templates:
+            v_shift = int(marker2_cfg.get("vertical_shift_px", 0))
+            h_shift = int(marker2_cfg.get("horizontal_shift_px", 0))
+            if marker2_match_roi is not None and marker2_roi is not None:
+                m2_coords = [marker2_match_roi.x1, marker2_match_roi.y1, marker2_match_roi.x2, marker2_match_roi.y2]
+                roi_coords = [marker2_roi.x1, marker2_roi.y1, marker2_roi.x2, marker2_roi.y2]
+                if m2_coords != roi_coords:
+                    v_shift = 0
+                    h_shift = 0
             marker2_matcher = MarkerTemplateMatcher(
                 marker2_templates,
                 center_width=(
@@ -580,9 +591,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     if marker2_cfg.get("template_center_width") is not None
                     else None
                 ),
-                vertical_shift_px=int(marker2_cfg.get("vertical_shift_px", 0)),
+                vertical_shift_px=v_shift,
                 vertical_shift_step=int(marker2_cfg.get("vertical_shift_step", 1)),
-                horizontal_shift_px=int(marker2_cfg.get("horizontal_shift_px", 0)),
+                horizontal_shift_px=h_shift,
                 horizontal_shift_step=int(marker2_cfg.get("horizontal_shift_step", 1)),
                 shift_mode=str(marker2_cfg.get("shift_mode", "vertical")),
             )
@@ -608,10 +619,12 @@ def run_pipeline(args: argparse.Namespace) -> int:
     else:
         _log("Fine-scan + state-machine segmentation started.")
         raw_segments: list[dict[str, Any]] = []
+        marker_score_ranges: list[dict[str, Any]] = []
         for ridx, (start_sec, end_sec) in enumerate(ranges):
             _log(f"Fine-scan window: {start_sec:.2f}s -> {end_sec:.2f}s")
             duration = max(0.01, end_sec - start_sec)
-            scan_fps = 1.0 / float(cfg["video"]["sample_interval_active"])
+            frame_stride = max(1, int(cfg["video"].get("frame_stride", 2)))
+            scan_fps = base_fps / float(frame_stride)
             dialog_dir = work_dir / f"fine_{ridx:03d}_dialog"
             name_dir = work_dir / f"fine_{ridx:03d}_name"
             marker_dir = work_dir / f"fine_{ridx:03d}_marker"
@@ -651,7 +664,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             else:
                 _log("Marker prune worker skipped (matcher unavailable).")
 
-            dialogue_paths, name_paths, marker_paths = extract_sequence_dialogue_name_marker(
+            dialogue_paths, name_paths, marker_paths, marker2_paths = extract_sequence_dialogue_name_marker(
                 ffmpeg_path=ffmpeg_path,
                 video_path=args.video,
                 dialogue_output_dir=dialogue_dir,
@@ -663,18 +676,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 marker_crop_filter=marker_roi.as_crop_filter(),
                 start_sec=start_sec,
                 duration_sec=duration,
+                marker2_output_dir=marker2_dir if marker2_matcher is not None else None,
+                marker2_crop_filter=marker2_match_roi.as_crop_filter() if marker2_matcher is not None and marker2_match_roi else None,
             )
-            marker2_paths: list[Path] = []
-            if marker2_matcher is not None:
-                marker2_paths = extract_sequence(
-                    ffmpeg_path=ffmpeg_path,
-                    video_path=args.video,
-                    output_dir=marker2_dir,
-                    fps=scan_fps,
-                    start_sec=start_sec,
-                    duration_sec=duration,
-                    vf_filters=[marker2_roi.as_crop_filter()],
-                )
 
             if marker_worker is not None:
                 worker_stop_event.set()
@@ -683,8 +687,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 _log("Marker prune worker finished.")
 
             _assert_crop_size(name_paths, name_roi, "fine window name")
-            if marker2_paths:
-                _assert_crop_size(marker2_paths, marker2_roi, "fine window marker2")
+            if marker2_paths and marker2_match_roi:
+                _assert_crop_size(marker2_paths, marker2_match_roi, "fine window marker2")
             dialog_paths = name_paths
 
             marker_stats: dict[str, int] = {}
@@ -841,8 +845,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
                         "marker_presence_threshold_used": marker_thr_eff,
                     }
                 )
+        if marker_matcher is not None and marker_scores_cached is not None:
+            marker_score_ranges.append({
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "scan_fps": scan_fps,
+                "threshold": marker_thr_eff,
+                "scores": [float(x) for x in marker_scores_cached],
+            })
         _save_json(raw_seg_json, raw_segments)
         _log(f"Segmentation done. Raw segments: {len(raw_segments)}")
+
+    if marker_score_ranges:
+        _save_json(work_dir / "marker_score_cache.json", {"ranges": marker_score_ranges})
 
     name_split_mode = str(getattr(args, "name_split_mode", "config") or "config").strip().lower()
     split_name_enabled = bool(cfg["state_machine"].get("split_on_name_ocr", True))
@@ -865,16 +880,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         refined = []
         fast_frames = int(cfg["state_machine"].get("name_fast_check_frames", 5))
         fast_hits = int(cfg["state_machine"].get("name_fast_min_hits", 4))
-        smooth_gap = int(cfg["state_machine"].get("name_smooth_blank_gap_frames", 1))
+        smooth_gap = int(cfg["state_machine"].get("name_smooth_blank_gap_frames", 2))
         general_cfg = cfg.get("general", {})
         min_blank = int(
             general_cfg.get(
                 "blank_ignore_under_frames",
-                cfg["state_machine"].get("name_min_blank_frames", 1),
+                cfg["state_machine"].get("name_min_blank_frames", 2),
             )
         )
-        blank_verify_frames = int(cfg["state_machine"].get("name_blank_verify_frames", 3))
-        blank_verify_hits = int(cfg["state_machine"].get("name_blank_verify_min_hits", 1))
         for raw in raw_segments:
             ridx = int(raw["range_index"])
             refined.extend(
@@ -885,10 +898,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     threshold=marker2_threshold,
                     fast_check_frames=fast_frames,
                     fast_min_hits=fast_hits,
-                    min_blank_frames=min_blank,
-                    blank_verify_frames=blank_verify_frames,
-                    blank_verify_min_hits=blank_verify_hits,
                     smooth_blank_gap_frames=smooth_gap,
+                    min_blank_frames=min_blank,
                 )
             )
         refined = _normalize_name_subsegments_per_marker(refined)
@@ -927,7 +938,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         fast_frames = int(cfg["state_machine"].get("name_fast_check_frames", 5))
         fast_hits = int(cfg["state_machine"].get("name_fast_min_hits", 4))
         coarse_step = int(cfg["state_machine"].get("name_coarse_step_frames", 6))
-        smooth_gap = int(cfg["state_machine"].get("name_smooth_blank_gap_frames", 1))
+        smooth_gap = int(cfg["state_machine"].get("name_smooth_blank_gap_frames", 2))
         general_cfg = cfg.get("general", {})
         min_blank = int(
             general_cfg.get(
@@ -1234,6 +1245,31 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 seg.dialogue_type,
             )
             cached_item = cache_full.get(k1) or cache_time_type.get(k2)
+            if cached_item is None:
+                cache_fuzz_frames = int(general_cfg.get("cache_fuzz_frames", 6))
+                if cache_fuzz_frames > 0:
+                    seg_scan_fps = float(raw.get("scan_fps", base_fps))
+                    fuzz_ms = int(round(cache_fuzz_frames / max(0.1, seg_scan_fps) * 1000))
+                    step_ms = max(1, fuzz_ms // 4)
+                    for offset_ms in range(-fuzz_ms, fuzz_ms + 1, step_ms):
+                        if offset_ms == 0:
+                            continue
+                        offset_s = offset_ms / 1000.0
+                        fk1 = _subtitle_cache_key(
+                            seg.segment_id,
+                            seg.time_start + offset_s,
+                            seg.time_end + offset_s,
+                            seg.dialogue_type,
+                        )
+                        fk2 = _subtitle_cache_key(
+                            0,
+                            seg.time_start + offset_s,
+                            seg.time_end + offset_s,
+                            seg.dialogue_type,
+                        )
+                        cached_item = cache_full.get(fk1) or cache_time_type.get(fk2)
+                        if cached_item:
+                            break
             if cached_item:
                 cached_speaker = str(cached_item.get("speaker", "") or "")
                 if cached_speaker:
@@ -1485,9 +1521,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     if name_ocr is not None:
         name_ocr.close()
 
-    final_json = work_dir / "segments.json"
-    _log("Writing segments.json / subtitle files")
-    _save_json(final_json, [seg.to_dict() for seg in final_segments])
+    work_relative = str(run_cache_path.resolve().relative_to(output_dir.resolve()))
     _dump_translation_cache(
         run_cache_path,
         video_path=str(args.video),
@@ -1495,6 +1529,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         segments=final_segments,
         debug_texts=debug_texts,
         prefix_entries=cache_prefix_entries,
+        source_work_cache=work_relative,
     )
     _log(f"Saved run cache: {run_cache_path}")
     if args.skip_translation:

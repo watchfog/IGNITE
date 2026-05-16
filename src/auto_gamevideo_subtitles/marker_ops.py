@@ -6,20 +6,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
-from .event_detect import MarkerTemplateMatcher, load_gray
+from .event_detect import MarkerTemplateMatcher, load_gray, score_frame
 from .log_utils import _log
 from .review_utils import _attach_review_metadata, _fill_short_false_gaps, _first_true_run_bounds, _merge_review_reasons
-
-
-def _score_frame(matcher: MarkerTemplateMatcher, path: Path) -> float:
-    if path.exists():
-        try:
-            return float(matcher.score(load_gray(path)))
-        except Exception:
-            return 0.0
-    return 0.0
 
 
 def _background_score_marker_and_prune_dialogue_cache(
@@ -155,158 +144,6 @@ def _prune_dialogue_cache_to_anchor_frames(
     return removed, failed, kept
 
 
-def _compute_marker_scores(
-    marker_frames: list[Path],
-    marker_matcher: MarkerTemplateMatcher,
-    marker_workers: int,
-    marker_coarse_step: int,
-    marker_refine_margin: float,
-    marker_threshold_hint: float | None,
-) -> tuple[list[float], dict[str, int]]:
-    def _score_one(j: int) -> tuple[int, float]:
-        return j, _score_frame(marker_matcher, marker_frames[j])
-
-    def _score_indices(indices: list[int]) -> dict[int, float]:
-        out: dict[int, float] = {}
-        if not indices:
-            return out
-        workers = max(1, int(marker_workers))
-        if workers <= 1:
-            for j in indices:
-                jj, sc = _score_one(j)
-                out[jj] = sc
-            return out
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(_score_one, j) for j in indices]
-            for fut in as_completed(futs):
-                jj, sc = fut.result()
-                out[jj] = sc
-        return out
-
-    n = len(marker_frames)
-    marker_scores: list[float] = [0.0] * n
-    scored = [False] * n
-    step = max(1, int(marker_coarse_step))
-    computed = 0
-
-    if step <= 1 or n <= step + 1:
-        full = _score_indices(list(range(n)))
-        for j, sc in full.items():
-            marker_scores[j] = sc
-            scored[j] = True
-        computed = len(full)
-    else:
-        anchors = list(range(0, n, step))
-        if anchors[-1] != (n - 1):
-            anchors.append(n - 1)
-        anchor_map = _score_indices(anchors)
-        computed += len(anchor_map)
-        for j, sc in anchor_map.items():
-            marker_scores[j] = sc
-            scored[j] = True
-
-        if marker_threshold_hint is None:
-            thr_hint = float(np.percentile(list(anchor_map.values()) or [0.0], 70))
-        else:
-            thr_hint = float(marker_threshold_hint)
-        margin = max(0.01, float(marker_refine_margin))
-
-        refine_set: set[int] = set(anchors)
-        stable_intervals: list[tuple[int, int, float, float, bool, int]] = []
-        for ai in range(len(anchors) - 1):
-            li = anchors[ai]
-            ri = anchors[ai + 1]
-            ls = float(anchor_map.get(li, 0.0))
-            rs = float(anchor_map.get(ri, 0.0))
-            l_on = ls >= thr_hint
-            r_on = rs >= thr_hint
-            uncertain = (abs(ls - thr_hint) <= margin) or (abs(rs - thr_hint) <= margin)
-            if (l_on != r_on) or uncertain:
-                lo = max(0, li - step)
-                hi = min(n - 1, ri + step)
-                refine_set.update(range(lo, hi + 1))
-            else:
-                mid = li + ((ri - li) // 2)
-                stable_intervals.append((li, ri, ls, rs, l_on, mid))
-
-        mids = sorted(set(x[5] for x in stable_intervals if x[5] not in anchor_map))
-        mid_map = _score_indices(mids) if mids else {}
-        computed += len(mid_map)
-
-        for li, ri, ls, rs, l_on, mid in stable_intervals:
-            ms = float(anchor_map.get(mid, mid_map.get(mid, ls)))
-            mid_uncertain = abs(ms - thr_hint) <= margin
-            mid_on = ms >= thr_hint
-            if mid_uncertain or (mid_on != l_on):
-                lo = max(0, li - step)
-                hi = min(n - 1, ri + step)
-                refine_set.update(range(lo, hi + 1))
-                continue
-            for k in range(li + 1, ri):
-                marker_scores[k] = ls if (k - li) <= (ri - k) else rs
-                scored[k] = True
-
-        refine_indices = [j for j in sorted(refine_set) if not scored[j]]
-        refine_map = _score_indices(refine_indices)
-        computed += len(refine_map)
-        for j, sc in refine_map.items():
-            marker_scores[j] = sc
-            scored[j] = True
-
-        # Fill leftovers by nearest scored frame.
-        last_sc = 0.0
-        for j in range(n):
-            if scored[j]:
-                last_sc = marker_scores[j]
-            else:
-                marker_scores[j] = last_sc
-        last_sc = marker_scores[-1] if n else 0.0
-        for j in range(n - 1, -1, -1):
-            if scored[j]:
-                last_sc = marker_scores[j]
-            else:
-                marker_scores[j] = last_sc
-
-    return marker_scores, {
-        "computed": int(computed),
-        "total": int(n),
-        "coarse_step": int(step),
-    }
-
-
-def _auto_marker_threshold(scores: list[float], fallback: float) -> float:
-    vals = np.asarray([x for x in scores if x > 1e-6], dtype=np.float64)
-    if vals.size < 24:
-        return float(fallback)
-    # Otsu on [0,1] marker scores
-    hist, edges = np.histogram(vals, bins=100, range=(0.0, 1.0))
-    total = vals.size
-    sum_total = float(np.dot(np.arange(100), hist))
-    sum_b = 0.0
-    w_b = 0.0
-    best_var = -1.0
-    best_t = int(round(fallback * 99.0))
-    for t in range(100):
-        w_b += hist[t]
-        if w_b <= 0:
-            continue
-        w_f = total - w_b
-        if w_f <= 0:
-            break
-        sum_b += t * hist[t]
-        m_b = sum_b / w_b
-        m_f = (sum_total - sum_b) / w_f
-        var_between = w_b * w_f * (m_b - m_f) ** 2
-        if var_between > best_var:
-            best_var = var_between
-            best_t = t
-    thr = float((edges[best_t] + edges[min(best_t + 1, len(edges) - 1)]) / 2.0)
-    # Blend with configured baseline to avoid over-aggressive threshold swings.
-    mixed = 0.6 * float(fallback) + 0.4 * thr
-    # Clamp to a sane operating region for this game marker.
-    return float(max(0.25, min(0.85, mixed)))
-
-
 def _build_refined_subsegment(
     raw: dict[str, Any],
     marker_seg_id: int,
@@ -349,10 +186,8 @@ def _split_segment_by_marker2(
     threshold: float,
     fast_check_frames: int = 5,
     fast_min_hits: int = 4,
-    min_blank_frames: int = 1,
-    blank_verify_frames: int = 3,
-    blank_verify_min_hits: int = 1,
-    smooth_blank_gap_frames: int = 1,
+    smooth_blank_gap_frames: int = 2,
+    min_blank_frames: int = 2,
 ) -> list[dict[str, Any]]:
     frame_start = int(raw["frame_start"])
     frame_end = int(raw["frame_end"])
@@ -369,7 +204,7 @@ def _split_segment_by_marker2(
     def _score(fid: int) -> float:
         if fid in score_cache:
             return score_cache[fid]
-        sc = _score_frame(matcher, marker2_dir / f"{fid + 1:06d}.png")
+        sc = score_frame(matcher, marker2_dir / f"{fid + 1:06d}.png")
         score_cache[fid] = sc
         return sc
 
@@ -388,39 +223,6 @@ def _split_segment_by_marker2(
             f"{tag}:score=[{min(vals):.4f},{max(vals):.4f}] "
             f"threshold={float(threshold):.4f}"
         ]
-
-    def _blank_near_threshold_review_reason(start_f: int, end_f: int) -> list[str]:
-        if end_f < start_f:
-            return []
-        vals = [_score(fid) for fid in range(start_f, end_f + 1)]
-        if not vals:
-            return []
-        max_score = max(vals)
-        low = 0.1
-        high = float(threshold)
-        if low <= max_score < high:
-            return [
-                f"marker2_blank_near_threshold:score=[{min(vals):.4f},{max_score:.4f}] "
-                f"review_band=[{low:.4f},{high:.4f}) threshold={high:.4f}"
-            ]
-        return []
-
-    def _blank_confirm(start_f: int, end_f: int) -> bool:
-        if end_f < start_f:
-            return True
-        k = max(1, int(blank_verify_frames))
-        need = max(1, int(blank_verify_min_hits))
-        step = 3
-        head = [start_f + i * step for i in range(k) if start_f + i * step <= end_f]
-        tail = [end_f - i * step for i in range(k) if end_f - i * step >= start_f]
-        sample_frames = sorted(set(head + tail))
-        hits = sum(1 for fid in sample_frames if _present(fid))
-        _log(
-            f"[split_by_marker2] seg_id={marker_seg_id} blank_confirm "
-            f"range=[{start_f},{end_f}] samples={sample_frames} hits={hits} "
-            f"need_lt={need} threshold={float(threshold):.4f}"
-        )
-        return hits < need
 
     probe_n = max(1, int(fast_check_frames))
     probe_offset = max(0, int(round(0.16 * scan_fps)))
@@ -470,8 +272,7 @@ def _split_segment_by_marker2(
 
     run_start, _run_end = run_bounds
     dialog_start = frame_start + run_start
-    min_blank = max(1, int(min_blank_frames))
-    if (dialog_start - frame_start) < min_blank:
+    if (dialog_start - frame_start) < max(1, int(min_blank_frames)):
         return [
             _build_refined_subsegment(
                 raw=raw,
@@ -482,20 +283,6 @@ def _split_segment_by_marker2(
                 st=frame_start,
                 ed=frame_end,
                 has_name=True,
-            )
-        ]
-    if not _blank_confirm(frame_start, dialog_start - 1):
-        return [
-            _build_refined_subsegment(
-                raw=raw,
-                marker_seg_id=marker_seg_id,
-                start_sec=start_sec,
-                scan_fps=scan_fps,
-                marker_thr=marker_thr,
-                st=frame_start,
-                ed=frame_end,
-                has_name=True,
-                review_reasons=_review_reason("marker2_blank_confirm_failed", frame_start, dialog_start - 1),
             )
         ]
 
@@ -513,7 +300,6 @@ def _split_segment_by_marker2(
             st=frame_start,
             ed=dialog_start - 1,
             has_name=False,
-            review_reasons=_blank_near_threshold_review_reason(frame_start, dialog_start - 1),
         ),
         _build_refined_subsegment(
             raw=raw,
