@@ -16,21 +16,12 @@ video:
   # Sample every N frames. 1 means every frame.
   frame_stride: 1
 
-scan:
-  # Extra padding added before/after coarse detected ranges before refinement.
-  range_padding_sec: 0.8
-  # Merge adjacent ranges if their gap is shorter than this value.
-  merge_gap_sec: 0.45
-  # Drop ranges shorter than this duration.
-  min_range_sec: 0.25
-
 threshold:
   # Frame-difference thresholds, normalized to [0, 1].
   # Tune these when segmentation is too sensitive or too sluggish.
   diff_dialogue_change: 0.08
   diff_dialogue_clear: 0.03
   diff_name_change: 0.22
-  diff_marker_change: 0.18
 
   # Minimum stable / clear durations used by the state machine.
   stable_duration_sec: 0.5
@@ -97,9 +88,6 @@ marker_2:
   template_center_width: null
   vertical_shift_px: 6
   vertical_shift_step: 1
-  # Larger matching ROI for fallback when marker2 drifts outside marker_2_roi.
-  # Defaults to same as roi.marker_2_roi if not set. Configurable via roi_editor.
-  match_roi: null
 
 ocr:
   # OCR backend. Current recommended default is RapidOCR.

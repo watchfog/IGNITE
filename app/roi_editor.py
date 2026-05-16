@@ -109,8 +109,8 @@ class RoiEditorApp:
         self.extra_requirements_var = tk.StringVar(value="")
         self.source_lang_var = tk.StringVar(value="ja")
         self.target_lang_var = tk.StringVar(value="zh-CN")
-        self.vlm_models_var = tk.StringVar(value="qwen3.6-plus")
-        self.vlm_model_var = tk.StringVar(value="qwen3.6-plus")
+        self.vlm_models_var = tk.StringVar(value="")
+        self.vlm_model_var = tk.StringVar(value="")
         self.match_score_var = tk.StringVar(value="Marker匹配分数: N/A")
         self.marker2_template_paths_var = tk.StringVar(value="")
         self.marker2_template_selected_var = tk.StringVar(value="")
@@ -214,7 +214,7 @@ class RoiEditorApp:
             row=0, column=1, columnspan=3, sticky="ew", padx=(6, 4)
         )
         ttk.Button(top, text="选择视频", command=self._pick_video).grid(row=0, column=4, padx=2)
-        ttk.Button(top, text="加载视频", command=self._reload_video).grid(row=0, column=5, padx=2)
+        ttk.Button(top, text="重载视频", command=self._reload_video).grid(row=0, column=5, padx=2)
         ttk.Button(top, text="修复视频(ffmpeg)", command=self._repair_video_with_ffmpeg).grid(row=0, column=6, padx=2)
 
         ttk.Label(top, text="配置").grid(row=1, column=0, sticky="w")
@@ -222,18 +222,22 @@ class RoiEditorApp:
             row=1, column=1, columnspan=3, sticky="ew", padx=(6, 4)
         )
         ttk.Button(top, text="选择配置", command=self._pick_config).grid(row=1, column=4, padx=2)
-        ttk.Button(top, text="加载配置", command=self._load_config_only).grid(row=1, column=5, padx=2)
+        ttk.Button(top, text="重载配置", command=self._load_config_only).grid(row=1, column=5, padx=2)
         ttk.Button(top, text="新建配置", command=self._create_new_profile).grid(row=1, column=6, padx=2)
         ttk.Button(top, text="导入现有配置新建", command=self._create_profile_from_existing).grid(row=1, column=7, padx=2)
+        ttk.Button(top, text="保存配置", command=self._save_config).grid(row=1, column=8, padx=2)
 
         ttk.Label(top, text="ROI 组件").grid(row=2, column=0, sticky="w")
         ttk.OptionMenu(top, self.roi_key_var, self.roi_key_var.get(), *ROI_KEYS).grid(
             row=2, column=1, sticky="w", padx=(6, 4)
         )
-        ttk.Button(top, text="保存配置", command=self._save_config).grid(row=2, column=2, padx=2)
-        ttk.Button(top, text="撤回", command=self._undo).grid(row=2, column=3, padx=2)
-        ttk.Button(top, text="恢复", command=self._redo).grid(row=2, column=4, padx=2)
-        ttk.Label(top, text="输出文件夹名").grid(row=2, column=5, sticky="e")
+        self._reset_match_roi_btn = ttk.Button(top, text="重置match_roi", command=self._reset_marker2_match_roi)
+        self._reset_match_roi_btn.grid(row=2, column=2, padx=2)
+        self._reset_match_roi_btn.grid_remove()
+        self.roi_key_var.trace_add("write", self._on_roi_key_changed)
+        ttk.Button(top, text="撤销", command=self._undo).grid(row=2, column=3, padx=2)
+        ttk.Button(top, text="重做", command=self._redo).grid(row=2, column=4, padx=2)
+        ttk.Label(top, text="输出文件夹名").grid(row=2, column=5, sticky="e", padx=(10, 0))
         ttk.Entry(top, textvariable=self.output_name_var, width=24).grid(
             row=2, column=6, columnspan=2, sticky="w", padx=(6, 0)
         )
@@ -362,14 +366,11 @@ class RoiEditorApp:
         )
         ttk.Label(top, text="目标语言").grid(row=14, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(top, textvariable=self.target_lang_var, width=12).grid(row=14, column=3, sticky="w", pady=(4, 0))
-        ttk.Label(top, text="VLM模型(逗号分隔)").grid(row=15, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(top, textvariable=self.vlm_models_var, width=86).grid(
-            row=15, column=1, columnspan=5, sticky="ew", padx=(6, 4), pady=(4, 0)
+        ttk.Label(top, text="VLM模型").grid(row=15, column=0, sticky="w", pady=(4, 0))
+        self._vlm_model_combo = ttk.Combobox(
+            top, textvariable=self.vlm_model_var, state="readonly", width=20,
         )
-        ttk.Label(top, text="当前VLM模型").grid(row=16, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(top, textvariable=self.vlm_model_var, width=40).grid(
-            row=16, column=1, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0)
-        )
+        self._vlm_model_combo.grid(row=15, column=1, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0))
 
         top.columnconfigure(1, weight=1)
 
@@ -382,9 +383,6 @@ class RoiEditorApp:
                 "当前帧Marker/Marker2匹配分数会自动刷新。"
             ),
         ).pack(anchor="w")
-        reset_bar = ttk.Frame(info)
-        reset_bar.pack(fill=tk.X)
-        ttk.Button(reset_bar, text="marker_2_match_roi 重置为 marker_2_roi", command=self._reset_marker2_match_roi).pack(side=tk.LEFT)
         ttk.Label(info, textvariable=self.status_var, foreground="#1f5f99").pack(anchor="w")
 
         canvas_frame = ttk.Frame(self.root, padding=8)
@@ -429,7 +427,6 @@ class RoiEditorApp:
             self.marker2_force_thd_var,
         ]:
             var.trace_add("write", lambda *_: self._update_marker2_match_score())
-        self.vlm_models_var.trace_add("write", lambda *_: self._sync_current_model_from_list())
         self.output_name_var.trace_add("write", lambda *_: self._on_output_name_changed())
         for var in [
             self.video_path_var,
@@ -470,6 +467,7 @@ class RoiEditorApp:
             self.video_path_var.set(vp.as_posix())
             self._ensure_output_name_default(vp)
             self._apply_video_to_current_profile(vp)
+            self._open_video(vp.as_posix())
 
     def _pick_config(self) -> None:
         p = filedialog.askopenfilename(
@@ -478,7 +476,7 @@ class RoiEditorApp:
         )
         if p:
             self.config_path_var.set(p)
-            
+            self._load_config_only()
     def _apply_video_to_current_profile(self, video_path: Path) -> None:
         raw_cfg = self.config_path_var.get().strip()
         if not raw_cfg:
@@ -683,26 +681,6 @@ class RoiEditorApp:
         self.status_var.set(f"配置已保存: {cfg_path.as_posix()}")
         self._load_config_only()
 
-    def _parse_model_list(self, text: str) -> list[str]:
-        out: list[str] = []
-        raw = str(text or "").strip()
-        if not raw:
-            return out
-        for p in raw.replace("\n", ",").replace(";", ",").split(","):
-            x = p.strip()
-            if x:
-                out.append(x)
-        return out
-
-    def _sync_current_model_from_list(self) -> None:
-        models = self._parse_model_list(self.vlm_models_var.get())
-        cur = self.vlm_model_var.get().strip()
-        if not models:
-            self.vlm_model_var.set("")
-            return
-        if not cur or cur not in models:
-            self.vlm_model_var.set(models[0])
-
     def _load_config_only(self) -> None:
         raw_cfg = self.config_path_var.get().strip()
         if not raw_cfg:
@@ -779,12 +757,15 @@ class RoiEditorApp:
         tr_cfg = self.cfg_merged.get("translation", {})
         models = tr_cfg.get("vlm_models", [])
         if isinstance(models, list):
-            model_text = ", ".join([str(x).strip() for x in models if str(x).strip()])
+            model_list = [str(x).strip() for x in models if str(x).strip()]
         else:
-            model_text = str(tr_cfg.get("model", "qwen3.6-plus"))
-        self.vlm_models_var.set(model_text or "qwen3.6-plus")
-        self.vlm_model_var.set(str(tr_cfg.get("model", "") or ""))
-        self._sync_current_model_from_list()
+            model_list = ["qwen3.6-plus"]
+        self.vlm_models_var.set(", ".join(model_list))
+        self._vlm_model_combo["values"] = model_list
+        cur_model = str(tr_cfg.get("model", "") or "").strip()
+        if not cur_model or cur_model not in model_list:
+            cur_model = model_list[0] if model_list else "qwen3.6-plus"
+        self.vlm_model_var.set(cur_model)
         cfg_out_name = str(self.cfg_merged.get("output_name", "") or "").strip()
         if cfg_out_name:
             self._set_output_name_value(cfg_out_name, is_auto=False)
@@ -2130,7 +2111,7 @@ class RoiEditorApp:
         cur = self.undo_stack.pop()
         self.redo_stack.append(cur)
         self._apply_state(self.undo_stack[-1])
-        self.status_var.set("已撤回 (Ctrl+Z)")
+        self.status_var.set("已撤销 (Ctrl+Z)")
 
     def _redo(self) -> None:
         if not self.redo_stack:
@@ -2138,7 +2119,7 @@ class RoiEditorApp:
         st = self.redo_stack.pop()
         self.undo_stack.append(st)
         self._apply_state(st)
-        self.status_var.set("已恢复 (Ctrl+Y)")
+        self.status_var.set("已重做 (Ctrl+Y)")
 
     def _reset_marker2_match_roi(self) -> None:
         src = self.rois.get("marker_2_roi")
@@ -2151,6 +2132,12 @@ class RoiEditorApp:
         self._refresh_canvas()
         self._schedule_profile_preview_refresh()
         self.status_var.set("已将 marker_2_match_roi 重置为 marker_2_roi")
+
+    def _on_roi_key_changed(self, *_: object) -> None:
+        if self.roi_key_var.get() == "marker_2_match_roi":
+            self._reset_match_roi_btn.grid()
+        else:
+            self._reset_match_roi_btn.grid_remove()
 
     def _to_cfg_path(self, path: Path) -> str:
         try:
@@ -2449,10 +2436,11 @@ class RoiEditorApp:
         data.setdefault("translation", {})
         if not isinstance(data["translation"], dict):
             data["translation"] = {}
-        model_list = self._parse_model_list(self.vlm_models_var.get())
-        data["translation"]["vlm_models"] = model_list if model_list else ["qwen3.6-plus"]
-        self._sync_current_model_from_list()
-        data["translation"]["model"] = str(self.vlm_model_var.get().strip() or data["translation"]["vlm_models"][0])
+        sel_model = str(self.vlm_model_var.get().strip())
+        if sel_model:
+            data["translation"]["model"] = sel_model
+        else:
+            data["translation"].pop("model", None)
 
     def _save_config(self) -> bool:
         raw_cfg = self.config_path_var.get().strip()
