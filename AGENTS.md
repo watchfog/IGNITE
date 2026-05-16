@@ -35,17 +35,67 @@ python tools/debug_rapidocr_single_image.py \       # OCR 调试
 
 ### 核心模块 (`src/auto_gamevideo_subtitles/`)
 
-| 模块 | 职责 |
+| 模块 | 行数 | 职责 |
+|------|------|------|
+| `pipeline.py` | 1690 | 主流水线编排：阶段调度、CLI 入口 `build_parser()`、`run_pipeline()` |
+| `state_machine.py` | 325 | 状态机分段：NO_DIALOGUE → TEXT_APPEARING → TEXT_STABLE → TEXT_CLEARING |
+| `event_detect.py` | 450 | 帧差异计算、marker 模板匹配 (`MarkerTemplateMatcher`)、`score_frame`、`score_batch` |
+| `ocr_engines.py` | 156 | OCR 引擎 (`build_ocr_engine`，RapidOCR) |
+| `translation_runtime.py` | 1128 | VLM 翻译客户端 (`BailianVlmTranslator`) + `translate_segment_with_retry`、`normalize_quotes_for_subtitle` |
+| `subtitle_export.py` | 142 | SRT + ASS 字幕导出 + 多行括号缩进对齐 |
+| `config.py` | 114 | YAML 配置加载，支持 `extends` 深合并 |
+| `ffmpeg_utils.py` | 270 | FFmpeg/FFprobe 封装（取帧、视频信息）+ 统一四路输出 |
+| `datatypes.py` | 50 | 数据类：`VideoMeta`、`Roi`、`OcrResult`、`DialogueSegment` |
+| `cache_manager.py` | 226 | 翻译缓存 JSON 读写、索引、命中检查 |
+| `name_splitter.py` | 808 | Name OCR 分割 (`_split_segment_by_name_ocr`) + 子段标准化 |
+| `marker_ops.py` | 326 | Marker/Marker2 评分、裁剪、分割 (`_split_segment_by_marker2`、`_build_refined_subsegment`) |
+| `name_ocr_runner.py` | 218 | `NameOcrRunner` 类（姓名区域 mask/OCR 检测，线程池并发） |
+| `debug_utils.py` | 99 | Debug 中间产物导出（marker/name 帧） |
+| `review_utils.py` | 78 | Review 元数据工具 (`_merge_review_reasons`、`_fill_short_false_gaps`、`_first_true_run_bounds`) |
+| `image_utils.py` | 77 | 图像裁剪/Base64/帧缓存加载 |
+| `log_utils.py` | 17 | 共享 `_log` / `set_log_file` |
+
+### 模块依赖关系
+
+```
+pipeline.py  ← 编排入口，import 所有下层模块
+  ├── cache_manager.py      (翻译缓存 CRUD，纯函数)
+  ├── review_utils.py       (review 元数据，纯工具)
+  ├── image_utils.py        (图像处理，依赖 PIL)
+  ├── debug_utils.py        (debug 导出)
+  ├── log_utils.py          (共享日志)
+  ├── marker_ops.py         (marker 评分+分割，依赖 event_detect + review_utils)
+  ├── name_splitter.py      (name OCR 分割，依赖 name_ocr_runner + marker_ops + review_utils)
+  ├── name_ocr_runner.py    (姓名 OCR 检测，依赖 ocr_engines + event_detect)
+  ├── translation_runtime.py (VLM 客户端，独立)
+  ├── subtitle_export.py    (字幕导出，依赖 datatypes)
+  ├── state_machine.py      (状态机，独立)
+  ├── ffmpeg_utils.py       (FFmpeg 封装，独立)
+  ├── config.py             (配置加载，独立)
+  └── datatypes.py          (共享数据类)
+```
+
+### Pipeline 分段流程
+
+1. **Marker 粗分段**：`MarkerTemplateMatcher.score_batch()` 对全视频做 marker 模板匹配 → 状态机输出 NO_DIALOGUE/TEXT_APPEARING/TEXT_STABLE/TEXT_CLEARING 序列
+2. **Name/Marker2 精化**（二选一）：
+   - **OCR 模式**：`_split_segment_by_name_ocr` 通过姓名区域 OCR 进一步切分空白→对话
+   - **Marker2 模式**（OCR 禁用时）：`_split_segment_by_marker2` 通过第二标记模板匹配切分
+3. **Normalize**：`_normalize_name_subsegments_per_marker` 将精化结果按 marker_seg_id 归组标准化
+
+### 分段结构约束
+
+每个 segment 的 `dialogue_type` 只能是以下两种情况：
+
+| 结构 | 说明 |
 |------|------|
-| `pipeline.py` | 主流水线（~3800 行），`build_parser()` 定义 CLI 参数 |
-| `state_machine.py` | 状态机分段：NO_DIALOGUE → TEXT_APPEARING → TEXT_STABLE → TEXT_CLEARING |
-| `event_detect.py` | 帧差异计算、marker 模板匹配 |
-| `ocr_engines.py` | OCR 引擎（RapidOCR） |
-| `translation_runtime.py` | VLM 翻译客户端（阿里云百炼 DashScope，OpenAI 兼容模式） |
-| `subtitle_export.py` | SRT + ASS 字幕导出 |
-| `config.py` | YAML 配置加载，支持 `extends` 字段做深层合并 |
-| `ffmpeg_utils.py` | FFmpeg/FFprobe 封装 |
-| `models.py` | 数据类：`VideoMeta`、`Roi`、`OcrResult`、`DialogueSegment` |
+| `blank_no_name` → `dialogue` | 空白段（无对话）→ 对话段 |
+| 纯 `dialogue` | 整段都是对话，无前置空白 |
+
+### Marker2 匹配逻辑
+
+- **True 可靠**：只用第一个 True 连续段判定对话边界，不做 `_blank_confirm` 二次确认
+- **两段式匹配**：若配置了 `marker_2_match_roi`（> `marker_2_roi`），帧截取即用大区域。`cv2.matchTemplate` 自动搜索全图，位移偏移 `vertical_shift_px/horizontal_shift_px` 自动设为 0
 
 ### 配置系统
 
