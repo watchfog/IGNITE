@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import threading
 import time
+import yaml
 from pathlib import Path
 from typing import Any
 
@@ -422,6 +423,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
     ffmpeg_path = Path(cfg["tools"]["ffmpeg_path"])
     ffprobe_path = Path(cfg["tools"]["ffprobe_path"])
 
+    subtitle_style: dict[str, Any] | None = None
+    style_path = project_root / "config" / "subtitle_style.yaml"
+    if style_path.exists():
+        try:
+            subtitle_style = yaml.safe_load(style_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    per_style = cfg.get("subtitle_style")
+    if isinstance(per_style, dict):
+        if subtitle_style is None:
+            subtitle_style = {}
+        subtitle_style.update(per_style)
+
     if bool(getattr(args, "subtitles_from_cache", False)):
         _log(f"Loading subtitle cache: {translation_cache_lookup_path}")
         if not translation_cache_lookup_path.exists():
@@ -461,6 +475,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             subtitle_location=subtitle_location,
             title_translation_location=title_translation_location,
             title_info_location=title_info_location,
+            style=subtitle_style,
         )
         write_srt(dbg_segs, output_dir / "subtitles_debug.srt")
         write_ass(
@@ -471,6 +486,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             subtitle_location=subtitle_location,
             title_translation_location=title_translation_location,
             title_info_location=title_info_location,
+            style=subtitle_style,
         )
         _backup_subtitles_to_work(output_dir, work_dir)
         _log("Subtitles generated from translation cache.")
@@ -1531,6 +1547,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             subtitle_location=subtitle_location,
             title_translation_location=title_translation_location,
             title_info_location=title_info_location,
+            style=subtitle_style,
         )
     else:
         write_srt(cache_sub_segments, output_dir / "subtitles.srt")
@@ -1542,6 +1559,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             subtitle_location=subtitle_location,
             title_translation_location=title_translation_location,
             title_info_location=title_info_location,
+            style=subtitle_style,
         )
         write_srt(cache_debug_segments, output_dir / "subtitles_debug.srt")
         write_ass(
@@ -1552,6 +1570,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             subtitle_location=subtitle_location,
             title_translation_location=title_translation_location,
             title_info_location=title_info_location,
+            style=subtitle_style,
         )
     _backup_subtitles_to_work(output_dir, work_dir)
 

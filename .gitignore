@@ -19,9 +19,10 @@ __pycache__/
 examples/*
 !examples/.gitkeep
 
-# Ignore config except the shared baseline config
+# Ignore config except the shared baseline configs
 config/*
 !config/general_config.yaml
+!config/subtitle_style.yaml
 
 # Ignore tools content but keep directory placeholder
 tools/*

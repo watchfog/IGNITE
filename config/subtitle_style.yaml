@@ -1,0 +1,31 @@
+# Subtitle style configuration for ASS/SRT output.
+# All values can be overridden in per-video config under the "subtitle_style" key.
+
+font_name: Microsoft YaHei
+# Base font size for regular dialogue. Actual size = max(min_font_size, int(video_height * ratio)).
+font_size_ratio: 0.05
+min_font_size: 28
+
+# ASS colour fields are in &HAABBGGRR format (alpha, blue, green, red).
+primary_colour: "&H00FFFFFF"       # white text
+secondary_colour: "&H000000FF"     # red (karaoke)
+outline_colour: "&H00000000"       # black outline
+back_colour: "&H64000000"          # semi-transparent black shadow
+
+# Border / shadow / margin
+border_style: 1                    # 1 = outline + drop shadow
+outline: 2.4                       # outline width
+shadow: 0.8                        # shadow depth
+margin_l: 40
+margin_r: 40
+margin_v: 40
+
+# Text styling
+bold: 0
+italic: 0
+underline: 0
+strike_out: 0
+scale_x: 100
+scale_y: 100
+spacing: 0
+angle: 0

@@ -1,8 +1,42 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from .datatypes import DialogueSegment
+
+
+_DEFAULT_STYLE: dict[str, Any] = {
+    "font_name": "Microsoft YaHei",
+    "font_size_ratio": 0.05,
+    "min_font_size": 28,
+    "primary_colour": "&H00FFFFFF",
+    "secondary_colour": "&H000000FF",
+    "outline_colour": "&H00000000",
+    "back_colour": "&H64000000",
+    "border_style": 1,
+    "outline": 2.4,
+    "shadow": 0.8,
+    "margin_l": 40,
+    "margin_r": 40,
+    "margin_v": 40,
+    "bold": 0,
+    "italic": 0,
+    "underline": 0,
+    "strike_out": 0,
+    "scale_x": 100,
+    "scale_y": 100,
+    "spacing": 0,
+    "angle": 0,
+}
+
+
+def _merge_style(style: dict[str, Any] | None) -> dict[str, Any]:
+    if not style:
+        return dict(_DEFAULT_STYLE)
+    out = dict(_DEFAULT_STYLE)
+    out.update(style)
+    return out
 
 
 def _srt_time(sec: float) -> str:
@@ -91,7 +125,30 @@ def write_ass(
     subtitle_location: list[int],
     title_translation_location: list[int] | None = None,
     title_info_location: list[int] | None = None,
+    style: dict[str, Any] | None = None,
 ) -> None:
+    s = _merge_style(style)
+    font_name = str(s["font_name"])
+    font_size = max(int(s["min_font_size"]), int(video_height * float(s["font_size_ratio"])))
+    primary = str(s["primary_colour"])
+    secondary = str(s["secondary_colour"])
+    outline_c = str(s["outline_colour"])
+    back_c = str(s["back_colour"])
+    border = int(s["border_style"])
+    outline_w = float(s["outline"])
+    shadow_w = float(s["shadow"])
+    ml = int(s["margin_l"])
+    mr = int(s["margin_r"])
+    mv = int(s["margin_v"])
+    b = int(s["bold"])
+    i = int(s["italic"])
+    u = int(s["underline"])
+    st = int(s["strike_out"])
+    sx = int(s["scale_x"])
+    sy = int(s["scale_y"])
+    sp = int(s["spacing"])
+    a = int(s["angle"])
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     x1, y1, x2, y2 = subtitle_location
@@ -107,7 +164,6 @@ def write_ass(
     title_anchor_y = int(round((ty1 + ty2) / 2.0))
     speaker_anchor_x = int(round((sx1 + sx2) / 2.0))
     speaker_anchor_y = int(round((sy1 + sy2) / 2.0))
-    font_size = max(26, int(video_height * 0.045))
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -118,8 +174,8 @@ def write_ass(
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
         "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
         "Alignment,MarginL,MarginR,MarginV,Encoding",
-        f"Style: Default,Microsoft YaHei,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
-        "0,0,0,0,100,100,0,0,1,2.2,0.8,2,40,40,40,1",
+        f"Style: Default,{font_name},{font_size},{primary},{secondary},{outline_c},{back_c},"
+        f"{b},{i},{u},{st},{sx},{sy},{sp},{a},{border},{outline_w},{shadow_w},2,{ml},{mr},{mv},1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
