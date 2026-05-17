@@ -15,7 +15,7 @@ python main.py --video <path> --config <path>      # 带参数启动
 python -m ignite.pipeline \  # 直接运行 pipeline（无 GUI）
     --video <path> --config <path> --output-dir <path>
 
-python ignite/gui/review.py --cache <path>   # 重新打开校对 GUI
+python -m ignite.gui.review --cache <path>   # 重新打开校对 GUI
 
 python tools/debug_rapidocr_single_image.py \       # OCR 调试
     --image <path> --config <path>

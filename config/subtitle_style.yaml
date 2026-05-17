@@ -2,9 +2,10 @@
 # All values can be overridden in per-video config under the "subtitle_style" key.
 
 font_name: Microsoft YaHei
-# Base font size for regular dialogue. Actual size = max(min_font_size, int(video_height * ratio)).
-font_size_ratio: 0.05
-min_font_size: 28
+# Font size is calculated from dialogue_roi height (two lines): height / 2 * scale.
+# Min ensures readability on very small ROIs.
+font_size_scale: 0.8
+min_font_size: 20
 
 # ASS colour fields are in &HAABBGGRR format (alpha, blue, green, red).
 primary_colour: "&H00FFFFFF"       # white text

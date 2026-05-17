@@ -1370,7 +1370,7 @@ class ProfileEditor:
     def _launch_cache_review(self, cache_path: Path, video: Path, config: Path) -> None:
         cmd = [
             sys.executable,
-            str((ROOT / "ignite" / "gui" / "review.py").resolve()),
+            "-m", "ignite.gui.review",
             "--cache",
             str(cache_path),
             "--video",

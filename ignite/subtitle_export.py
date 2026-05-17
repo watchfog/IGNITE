@@ -8,8 +8,8 @@ from .datatypes import DialogueSegment
 
 _DEFAULT_STYLE: dict[str, Any] = {
     "font_name": "Microsoft YaHei",
-    "font_size_ratio": 0.05,
-    "min_font_size": 28,
+    "font_size_scale": 0.8,
+    "min_font_size": 20,
     "primary_colour": "&H00FFFFFF",
     "secondary_colour": "&H000000FF",
     "outline_colour": "&H00000000",
@@ -128,13 +128,16 @@ def write_ass(
     style: dict[str, Any] | None = None,
     *,
     dialogue_height: int = 0,
+    title_height: int = 0,
 ) -> None:
     s = _merge_style(style)
     font_name = str(s["font_name"])
+    scale = float(s.get("font_size_scale", 0.8))
     if dialogue_height > 0:
-        font_size = max(int(s.get("min_font_size", 20)), dialogue_height // 2)
+        font_size = max(int(s.get("min_font_size", 20)), int(dialogue_height / 2 * scale))
     else:
         font_size = max(int(s.get("min_font_size", 20)), int(video_height * float(s.get("font_size_ratio", 0.05))))
+    title_font_size = int(title_height * scale) if title_height > 0 else font_size
     primary = str(s["primary_colour"])
     secondary = str(s["secondary_colour"])
     outline_c = str(s["outline_colour"])
@@ -192,18 +195,20 @@ def write_ass(
         text = raw.replace("\n", "\\N")
         is_title = str(seg.dialogue_type or "").strip().lower() == "title"
         if is_title:
+            title_override = f"{{\\an5\\pos({title_anchor_x},{title_anchor_y})\\fs{title_font_size}}}"
             speaker_text = str(seg.speaker or "").replace("\n", "\\N").strip()
             if text.strip():
                 events.append(
                     "Dialogue: 0,"
                     f"{_ass_time(seg.time_start)},{_ass_time(seg.time_end)},Default,,0,0,0,,"
-                    f"{{\\an5\\pos({title_anchor_x},{title_anchor_y})}}{text}"
+                    f"{title_override}{text}"
                 )
             if speaker_text:
+                speaker_override = f"{{\\an5\\pos({speaker_anchor_x},{speaker_anchor_y})\\fs{title_font_size}}}"
                 events.append(
                     "Dialogue: 0,"
                     f"{_ass_time(seg.time_start)},{_ass_time(seg.time_end)},Default,,0,0,0,,"
-                    f"{{\\an5\\pos({speaker_anchor_x},{speaker_anchor_y})}}{speaker_text}"
+                    f"{speaker_override}{speaker_text}"
                 )
             continue
         if text.strip():

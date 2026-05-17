@@ -455,6 +455,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _log("Reading video metadata.")
         video_meta = ffprobe_video(ffprobe_path, args.video)
         dialogue_roi = _roi_from_cfg(cfg, "dialogue_roi")
+        title_ocr_roi = (
+            _roi_from_cfg(cfg, "title_ocr_roi")
+            if isinstance(cfg.get("roi", {}).get("title_ocr_roi"), list)
+            else _roi_from_cfg(cfg, "dialogue_roi")
+        )
         subtitle_location = cfg["roi"].get("subtitle_location", cfg["roi"].get("subtitle_roi"))
         if not isinstance(subtitle_location, list) or len(subtitle_location) != 4:
             raise RuntimeError("Invalid config: roi.subtitle_location must be [x1,y1,x2,y2]")
@@ -478,6 +483,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             title_info_location=title_info_location,
             style=subtitle_style,
             dialogue_height=dialogue_roi.height,
+            title_height=title_ocr_roi.height,
         )
         write_srt(dbg_segs, output_dir / "subtitles_debug.srt")
         write_ass(
@@ -490,6 +496,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             title_info_location=title_info_location,
             style=subtitle_style,
             dialogue_height=dialogue_roi.height,
+            title_height=title_ocr_roi.height,
         )
         _backup_subtitles_to_work(output_dir, work_dir)
         _log("Subtitles generated from translation cache.")
@@ -501,6 +508,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
     video_meta = ffprobe_video(ffprobe_path, args.video)
     name_roi = _roi_from_cfg(cfg, "name_roi")
     dialogue_roi = _roi_from_cfg(cfg, "dialogue_roi")
+    title_ocr_roi = (
+        _roi_from_cfg(cfg, "title_ocr_roi")
+        if isinstance(cfg.get("roi", {}).get("title_ocr_roi"), list)
+        else _roi_from_cfg(cfg, "dialogue_roi")
+    )
     marker_roi = _roi_from_cfg(cfg, "marker_roi")
     marker2_roi = (
         _roi_from_cfg(cfg, "marker_2_roi")
@@ -1552,6 +1564,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             title_info_location=title_info_location,
             style=subtitle_style,
             dialogue_height=dialogue_roi.height,
+            title_height=title_ocr_roi.height,
         )
     else:
         write_srt(cache_sub_segments, output_dir / "subtitles.srt")
@@ -1565,6 +1578,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             title_info_location=title_info_location,
             style=subtitle_style,
             dialogue_height=dialogue_roi.height,
+            title_height=title_ocr_roi.height,
         )
         write_srt(cache_debug_segments, output_dir / "subtitles_debug.srt")
         write_ass(
@@ -1577,6 +1591,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             title_info_location=title_info_location,
             style=subtitle_style,
             dialogue_height=dialogue_roi.height,
+            title_height=title_ocr_roi.height,
         )
     _backup_subtitles_to_work(output_dir, work_dir)
 
