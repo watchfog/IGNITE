@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from app.roi_editor import RoiEditorApp
+from ignite.gui.profile import ProfileEditor
 
 
 def main() -> int:
@@ -22,7 +22,7 @@ def main() -> int:
     if raw_out:
         out_name = Path(raw_out).name.strip()
 
-    app = RoiEditorApp(
+    app = ProfileEditor(
         video_path=str(args.video or "").strip(),
         config_path=str(args.config or "").strip(),
         output_name=out_name,

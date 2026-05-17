@@ -19,14 +19,11 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
+from ignite.config import load_config
+from ignite.event_detect import MarkerTemplateMatcher
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
 
-from auto_gamevideo_subtitles.config import load_config  # noqa: E402
-from auto_gamevideo_subtitles.event_detect import MarkerTemplateMatcher  # noqa: E402
+ROOT = Path(__file__).resolve().parents[2]
 
 
 ROI_KEYS = [
@@ -84,7 +81,7 @@ def _raw_cfg_to_text(data: dict[str, Any]) -> str:
         return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-class RoiEditorApp:
+class ProfileEditor:
     def __init__(self, video_path: str, config_path: str, output_name: str = "") -> None:
         self.root = tk.Tk()
         self.root.title("Profile编辑器 - IGNITE")
@@ -1373,7 +1370,7 @@ class RoiEditorApp:
     def _launch_cache_review(self, cache_path: Path, video: Path, config: Path) -> None:
         cmd = [
             sys.executable,
-            str((ROOT / "app" / "cache_browser_review.py").resolve()),
+            str((ROOT / "ignite" / "gui" / "review.py").resolve()),
             "--cache",
             str(cache_path),
             "--video",
@@ -1393,7 +1390,7 @@ class RoiEditorApp:
         base = [
             sys.executable,
             "-m",
-            "src.auto_gamevideo_subtitles.pipeline",
+            "ignite.pipeline",
             "--video",
             str(video),
             "--config",
@@ -1747,7 +1744,6 @@ class RoiEditorApp:
             
     def _start_precise_seek_async(self, sec: float) -> None:
         self._precise_req_id += 1
-        req_id = self._precise_req_id
         self._precise_pending_sec = self._snap_to_frame_time(float(sec))
         self._set_decode_overlay(True)
 
@@ -2541,7 +2537,7 @@ def main() -> int:
     parser.add_argument("--config", default="")
     parser.add_argument("--output-name", default="")
     args = parser.parse_args()
-    app = RoiEditorApp(video_path=args.video, config_path=args.config, output_name=args.output_name)
+    app = ProfileEditor(video_path=args.video, config_path=args.config, output_name=args.output_name)
     app.run()
     return 0
 

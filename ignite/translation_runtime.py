@@ -65,8 +65,8 @@ def normalize_quotes_for_subtitle(text: str) -> str:
     last = s[-1] if s else ""
     openers = {'"', '『', '「', '"'}
     closers = {'"', '』', '」', '"'}
-    pair_map = {'"': '"', '『': '』', '「': '」', '"': '"'}
-    rev_pair_map = {'"': '"', '』': '『', '」': '「', '"': '"'}
+    pair_map = {'"': '"', '『': '』', '「': '」', '"': '"'}  # noqa: F601
+    rev_pair_map = {'"': '"', '』': '『', '」': '「', '"': '"'}  # noqa: F601
 
     starts_with_opener = first in openers
     ends_with_closer = last in closers
@@ -534,7 +534,6 @@ class BailianVlmTranslator:
         custom_prompt: str = "",
         extra_requirements: str = "",
     ) -> tuple[str, str, str, dict[str, int]]:
-        game_hint = f"图像中的文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         system_prompt = (
             f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的日文文本翻译为中文。"
             f"接下来会给你两张图像，图片1是当前说话人日文姓名，图片2是日文对话文本。"
@@ -552,14 +551,6 @@ class BailianVlmTranslator:
             )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
-        refs: list[str] = []
-        if history_items:
-            for idx, item in enumerate(history_items, start=1):
-                refs.append(
-                    f"{idx}. time={item.get('time','')}; speaker={item.get('speaker','')}; "
-                    f"original={item.get('original','')}; translation={item.get('translation','')}"
-                )
-        history_text = "\n".join(refs) if refs else "(none)"
         user_text = (
             "下面会提供两张图片用于识别和翻译，"
             "图片1：当前说话人。图片2：当前对话文本。"
@@ -864,14 +855,6 @@ class BailianVlmTranslator:
         )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
-        refs: list[str] = []
-        if history_items:
-            for idx, item in enumerate(history_items, start=1):
-                refs.append(
-                    f"{idx}. time={item.get('time','')}; speaker={item.get('speaker','')}; "
-                    f"original={item.get('original','')}; translation={item.get('translation','')}"
-                )
-        history_text = "\n".join(refs) if refs else "(none)"
         user_text = (
             "下面提供一张图像（标题或文本区域），请执行OCR并翻译。\n"
             "给出的前文仅作风格和术语参考，不一定与当前图像直接相关。\n"

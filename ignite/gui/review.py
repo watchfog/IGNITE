@@ -17,22 +17,19 @@ import cv2
 import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 
-
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from auto_gamevideo_subtitles.config import load_config  # noqa: E402
-from auto_gamevideo_subtitles.event_detect import MarkerTemplateMatcher  # noqa: E402
-from auto_gamevideo_subtitles.translation_runtime import (  # noqa: E402
+from ignite.config import load_config
+from ignite.event_detect import MarkerTemplateMatcher
+from ignite.translation_runtime import (
     BailianVlmTranslator,
     has_kanji_overlap_from_original,
     normalize_quotes_for_subtitle,
     load_api_key,
 )
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 ROI_KEYS = ["name_roi", "dialogue_roi", "title_ocr_roi"]
@@ -1205,7 +1202,6 @@ class CacheReviewApp:
             return
         saved = self._merge_undo
         idx_a = int(saved["idx_a"])
-        idx_b = int(saved["idx_b"])
         restored_a = dict(saved["entries"][0])
         restored_b = dict(saved["entries"][1])
         new_entries = self.entries[:idx_a] + [restored_a, restored_b] + self.entries[idx_a + 1:]
@@ -1237,7 +1233,7 @@ class CacheReviewApp:
             shutil.copy2(src, dst)
             msgs.append(f"(已同步: {dst})")
         else:
-            msgs.append(f"(latest已是当前文件)")
+            msgs.append("(latest已是当前文件)")
         source_work = self.cache_payload.get("source_work_cache")
         if source_work and (out_dir / "work").is_dir():
             work_path = (out_dir / source_work).resolve()
@@ -1270,7 +1266,7 @@ class CacheReviewApp:
         return [
             sys.executable,
             "-m",
-            "src.auto_gamevideo_subtitles.pipeline",
+            "ignite.pipeline",
             "--video",
             str(video_path),
             "--config",

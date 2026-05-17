@@ -29,36 +29,27 @@ from .config import load_config
 from .debug_utils import (
     _export_marker_frames_for_segment,
     _export_name_frames_for_segment,
-    _name_mask_debug_label,
 )
 from .event_detect import (
     FrameMetric,
     MarkerTemplateMatcher,
     extract_text_features,
-    extract_text_mask_stats,
     frame_text_change_score,
     load_gray,
 )
 from .ffmpeg_utils import (
-    extract_frame,
-    extract_sequence,
     extract_sequence_dialogue_name_marker,
     ffprobe_video,
     extract_frame_to_memory,
 )
 from .image_utils import (
     _assert_crop_size,
-    _crop_and_save,
-    _crop_image_to_base64,
     _image_to_base64,
-    _timestamp_to_frame_number,
-    _try_load_cached_full_frame,
     _try_load_cached_roi_frame_with_status,
 )
 from .log_utils import _log, set_log_file
 from .marker_ops import (
     _background_score_marker_and_prune_dialogue_cache,
-    _build_refined_subsegment,
     _final_prune_dialogue_cache_by_scores,
     _pick_marker_anchor_frame,
     _prune_dialogue_cache_to_anchor_frames,
@@ -67,16 +58,12 @@ from .marker_ops import (
 from .datatypes import DialogueSegment, Roi
 from .name_ocr_runner import NameOcrRunner
 from .name_splitter import (
-    _head_probe_hits_ocr,
     _normalize_name_subsegments_per_marker,
     _split_segment_by_name_ocr,
 )
 from .ocr_engines import build_ocr_engine
 from .review_utils import (
-    _attach_review_metadata,
     _coerce_review_reasons,
-    _fill_short_false_gaps,
-    _first_true_run_bounds,
     _mark_kanji_overlap_for_review,
     _merge_review_reasons,
 )
@@ -624,7 +611,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
             duration = max(0.01, end_sec - start_sec)
             frame_stride = max(1, int(cfg["video"].get("frame_stride", 2)))
             scan_fps = base_fps / float(frame_stride)
-            dialog_dir = work_dir / f"fine_{ridx:03d}_dialog"
             name_dir = work_dir / f"fine_{ridx:03d}_name"
             marker_dir = work_dir / f"fine_{ridx:03d}_marker"
             marker2_dir = work_dir / f"fine_{ridx:03d}_marker2"
@@ -872,7 +858,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     if split_name_enabled and (not name_split_use_ocr) and marker2_matcher is None:
         raise RuntimeError(
             "OCR disabled, but marker_2.template_paths are not configured. "
-            "Set marker_2 templates in roi_editor or enable OCR."
+            "Set marker_2 templates in profile editor or enable OCR."
         )
     if split_name_enabled and (not name_split_use_ocr) and marker2_matcher is not None:
         _log("Refining segments by marker2 template presence (OCR disabled).")
@@ -1174,23 +1160,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
         frame_end_abs = int(round(raw["time_end"] * base_fps))
         stable_ids = [int(round((raw["start_sec"] + (f / raw["scan_fps"])) * base_fps)) for f in raw["sample_frames"]]
 
-        # Stable frame from marker-on selected OCR frame.
-        if has_name and selected_ts_for_ocr is not None:
-            stable_t = selected_ts_for_ocr
-        elif has_name and raw.get("sample_frames"):
-            stable_t = float(raw["start_sec"]) + (float(raw["sample_frames"][0]) / float(raw["scan_fps"]))
-        elif has_name:
-            anchor_fid = _pick_marker_anchor_frame(
-                raw=raw,
-                from_end_frames=marker_anchor_from_end_frames,
-            )
-            stable_t = float(raw["start_sec"]) + (float(anchor_fid) / float(raw["scan_fps"]))
-            _log(
-                f"Warning: segment {i} has_name=true but no selected OCR frame; "
-                "fallback to tail-anchor frame for stable frame."
-            )
-        else:
-            stable_t = float(raw.get("stable_time", (raw["time_start"] + raw["time_end"]) / 2))
+        if not has_name:
+            selected_ts_for_ocr = None
 
         dialogue_type = "speaker_dialogue" if has_name else "blank_no_name"
         line_count = 1

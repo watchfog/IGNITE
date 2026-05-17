@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Ruff linter cache
+.ruff_cache/
+
 # Sensitive files (API keys / credentials)
 **/*api_key*
 *.key

@@ -313,9 +313,9 @@ def _moving_average(values: list[float], window: int) -> list[float]:
     half = window // 2
     n = len(values)
     for i in range(n):
-        l = max(0, i - half)
+        left = max(0, i - half)
         r = min(n, i + half + 1)
-        out.append(sum(values[l:r]) / float(r - l))
+        out.append(sum(values[left:r]) / float(r - left))
     return out
 
 

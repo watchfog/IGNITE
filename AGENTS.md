@@ -12,10 +12,10 @@ pip install -r requirements.txt                   # 安装依赖
 python main.py                                    # 启动 Profile 编辑器 GUI
 python main.py --video <path> --config <path>      # 带参数启动
 
-python -m src.auto_gamevideo_subtitles.pipeline \  # 直接运行 pipeline（无 GUI）
+python -m ignite.pipeline \  # 直接运行 pipeline（无 GUI）
     --video <path> --config <path> --output-dir <path>
 
-python app/cache_browser_review.py --cache <path>   # 重新打开校对 GUI
+python ignite/gui/review.py --cache <path>   # 重新打开校对 GUI
 
 python tools/debug_rapidocr_single_image.py \       # OCR 调试
     --image <path> --config <path>
@@ -30,10 +30,10 @@ python tools/debug_rapidocr_single_image.py \       # OCR 调试
 | 入口 | 用途 |
 |------|------|
 | `main.py` | Profile 编辑器 GUI（ROI 框选、marker 配置、启动流程） |
-| `src/auto_gamevideo_subtitles/pipeline.py` | 核心流水线：分段 → OCR → VLM 翻译 → 缓存 → 字幕生成 |
-| `app/cache_browser_review.py` | 字幕校对 GUI（编辑翻译、复译、生成字幕） |
+| `ignite/pipeline.py` | 核心流水线：分段 → OCR → VLM 翻译 → 缓存 → 字幕生成 |
+| `ignite/gui/review.py` | 字幕校对 GUI（编辑翻译、复译、生成字幕） |
 
-### 核心模块 (`src/auto_gamevideo_subtitles/`)
+### 核心模块 (`ignite/`)
 
 | 模块 | 行数 | 职责 |
 |------|------|------|
@@ -105,27 +105,6 @@ pipeline.py  ← 编排入口，import 所有下层模块
 - VLM 默认模型：Qwen 3.6 Plus，`responses` 模式，须支持视觉识别
 
 ## 代码约定
-
-### sys.path 操作（重要）
-
-`app/` 下的文件通过操作 `sys.path` 定位 `src/`，遵循固定模式：
-
-```python
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from auto_gamevideo_subtitles.xxx import yyy  # noqa: E402
-```
-
-**新增 `app/` 下文件时，必须遵循此模式**。import 语句放在 `sys.path` 修改之后，并加 `# noqa: E402`。
-
-### 文件头
-
-- 首行 `from __future__ import annotations`（几乎所有文件）
-- 部分旧文件有 `# -*- coding: utf-8 -*-`
-- 使用延迟类型注解（PEP 563）
 
 ### 线程模型
 

@@ -7,7 +7,6 @@ from typing import Any
 import numpy as np
 
 from .event_detect import FrameMetric, extract_text_mask_stats, load_gray
-from .log_utils import _log
 
 
 def _export_marker_frames_for_segment(
