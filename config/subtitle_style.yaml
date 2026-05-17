@@ -4,7 +4,7 @@
 font_name: Microsoft YaHei
 # Font size is calculated from dialogue_roi height (two lines): height / 2 * scale.
 # Min ensures readability on very small ROIs.
-font_size_scale: 0.5
+font_size_scale: 0.7
 min_font_size: 20
 
 # ASS colour fields are in &HAABBGGRR format (alpha, blue, green, red).
@@ -30,3 +30,30 @@ scale_x: 100
 scale_y: 100
 spacing: 0
 angle: 0
+
+# Speaker 样式（仅对 ASS/硬字幕生效，不影响 SRT）
+# 匹配到 speaker 后会用对应 style 覆盖 outline_colour（描边颜色）。
+# 未匹配到的 speaker 或 title 段继续使用 Default 样式。
+speaker_style_matching:
+  enabled: true
+  max_edit_distance: 1
+
+speaker_styles:
+  天羽奏:
+    outline_colour: "&H00004DFF"    # #ff4d00
+  風鳴翼:
+    outline_colour: "&H00B76801"    # #0168b7
+  立花響:
+    outline_colour: "&H000080FF"    # #ff8000
+  雪音クリス:
+    outline_colour: "&H002E00E6"    # #e6002e
+  マリア:
+    outline_colour: "&H00C0B9B0"    # #b0b9c0
+  月読調:
+    outline_colour: "&H009E60EA"    # #ea609e
+  暁切歌:
+    outline_colour: "&H005ABB6B"    # #6bbb5a
+  小日向未来:
+    outline_colour: "&H00DB7093"    # #9370db
+  キャロル:
+    outline_colour: "&H00508DA5"    # #a58d50

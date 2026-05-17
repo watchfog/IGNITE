@@ -38,15 +38,15 @@ ROI_KEYS = [
     "title_info_location",
 ]
 ROI_COLORS = {
-    "name_roi": "#ffbf00",
-    "dialogue_roi": "#0896e0",
-    "marker_roi": "#e32636",
-    "marker_2_roi": "#ff7f00",
-    "marker_2_match_roi": "#ffbf80",
-    "subtitle_location": "#bf00ff",
-    "title_ocr_roi": "#c0c0c0",
-    "title_translation_location": "#36bf36",
-    "title_info_location": "#ff0da6",
+    "name_roi": "#ff8000",
+    "dialogue_roi": "#0168b7",
+    "marker_roi": "#e6002e",
+    "marker_2_roi": "#a58d50",
+    "marker_2_match_roi": "#ff4d00",
+    "subtitle_location": "#9370db",
+    "title_ocr_roi": "#b0b9c0",
+    "title_translation_location": "#6bbb5a",
+    "title_info_location": "#ea609e",
 }
 DEFAULT_MARKER_FORCE_THRESHOLD = 0.6
 DEFAULT_MARKER2_FORCE_THRESHOLD = 0.1

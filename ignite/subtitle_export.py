@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,206 @@ def _merge_style(style: dict[str, Any] | None) -> dict[str, Any]:
     out = dict(_DEFAULT_STYLE)
     out.update(style)
     return out
+
+
+_NOISE_CHARS = set(" 　\n\r\t\u3000：:（）()「」『』【】\"'\"'｢｣“”‘’・．")
+
+
+def _normalize_speaker_name(raw: str) -> str:
+    text = unicodedata.normalize("NFKC", str(raw or ""))
+    chars: list[str] = []
+    for ch in text:
+        if ch in _NOISE_CHARS:
+            continue
+        chars.append(ch)
+    return "".join(chars)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            ins = cur[-1] + 1
+            dlt = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            cur.append(min(ins, dlt, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _match_speaker_style(
+    speaker_raw: str,
+    speaker_styles: dict[str, dict[str, Any]],
+    max_edit_distance: int,
+) -> tuple[str | None, bool]:
+    normalized = _normalize_speaker_name(speaker_raw)
+    if not normalized:
+        return None, False
+
+    if normalized in speaker_styles:
+        return normalized, False
+
+    norm_equal: list[str] = []
+    contains: list[str] = []
+    for key in speaker_styles:
+        nk = _normalize_speaker_name(key)
+        if normalized == nk:
+            norm_equal.append(key)
+        elif normalized in nk or nk in normalized:
+            contains.append(key)
+
+    if len(norm_equal) == 1:
+        return norm_equal[0], False
+    if len(norm_equal) > 1:
+        return None, True
+
+    if len(contains) == 1:
+        return contains[0], False
+    if len(contains) > 1:
+        return None, True
+
+    best_dists: list[str] = []
+    best_dist = max_edit_distance + 1
+    for key in speaker_styles:
+        nk = _normalize_speaker_name(key)
+        dist = _edit_distance(normalized, nk)
+        if dist < best_dist:
+            best_dist = dist
+            best_dists = [key]
+        elif dist == best_dist:
+            best_dists.append(key)
+
+    if best_dist <= max_edit_distance:
+        if len(best_dists) == 1:
+            return best_dists[0], False
+        return None, True
+
+    return None, False
+
+
+def _build_speaker_style_map(
+    style: dict[str, Any],
+    default_style_clone: dict[str, Any],
+) -> tuple[dict[str, str], list[str]]:
+    speaker_styles_raw: Any = style.get("speaker_styles", None)
+    if not isinstance(speaker_styles_raw, dict):
+        return {}, []
+
+    matching_cfg: Any = style.get("speaker_style_matching")
+    if isinstance(matching_cfg, dict) and not matching_cfg.get("enabled", True):
+        return {}, []
+
+    speaker_styles: dict[str, dict[str, Any]] = {}
+    for k, v in speaker_styles_raw.items():
+        if isinstance(v, dict) and k.strip():
+            speaker_styles[k.strip()] = v
+
+    style_lines: list[str] = []
+    speaker_name_to_style_name: dict[str, str] = {}
+
+    fmt = (
+        "{font_name},{font_size},{primary},{secondary},{outline},{back},"
+        "{bold},{italic},{underline},{strike_out},{scale_x},{scale_y},"
+        "{spacing},{angle},{border},{outline_w},{shadow_w},2,{ml},{mr},{mv},1"
+    )
+
+    for speaker_name, overrides in speaker_styles.items():
+        sp = copy.deepcopy(default_style_clone)
+        for attr in (
+            "primary_colour",
+            "secondary_colour",
+            "outline_colour",
+            "back_colour",
+            "outline",
+            "shadow",
+            "bold",
+            "italic",
+            "underline",
+            "strike_out",
+            "scale_x",
+            "scale_y",
+            "spacing",
+            "angle",
+            "margin_l",
+            "margin_r",
+            "margin_v",
+        ):
+            val = overrides.get(attr)
+            if val is not None:
+                sp[attr] = val
+
+        style_name = f"Speaker_{speaker_name}"
+        safe_name = style_name.replace(",", "").replace(";", "")
+        speaker_name_to_style_name[speaker_name] = safe_name
+
+        style_lines.append(
+            f"Style: {safe_name},"
+            + fmt.format(
+                font_name=sp["font_name"],
+                font_size=int(sp.get("font_size", default_style_clone.get("font_size", 20))),
+                primary=sp["primary_colour"],
+                secondary=sp["secondary_colour"],
+                outline=sp["outline_colour"],
+                back=sp["back_colour"],
+                bold=int(sp.get("bold", 0)),
+                italic=int(sp.get("italic", 0)),
+                underline=int(sp.get("underline", 0)),
+                strike_out=int(sp.get("strike_out", 0)),
+                scale_x=int(sp.get("scale_x", 100)),
+                scale_y=int(sp.get("scale_y", 100)),
+                spacing=int(sp.get("spacing", 0)),
+                angle=int(sp.get("angle", 0)),
+                border=int(sp.get("border_style", 1)),
+                outline_w=float(sp.get("outline", 2.4)),
+                shadow_w=float(sp.get("shadow", 0.8)),
+                ml=int(sp.get("margin_l", 40)),
+                mr=int(sp.get("margin_r", 40)),
+                mv=int(sp.get("margin_v", 40)),
+            )
+        )
+
+    return speaker_name_to_style_name, style_lines
+
+
+def mark_ambiguous_speaker_segments(
+    segments: list[DialogueSegment],
+    style: dict[str, Any] | None = None,
+) -> None:
+    if not style:
+        return
+    raw_styles = style.get("speaker_styles")
+    if not isinstance(raw_styles, dict):
+        return
+    matching_cfg = style.get("speaker_style_matching")
+    if isinstance(matching_cfg, dict) and not matching_cfg.get("enabled", True):
+        return
+    max_edit_distance = 1
+    if isinstance(matching_cfg, dict):
+        max_edit_distance = int(matching_cfg.get("max_edit_distance", 1))
+
+    speaker_styles: dict[str, dict[str, Any]] = {}
+    for k, v in raw_styles.items():
+        if isinstance(v, dict) and k.strip():
+            speaker_styles[k.strip()] = v
+    if not speaker_styles:
+        return
+
+    for seg in segments:
+        if not seg.speaker:
+            continue
+        dt = str(seg.dialogue_type or "").strip().lower()
+        if dt == "title":
+            continue
+        matched, ambiguous = _match_speaker_style(seg.speaker, speaker_styles, max_edit_distance)
+        if ambiguous:
+            seg.needs_review = True
+            if "speaker_ambiguous" not in seg.review_reason:
+                seg.review_reason.append("speaker_ambiguous")
 
 
 def _srt_time(sec: float) -> str:
@@ -138,6 +340,15 @@ def write_ass(
     else:
         font_size = max(int(s.get("min_font_size", 20)), int(video_height * float(s.get("font_size_ratio", 0.05))))
     title_font_size = int(title_height * scale) if title_height > 0 else font_size
+
+    default_style_clone = dict(s)
+    default_style_clone["font_size"] = font_size
+    speaker_name_to_style_name, speaker_style_lines = _build_speaker_style_map(s, default_style_clone)
+    max_edit_distance = 1
+    matching_cfg = s.get("speaker_style_matching", {})
+    if isinstance(matching_cfg, dict):
+        max_edit_distance = int(matching_cfg.get("max_edit_distance", 1))
+
     primary = str(s["primary_colour"])
     secondary = str(s["secondary_colour"])
     outline_c = str(s["outline_colour"])
@@ -184,11 +395,16 @@ def write_ass(
         "Alignment,MarginL,MarginR,MarginV,Encoding",
         f"Style: Default,{font_name},{font_size},{primary},{secondary},{outline_c},{back_c},"
         f"{b},{i},{u},{st},{sx},{sy},{sp},{a},{border},{outline_w},{shadow_w},2,{ml},{mr},{mv},1",
-        "",
-        "[Events]",
-        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
     ]
+    header.extend(speaker_style_lines)
+    header.extend(["", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"])
     events: list[str] = []
+
+    speaker_styles: dict[str, dict[str, Any]] = {}
+    raw_styles = s.get("speaker_styles", {})
+    if isinstance(raw_styles, dict):
+        speaker_styles = {k.strip(): v for k, v in raw_styles.items() if isinstance(v, dict) and k.strip()}
+
     for seg in segments:
         raw = seg.translation_subtitle or seg.text_original
         raw = _format_multiline_bracket_indent(raw, ass_mode=True)
@@ -211,10 +427,15 @@ def write_ass(
                     f"{speaker_override}{speaker_text}"
                 )
             continue
+        style_name = "Default"
+        if speaker_name_to_style_name and seg.speaker:
+            matched, ambiguous = _match_speaker_style(seg.speaker, speaker_styles, max_edit_distance)
+            if matched and not ambiguous:
+                style_name = speaker_name_to_style_name[matched]
         if text.strip():
             events.append(
                 "Dialogue: 0,"
-                f"{_ass_time(seg.time_start)},{_ass_time(seg.time_end)},Default,,0,0,0,,"
+                f"{_ass_time(seg.time_start)},{_ass_time(seg.time_end)},{style_name},,0,0,0,,"
                 f"{{\\an1\\pos({anchor_x},{anchor_y})}}{text}"
             )
     path.write_text("\n".join(header + events), encoding="utf-8")

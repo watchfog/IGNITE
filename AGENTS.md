@@ -54,6 +54,7 @@ python tools/debug_rapidocr_single_image.py \       # OCR 调试
 | `review_utils.py` | 78 | Review 元数据工具 (`_merge_review_reasons`、`_fill_short_false_gaps`、`_first_true_run_bounds`) |
 | `image_utils.py` | 77 | 图像裁剪/Base64/帧缓存加载 |
 | `log_utils.py` | 17 | 共享 `_log` / `set_log_file` |
+| `gui/` | — | GUI 子包：`profile.py`（Profile 编辑器）、`review.py`（字幕校对） |
 
 ### 模块依赖关系
 
@@ -99,7 +100,8 @@ pipeline.py  ← 编排入口，import 所有下层模块
 
 ### 配置系统
 
-- `config/general_config.yaml` — 全局默认配置（**唯一被 git 跟踪的 config 文件**）
+- `config/general_config.yaml` — 全局默认配置（**被 git 跟踪**）
+- `config/subtitle_style.yaml` — 字幕样式配置（字体、字号、颜色等，**被 git 跟踪**），含 `speaker_styles` 按角色名配置描边颜色，仅 ASS/硬字幕生效
 - Per-video 配置文件通过 `extends` 字段继承 `general_config.yaml`，覆盖 ROI 坐标等参数
 - API 密钥：在 `general_config.yaml` 的 `translation.api_key_file` 指向 `config/keys/` 下的文件（不是环境变量）
 - VLM 默认模型：Qwen 3.6 Plus，`responses` 模式，须支持视觉识别
@@ -124,6 +126,6 @@ pipeline.py  ← 编排入口，import 所有下层模块
 
 ## .gitignore 注意
 
-- `config/` 下仅跟踪 `general_config.yaml`，其他 config 文件被忽略
+- `config/` 下仅跟踪 `general_config.yaml` 和 `subtitle_style.yaml`，其他 config 文件被忽略
 - `tools/`、`outputs/`、`archive/`、`examples/` 仅保留 `.gitkeep`
 - 所有视频格式（mp4/avi/mov/mkv/webm）和 API 密钥文件均被忽略

@@ -34,9 +34,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 ROI_KEYS = ["name_roi", "dialogue_roi", "title_ocr_roi"]
 ROI_COLORS = {
-    "name_roi": "#ffbf00",
-    "dialogue_roi": "#0896e0",
-    "title_ocr_roi": "#c0c0c0",
+    "name_roi": "#ff8000",
+    "dialogue_roi": "#0168b7",
+    "title_ocr_roi": "#b0b9c0",
 }
 
 

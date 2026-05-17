@@ -210,6 +210,10 @@ python -m ignite.gui.review --cache [CACHE] --video [VIDEO] --config [CONFIG]
 
 如需生成内嵌硬字幕视频，点击 `生成内嵌字幕视频`，在弹出的对话框中配置编码选项后生成。
 
+字幕样式（字体、字号、颜色等）可在 `config/subtitle_style.yaml` 中配置，字号基于 `dialogue_roi` 高度自动计算。
+
+支持按 speaker（角色名）使用不同的描边颜色，仅对 ASS 和硬字幕生效（SRT 不支持样式）。在 `config/subtitle_style.yaml` 的 `speaker_styles` 下按角色名配置 `outline_colour` 即可。模糊匹配可处理 OCR 轻微错字。
+
 ![字幕结果](docs/images/subtitle_result.png)
 
 ## 命令行使用

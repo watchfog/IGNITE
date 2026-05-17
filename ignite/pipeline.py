@@ -69,7 +69,7 @@ from .review_utils import (
     _merge_review_reasons,
 )
 from .state_machine import StateMachineConfig, segment_from_metrics
-from .subtitle_export import write_ass, write_srt
+from .subtitle_export import mark_ambiguous_speaker_segments, write_ass, write_srt
 from .translation_runtime import (
     BailianVlmTranslator,
     load_api_key,
@@ -1523,6 +1523,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         name_ocr.close()
 
     work_relative = str(run_cache_path.resolve().relative_to(output_dir.resolve()))
+    mark_ambiguous_speaker_segments(final_segments, subtitle_style)
     _dump_translation_cache(
         run_cache_path,
         video_path=str(args.video),
