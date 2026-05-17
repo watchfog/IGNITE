@@ -126,10 +126,15 @@ def write_ass(
     title_translation_location: list[int] | None = None,
     title_info_location: list[int] | None = None,
     style: dict[str, Any] | None = None,
+    *,
+    dialogue_height: int = 0,
 ) -> None:
     s = _merge_style(style)
     font_name = str(s["font_name"])
-    font_size = max(int(s["min_font_size"]), int(video_height * float(s["font_size_ratio"])))
+    if dialogue_height > 0:
+        font_size = max(int(s.get("min_font_size", 20)), dialogue_height // 2)
+    else:
+        font_size = max(int(s.get("min_font_size", 20)), int(video_height * float(s.get("font_size_ratio", 0.05))))
     primary = str(s["primary_colour"])
     secondary = str(s["secondary_colour"])
     outline_c = str(s["outline_colour"])
