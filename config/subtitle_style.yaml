@@ -4,7 +4,7 @@
 font_name: Microsoft YaHei
 # Font size is calculated from dialogue_roi height (two lines): height / 2 * scale.
 # Min ensures readability on very small ROIs.
-font_size_scale: 0.8
+font_size_scale: 0.5
 min_font_size: 20
 
 # ASS colour fields are in &HAABBGGRR format (alpha, blue, green, red).

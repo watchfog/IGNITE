@@ -348,7 +348,7 @@ def _resolve_run_prefix(args: argparse.Namespace) -> str:
 
 def run_pipeline(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[1]
     video_arg = str(getattr(args, "video", "") or "").strip()
     cfg_video = str(cfg.get("video_path", "") or "").strip()
     if not video_arg and not cfg_video:
