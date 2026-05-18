@@ -1183,7 +1183,10 @@ class ProfileEditor:
         if not bool(self.enable_name_ocr_var.get()):
             marker2_paths = self._parse_marker2_template_paths()
             if not marker2_paths:
-                errs.append("未启用OCR时必须配置 Marker2 模板。")
+                errs.append(
+                    "当前未启用 OCR，将使用 Marker2 判定对话出现；"
+                    "请配置 Marker2 模板，或勾选“启用OCR”。"
+                )
 
         self._ensure_output_name_default()
         if not self._sanitize_output_name(self.output_name_var.get()):
@@ -1403,12 +1406,13 @@ class ProfileEditor:
             cmd.append("--skip-translation")
         if bool(self.debug_mode_var.get()):
             cmd.append("--debug")
-        cmd.extend(
-            [
-                "--name-split-mode",
-                "ocr" if bool(self.enable_name_ocr_var.get()) else "mask",
-            ]
-        )
+        if "--subtitles-from-cache" not in extra_args:
+            cmd.extend(
+                [
+                    "--dialogue-presence-mode",
+                    "ocr" if bool(self.enable_name_ocr_var.get()) else "marker2",
+                ]
+            )
         return cmd
 
     def _open_video(self, video_path: str) -> None:

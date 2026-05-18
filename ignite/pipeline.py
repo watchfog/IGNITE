@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 import io
@@ -16,6 +17,7 @@ import numpy as np
 from PIL import Image
 
 from .cache_manager import (
+    _build_debug_subtitle,
     _dump_translation_cache,
     _extract_title_entries,
     _find_latest_translation_cache,
@@ -69,7 +71,7 @@ from .review_utils import (
     _merge_review_reasons,
 )
 from .state_machine import StateMachineConfig, segment_from_metrics
-from .subtitle_export import mark_ambiguous_speaker_segments, write_ass, write_srt
+from .subtitle_export import write_ass
 from .translation_runtime import (
     BailianVlmTranslator,
     load_api_key,
@@ -321,9 +323,7 @@ def _pick_sample_indices(frame_indices: list[int], max_candidates: int) -> list[
 
 def _backup_subtitles_to_work(output_dir: Path, work_dir: Path) -> None:
     files = [
-        "subtitles.srt",
         "subtitles.ass",
-        "subtitles_debug.srt",
         "subtitles_debug.ass",
     ]
     for name in files:
@@ -336,6 +336,18 @@ def _backup_subtitles_to_work(output_dir: Path, work_dir: Path) -> None:
             shutil.copy2(src, dst)
         except Exception as exc:
             _log(f"Warning: failed to backup subtitle {name} to work dir: {exc.__class__.__name__}")
+
+
+def _cleanup_obsolete_srt_outputs(output_dir: Path) -> None:
+    for name in ("subtitles.srt", "subtitles_debug.srt"):
+        path = output_dir / name
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+            _log(f"Removed obsolete SRT output: {path}")
+        except Exception as exc:
+            _log(f"Warning: failed to remove obsolete SRT {path}: {exc.__class__.__name__}")
 
 
 def _resolve_run_prefix(args: argparse.Namespace) -> str:
@@ -472,7 +484,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             cfg["roi"].get("title_info_roi", cfg["roi"].get("title_speaker_roi", subtitle_location)),
         )
         segs, dbg_segs = _segments_from_cache_entries(entries)
-        write_srt(segs, output_dir / "subtitles.srt")
+        _cleanup_obsolete_srt_outputs(output_dir)
         write_ass(
             segs,
             output_dir / "subtitles.ass",
@@ -485,9 +497,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             dialogue_height=dialogue_roi.height,
             title_height=title_ocr_roi.height,
         )
-        write_srt(dbg_segs, output_dir / "subtitles_debug.srt")
         write_ass(
-            dbg_segs,
+            segs,
             output_dir / "subtitles_debug.ass",
             video_width=video_meta.width,
             video_height=video_meta.height,
@@ -497,6 +508,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             style=subtitle_style,
             dialogue_height=dialogue_roi.height,
             title_height=title_ocr_roi.height,
+            debug_overlay_segments=dbg_segs,
         )
         _backup_subtitles_to_work(output_dir, work_dir)
         _log("Subtitles generated from translation cache.")
@@ -875,23 +887,18 @@ def run_pipeline(args: argparse.Namespace) -> int:
     if marker_score_ranges:
         _save_json(work_dir / "marker_score_cache.json", {"ranges": marker_score_ranges})
 
-    name_split_mode = str(getattr(args, "name_split_mode", "config") or "config").strip().lower()
-    split_name_enabled = bool(cfg["state_machine"].get("split_on_name_ocr", True))
-    if name_split_mode in {"mask", "ocr"}:
-        split_name_enabled = True
-    name_split_use_ocr = bool(cfg["state_machine"].get("name_split_use_ocr", True))
-    if name_split_mode == "mask":
-        name_split_use_ocr = False
-    elif name_split_mode == "ocr":
-        name_split_use_ocr = True
-
-    name_ocr: NameOcrRunner | None = None
-    if split_name_enabled and (not name_split_use_ocr) and marker2_matcher is None:
+    dialogue_presence_mode = str(getattr(args, "dialogue_presence_mode", "") or "").strip().lower()
+    if dialogue_presence_mode not in {"marker2", "ocr"}:
         raise RuntimeError(
-            "OCR disabled, but marker_2.template_paths are not configured. "
-            "Set marker_2 templates in profile editor or enable OCR."
+            "Missing --dialogue-presence-mode. Use 'marker2' or 'ocr' for normal pipeline runs."
         )
-    if split_name_enabled and (not name_split_use_ocr) and marker2_matcher is not None:
+    name_ocr: NameOcrRunner | None = None
+    if dialogue_presence_mode == "marker2":
+        if marker2_matcher is None:
+            raise RuntimeError(
+                "--dialogue-presence-mode marker2 requires marker_2.template_paths. "
+                "Set Marker2 templates in Profile Editor or use --dialogue-presence-mode ocr."
+            )
         _log("Refining segments by marker2 template presence (OCR disabled).")
         refined = []
         fast_frames = int(cfg["state_machine"].get("name_fast_check_frames", 5))
@@ -922,30 +929,28 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _log(f"Marker2 refine: {len(raw_segments)} -> {len(refined)} segments.")
         raw_segments = refined
         _save_json(raw_seg_json, raw_segments)
-    elif split_name_enabled:
+    elif dialogue_presence_mode == "ocr":
         ocr_engine = None
-        if name_split_use_ocr:
-            _log("Initializing OCR engine (name split verification).")
-            ocr_engine = build_ocr_engine(cfg["ocr"])
-            ocr_info = ocr_engine.info()
-            _log(
-                "OCR engine: "
-                f"{ocr_info.get('engine')} / runtime={ocr_info.get('runtime')} / "
-                f"target={ocr_info.get('target_lang')} / actual={ocr_info.get('actual_lang')} / "
-                f"charset={ocr_info.get('charset_size')}"
+        _log("Initializing OCR engine (dialogue presence verification).")
+        ocr_engine = build_ocr_engine(cfg["ocr"])
+        ocr_info = ocr_engine.info()
+        _log(
+            "OCR engine: "
+            f"{ocr_info.get('engine')} / runtime={ocr_info.get('runtime')} / "
+            f"target={ocr_info.get('target_lang')} / actual={ocr_info.get('actual_lang')} / "
+            f"charset={ocr_info.get('charset_size')}"
+        )
+        if (
+            str(cfg["ocr"].get("rapidocr_rec_lang", "")).lower().startswith("japan")
+            and ocr_info.get("engine") == "rapidocr"
+            and ocr_info.get("actual_lang") == "non_japan_like"
+        ):
+            raise RuntimeError(
+                "OCR is configured for Japanese, but current RapidOCR model is non-Japanese. "
+                "Please provide Japanese OCR model files or switch to paddleocr_cli with --lang japan."
             )
-            if (
-                str(cfg["ocr"].get("rapidocr_rec_lang", "")).lower().startswith("japan")
-                and ocr_info.get("engine") == "rapidocr"
-                and ocr_info.get("actual_lang") == "non_japan_like"
-            ):
-                raise RuntimeError(
-                    "OCR is configured for Japanese, but current RapidOCR model is non-Japanese. "
-                    "Please provide Japanese OCR model files or switch to paddleocr_cli with --lang japan."
-                )
-        else:
-            _log("Name split mode: mask-only (OCR disabled).")
-        name_ocr_workers = int(cfg["ocr"].get("name_ocr_workers", 1)) if name_split_use_ocr else 1
+        name_split_use_ocr = True
+        name_ocr_workers = int(cfg["ocr"].get("name_ocr_workers", 1))
         name_ocr = NameOcrRunner(cfg["ocr"], ocr_engine, workers=name_ocr_workers)
         _log(f"Name split workers: {name_ocr.workers}; use_ocr={name_split_use_ocr}")
 
@@ -1102,7 +1107,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
         )
 
     final_segments: list[DialogueSegment] = []
-    debug_texts: list[str] = []
     _log("Running OCR fusion and translation.")
     vlm_history_enabled = bool(tr_cfg.get("history_enabled", False))
     vlm_history_n = int(tr_cfg.get("history_n", 5))
@@ -1198,6 +1202,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         line_count = 1
         seg = DialogueSegment(
             segment_id=i,
+            raw_id=marker_seg_id,
             frame_start=frame_start_abs,
             frame_end=frame_end_abs,
             time_start=float(raw["time_start"]),
@@ -1216,13 +1221,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
             needs_review=needs_review,
             review_reason=review_reasons,
         )
-        state_txt = "blank" if (not has_name) else "has_name=true"
-        debug_text = (
-            f"[DEBUG] {seg_label} (id={seg.segment_id}) "
-            f"{seg.time_start:.2f}-{seg.time_end:.2f}s "
-            f"{state_txt}"
+        debug_text = _build_debug_subtitle(
+            segment_id=seg.segment_id,
+            raw_id=seg.raw_id,
+            time_start=seg.time_start,
+            time_end=seg.time_end,
+            dialogue_type=seg.dialogue_type,
+            raw_seen_idx=marker_seen_idx,
+            raw_count=marker_count,
         )
-        debug_texts.append(debug_text)
         if args.skip_translation:
             seg.text_original = ""
             seg.speaker = ""
@@ -1277,10 +1284,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     seg.speaker = cached_speaker
                 seg.text_original = str(cached_item.get("text_original", "") or "")
                 seg.translation_subtitle = str(cached_item.get("translation_subtitle", "") or "")
-                cached_reasons = _coerce_review_reasons(cached_item.get("review_reason"))
-                if bool(cached_item.get("needs_review", False)) or cached_reasons:
-                    seg.needs_review = True
-                    seg.review_reason = _merge_review_reasons(seg.review_reason, cached_reasons)
+                cached_style = cached_item.get("subtitle_style")
+                seg.subtitle_style = copy.deepcopy(cached_style) if isinstance(cached_style, dict) else {}
                 _mark_kanji_overlap_for_review(seg)
                 cache_hit_count += 1
                 _log(
@@ -1523,15 +1528,14 @@ def run_pipeline(args: argparse.Namespace) -> int:
         name_ocr.close()
 
     work_relative = str(run_cache_path.resolve().relative_to(output_dir.resolve()))
-    mark_ambiguous_speaker_segments(final_segments, subtitle_style)
     _dump_translation_cache(
         run_cache_path,
         video_path=str(args.video),
         config_path=str(Path(args.config).resolve()),
         segments=final_segments,
-        debug_texts=debug_texts,
         prefix_entries=cache_prefix_entries,
         source_work_cache=work_relative,
+        subtitle_style_cfg=subtitle_style,
     )
     _log(f"Saved run cache: {run_cache_path}")
     if args.skip_translation:
@@ -1553,8 +1557,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return 0
     cache_sub_segments, cache_debug_segments = _segments_from_cache_entries(cache_entries_for_subs)
     _log(f"Generating subtitles from cache entries: {len(cache_entries_for_subs)}")
+    _cleanup_obsolete_srt_outputs(output_dir)
     if args.skip_translation:
-        write_srt(cache_debug_segments, output_dir / "subtitles.srt")
         write_ass(
             cache_debug_segments,
             output_dir / "subtitles.ass",
@@ -1567,8 +1571,20 @@ def run_pipeline(args: argparse.Namespace) -> int:
             dialogue_height=dialogue_roi.height,
             title_height=title_ocr_roi.height,
         )
+        write_ass(
+            cache_debug_segments,
+            output_dir / "subtitles_debug.ass",
+            video_width=video_meta.width,
+            video_height=video_meta.height,
+            subtitle_location=subtitle_location,
+            title_translation_location=title_translation_location,
+            title_info_location=title_info_location,
+            style=subtitle_style,
+            dialogue_height=dialogue_roi.height,
+            title_height=title_ocr_roi.height,
+            debug_overlay_segments=cache_debug_segments,
+        )
     else:
-        write_srt(cache_sub_segments, output_dir / "subtitles.srt")
         write_ass(
             cache_sub_segments,
             output_dir / "subtitles.ass",
@@ -1581,9 +1597,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             dialogue_height=dialogue_roi.height,
             title_height=title_ocr_roi.height,
         )
-        write_srt(cache_debug_segments, output_dir / "subtitles_debug.srt")
         write_ass(
-            cache_debug_segments,
+            cache_sub_segments,
             output_dir / "subtitles_debug.ass",
             video_width=video_meta.width,
             video_height=video_meta.height,
@@ -1593,6 +1608,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             style=subtitle_style,
             dialogue_height=dialogue_roi.height,
             title_height=title_ocr_roi.height,
+            debug_overlay_segments=cache_debug_segments,
         )
     _backup_subtitles_to_work(output_dir, work_dir)
 
@@ -1619,6 +1635,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         review_items.append(
             {
                 "segment_id": seg.segment_id,
+                "raw_id": seg.raw_id,
                 "time_start": seg.time_start,
                 "time_end": seg.time_end,
                 "speaker": seg.speaker,
@@ -1682,10 +1699,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable debug artifacts (marker_by_segment/name_by_segment and keep fine_* intermediates).",
     )
     parser.add_argument(
-        "--name-split-mode",
-        choices=["config", "mask", "ocr"],
-        default="config",
-        help="Name-region split verification mode. Use mask for no OCR, ocr for OCR confirmation.",
+        "--dialogue-presence-mode",
+        choices=["marker2", "ocr"],
+        default="",
+        help="How to suppress blank marker segments: marker2 template or name OCR. Required for normal runs.",
     )
     return parser
 

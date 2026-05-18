@@ -52,12 +52,14 @@ class DialogueSegment:
     translation_subtitle: str
     dialogue_type: str
     line_count_detected: int
+    raw_id: int | str = 0
     stable_frame_ids: list[int] = field(default_factory=list)
     keyframe_before: str = ""
     keyframe_stable: str = ""
     keyframe_after: str = ""
     needs_review: bool = False
     review_reason: list[str] = field(default_factory=list)
+    subtitle_style: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

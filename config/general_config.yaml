@@ -1,6 +1,6 @@
 general:
   # Whether to render a final hard-subtitled video after subtitle generation.
-  # false: only export subtitle files such as SRT / ASS.
+  # false: only export ASS subtitle files.
   render_video: false
   # Whether to enable online search capability in Bailian VLM requests.
   # Keep false unless the selected model / account path explicitly supports it.

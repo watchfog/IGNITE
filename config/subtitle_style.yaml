@@ -1,4 +1,4 @@
-# Subtitle style configuration for ASS/SRT output.
+# Subtitle style configuration for ASS output.
 # All values can be overridden in per-video config under the "subtitle_style" key.
 
 font_name: Microsoft YaHei
@@ -31,9 +31,20 @@ scale_y: 100
 spacing: 0
 angle: 0
 
-# Speaker 样式（仅对 ASS/硬字幕生效，不影响 SRT）
-# 匹配到 speaker 后会用对应 style 覆盖 outline_colour（描边颜色）。
-# 未匹配到的 speaker 或 title 段继续使用 Default 样式。
+# Debug 字幕顶部叠加层（仅 subtitles_debug.ass 使用）
+debug_overlay:
+  enabled: true
+  # 1.0 = same as regular dialogue subtitle font size.
+  font_size_scale: 1.0
+  top_margin: 40
+  primary_colour: "&H0000FFFF"      # yellow text
+  outline_colour: "&H00000000"      # black outline
+  outline: 2.0
+  shadow: 0.5
+
+# Speaker 样式（仅对 ASS/硬字幕生效）
+# 生成 translation_cache 时，匹配到 speaker 后会把对应 style 写入 entry.subtitle_style。
+# 未匹配到的 speaker 或 title 段会写入空 subtitle_style，并在 ASS 导出时使用默认样式。
 speaker_style_matching:
   enabled: true
   max_edit_distance: 1
