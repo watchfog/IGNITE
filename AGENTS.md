@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-IGNITE — 面向游戏剧情视频的字幕流水线 GUI 工具（OCR + VLM 识别/翻译 → 校对 → 导出 SRT/ASS）。纯 Python，Tkinter GUI。
+IGNITE — 面向游戏剧情视频的字幕流水线 GUI 工具（OCR + VLM 识别/翻译 → 校对 → 导出 ASS）。纯 Python，Tkinter GUI。
 
 ## 常用命令
 
@@ -13,7 +13,8 @@ python main.py                                    # 启动 Profile 编辑器 GUI
 python main.py --video <path> --config <path>      # 带参数启动
 
 python -m ignite.pipeline \  # 直接运行 pipeline（无 GUI）
-    --video <path> --config <path> --output-dir <path>
+    --video <path> --config <path> --output-dir <path> \
+    --dialogue-presence-mode <marker2|ocr>
 
 python -m ignite.gui.review --cache <path>   # 重新打开校对 GUI
 
@@ -42,7 +43,7 @@ python tools/debug_rapidocr_single_image.py \       # OCR 调试
 | `event_detect.py` | 450 | 帧差异计算、marker 模板匹配 (`MarkerTemplateMatcher`)、`score_frame`、`score_batch` |
 | `ocr_engines.py` | 156 | OCR 引擎 (`build_ocr_engine`，RapidOCR) |
 | `translation_runtime.py` | 1128 | VLM 翻译客户端 (`BailianVlmTranslator`) + `translate_segment_with_retry`、`normalize_quotes_for_subtitle` |
-| `subtitle_export.py` | 142 | SRT + ASS 字幕导出 + 多行括号缩进对齐 |
+| `subtitle_export.py` | 142 | ASS 字幕导出 + 多行括号缩进对齐 + debug overlay |
 | `config.py` | 114 | YAML 配置加载，支持 `extends` 深合并 |
 | `ffmpeg_utils.py` | 270 | FFmpeg/FFprobe 封装（取帧、视频信息）+ 统一四路输出 |
 | `datatypes.py` | 50 | 数据类：`VideoMeta`、`Roi`、`OcrResult`、`DialogueSegment` |
@@ -101,12 +102,28 @@ pipeline.py  ← 编排入口，import 所有下层模块
 ### 配置系统
 
 - `config/general_config.yaml` — 全局默认配置（**被 git 跟踪**）
-- `config/subtitle_style.yaml` — 字幕样式配置（字体、字号、颜色等，**被 git 跟踪**），含 `speaker_styles` 按角色名配置描边颜色，仅 ASS/硬字幕生效
+- `config/subtitle_style.yaml` — 字幕样式配置（字体、字号、颜色等，**被 git 跟踪**），含 `speaker_styles` 按角色名生成 cache entry 的 `subtitle_style`，仅 ASS/硬字幕生效
 - Per-video 配置文件通过 `extends` 字段继承 `general_config.yaml`，覆盖 ROI 坐标等参数
 - API 密钥：在 `general_config.yaml` 的 `translation.api_key_file` 指向 `config/keys/` 下的文件（不是环境变量）
 - VLM 默认模型：Qwen 3.6 Plus，`responses` 模式，须支持视觉识别
 
 ## 代码约定
+
+### review_reason / needs_review 规则
+
+- `needs_review` 和 `review_reason` **必须紧邻**（`needs_review` 在前，`review_reason` 在后），统一由 `_entry_with_review_metadata` 负责 pop 旧键后重新连续写入
+- **空 `review_reason` 不保留**：reasons 为空时，两个字段都会被移除（`cache_manager._cache_entry_with_review_metadata` 同样遵循）
+- **有 `review_reason` 必有 `needs_review: true`**：所有生成点（pipeline、_attach_review_metadata、_dump_translation_cache）均遵循此规则
+- `_attach_review_metadata` 已移除 `force_review` 参数：原因继承通过 `_merge_review_reasons` 完成，不需要单独 force 标记
+
+### Review GUI 高级编辑
+
+- **插入段**：前插/后插，非模态弹窗，支持联动主界面进度条和"设为段开始/结束"快捷键；自动分配 `raw_id="manual_insert"`，基于 speaker 生成 `subtitle_style`
+- **删除段**：确认后删除当前段，后续 `segment_id` 自动 -1
+- **合并段**：非模态弹窗，可编辑起止时间，支持来源选择下拉框（speaker/原文/译文/needs_review/style 各有 合并/保留当前段/保留上(下)一段 等选项），预览统一使用 `_build_merge_entry()` 构建完整 entry
+- **撤销/恢复**：undo/redo 栈，支持合并、插入、删除三种操作，新操作清空 redo 栈
+- **`segment_id` 自动顺延**：插入/删除时级联更新后续正编号段
+- **插入/合并额外review标记**：操作条复选框，默认关闭。勾选时才会在 `review_reason` 中追加 `manual_insert` / `manual_merge`
 
 ### 线程模型
 
@@ -122,7 +139,8 @@ pipeline.py  ← 编排入口，import 所有下层模块
 
 - 输出目录：`outputs/<名称>/`
 - 翻译缓存：`translation_cache_latest.json`（最新）和 `work/run_cache_<时间>/translation_cache.json`（仅保留 3 次）
-- 最终字幕：`subtitles.srt`、`subtitles.ass`、`subtitles_debug.srt`、`subtitles_debug.ass`
+- cache entry 使用 `raw_id` 记录原始 marker 粗分段 ID；新 cache 不写 `debug_subtitle`，`subtitles_debug.ass` 顶部 overlay 基于 `raw_id` 动态生成（旧 cache 的 `debug_subtitle` 仅兼容读取）
+- 最终字幕：`subtitles.ass`、`subtitles_debug.ass`（普通字幕 + 顶部 debug overlay）
 
 ## .gitignore 注意
 
