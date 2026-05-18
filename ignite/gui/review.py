@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import copy
 import json
 import re
 import shlex
@@ -12,15 +13,22 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+import yaml
 
 import cv2
 import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
+from ignite.cache_manager import (
+    MANUAL_INSERT_RAW_ID,
+    _debug_subtitle_from_entry,
+    _resolve_speaker_subtitle_style,
+)
 from ignite.config import load_config
 from ignite.event_detect import MarkerTemplateMatcher
+from ignite.review_utils import _merge_review_reasons
 from ignite.translation_runtime import (
     BailianVlmTranslator,
     has_kanji_overlap_from_original,
@@ -132,7 +140,10 @@ class CacheReviewApp:
         self._marker2_matcher: MarkerTemplateMatcher | None = None
         self._marker_roi: list[int] | None = None
         self._marker2_roi: list[int] | None = None
-        self._merge_undo: dict[str, Any] | None = None
+        self._undo_stack: list[dict[str, Any]] = []
+        self._redo_stack: list[dict[str, Any]] = []
+        self._insert_dialog: dict[str, Any] | None = None
+        self.subtitle_style_cfg: dict[str, Any] | None = None
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -272,7 +283,18 @@ class CacheReviewApp:
         merge_bar.pack(fill=tk.X, pady=(2, 0))
         ttk.Button(merge_bar, text="合并上一段", command=self._merge_with_prev).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(merge_bar, text="合并下一段", command=self._merge_with_next).pack(side=tk.LEFT, padx=2)
-        ttk.Button(merge_bar, text="撤回合并", command=self._undo_merge).pack(side=tk.LEFT, padx=2)
+        ttk.Button(merge_bar, text="前插入段", command=self._insert_before_segment).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Button(merge_bar, text="后插入段", command=self._insert_after_segment).pack(side=tk.LEFT, padx=2)
+        ttk.Button(merge_bar, text="删除当前段", command=self._delete_current_segment).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Button(merge_bar, text="撤回操作", command=self._undo_merge).pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Button(merge_bar, text="恢复操作", command=self._redo_operation).pack(side=tk.LEFT, padx=2)
+
+        self.auto_mark_manual_review = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            merge_bar,
+            text="插入/合并额外review标记",
+            variable=self.auto_mark_manual_review,
+        ).pack(side=tk.LEFT, padx=(14, 2))
         neighbor_preview = ttk.Frame(json_panel)
         neighbor_preview.pack(fill=tk.X, pady=(4, 6))
         for key, label in (("prev", "上一段"), ("next", "下一段")):
@@ -373,8 +395,9 @@ class CacheReviewApp:
             "speaker": str(speaker or base_entry.get("speaker", "")),
             "text_original": str(original or ""),
             "translation_subtitle": normalized,
-            "debug_subtitle": base_entry.get("debug_subtitle", ""),
         }
+        if "raw_id" in base_entry:
+            out["raw_id"] = base_entry.get("raw_id")
         reasons = self._entry_review_reasons(out)
         if reasons:
             out["needs_review"] = True
@@ -403,6 +426,7 @@ class CacheReviewApp:
         p = Path(self.config_var.get().strip() or self.config_path).resolve()
         self.config_path = p
         self.cfg = load_config(p)
+        self.subtitle_style_cfg = self._load_subtitle_style_cfg()
         self.translator = None
         tools_cfg = self.cfg.get("tools", {})
         ffmpeg_cfg = str(tools_cfg.get("ffmpeg_path", "") or "").strip()
@@ -442,6 +466,23 @@ class CacheReviewApp:
         self._load_marker_score_cache()
         self.status_var.set(f"已加载配置: {p}")
         self._refresh_canvas()
+
+    def _load_subtitle_style_cfg(self) -> dict[str, Any] | None:
+        subtitle_style: dict[str, Any] | None = None
+        style_path = ROOT / "config" / "subtitle_style.yaml"
+        if style_path.exists():
+            try:
+                loaded = yaml.safe_load(style_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    subtitle_style = loaded
+            except Exception:
+                subtitle_style = None
+        per_style = self.cfg.get("subtitle_style") if isinstance(self.cfg, dict) else None
+        if isinstance(per_style, dict):
+            if subtitle_style is None:
+                subtitle_style = {}
+            subtitle_style.update(per_style)
+        return subtitle_style
 
     def _init_marker_matchers(self) -> None:
         self._marker_matcher = None
@@ -656,7 +697,7 @@ class CacheReviewApp:
             return []
         translated = str(entry.get("translation_subtitle", "") or "").strip()
         original = str(entry.get("text_original", "") or "").strip()
-        debug_text = str(entry.get("debug_subtitle", "") or "").strip()
+        debug_text = _debug_subtitle_from_entry(entry).strip()
         reasons: list[str] = []
         if not translated:
             reasons.append("translation_missing")
@@ -693,9 +734,14 @@ class CacheReviewApp:
 
     def _entry_with_review_metadata(self, entry: dict[str, Any]) -> dict[str, Any]:
         reasons = self._entry_review_reasons(entry)
-        if self._entry_is_suspect(entry) or reasons:
+        if reasons:
+            entry.pop("review_reason", None)
             entry["needs_review"] = True
             entry["review_reason"] = reasons
+        else:
+            entry.pop("review_reason", None)
+            if not self._entry_is_suspect(entry):
+                entry.pop("needs_review", None)
         return entry
 
     def _rebuild_suspect_indices(self) -> None:
@@ -940,16 +986,427 @@ class CacheReviewApp:
         self.status_var.set(f"已更新第 {self.current_index + 1} 段（内存）")
 
     def _merge_with_prev(self) -> None:
+        if self._block_if_insert_dialog_active():
+            return
         if self.current_index <= 0 or not self.entries:
             self.status_var.set("已是第一段，无法向前合并")
             return
         self._merge_segments(self.current_index - 1, self.current_index, self.current_index, "上一段")
 
     def _merge_with_next(self) -> None:
+        if self._block_if_insert_dialog_active():
+            return
         if self.current_index >= len(self.entries) - 1 or not self.entries:
             self.status_var.set("已是最后一段，无法向后合并")
             return
         self._merge_segments(self.current_index, self.current_index + 1, self.current_index, "下一段")
+
+    def _block_if_insert_dialog_active(self) -> bool:
+        active = self._active_dialog_state()
+        if active is None:
+            return False
+        win = active.get("window")
+        try:
+            if win is not None:
+                win.lift()
+                win.focus_set()
+        except Exception:
+            pass
+        self.status_var.set("请先确认或取消插入段窗口")
+        return True
+
+    def _save_undo_snapshot(self, kind: str) -> None:
+        self._undo_stack.append(
+            {
+                "kind": kind,
+                "entries": copy.deepcopy(self.entries),
+                "current_idx": self.current_index,
+            }
+        )
+        self._redo_stack.clear()
+
+    def _current_snapshot(self, kind: str) -> dict[str, Any]:
+        return {
+            "kind": kind,
+            "entries": copy.deepcopy(self.entries),
+            "current_idx": self.current_index,
+        }
+
+    def _restore_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self.entries = copy.deepcopy(snapshot.get("entries", []))
+        self._rebuild_suspect_indices()
+        self.current_index = max(0, min(int(snapshot.get("current_idx", 0)), len(self.entries) - 1))
+        self._show_segment(self.current_index)
+
+    def _undo_label(self, kind: str) -> str:
+        return (
+            "合并"
+            if kind == "merge"
+            else "插入"
+            if kind == "insert"
+            else "删除"
+            if kind == "delete"
+            else "操作"
+        )
+
+    def _insert_before_segment(self) -> None:
+        self._insert_segment(-1)
+
+    def _insert_after_segment(self) -> None:
+        self._insert_segment(1)
+
+    def _delete_current_segment(self) -> None:
+        if self._block_if_insert_dialog_active():
+            return
+        if not self.entries:
+            self.status_var.set("无分段，无法删除")
+            return
+        try:
+            self._save_current_entry()
+            idx = self.current_index
+            entry = self.entries[idx]
+            st, ed = self._entry_times(idx)
+            sid = entry.get("segment_id", idx + 1)
+            if not messagebox.askyesno(
+                "删除当前段",
+                f"确认删除 segment_id={sid} ({st:.2f}s-{ed:.2f}s)？\n可用“撤回操作”恢复。",
+                parent=self.root,
+            ):
+                return
+            deleted_sid = self._positive_segment_id(entry)
+            self._save_undo_snapshot("delete")
+            deleted = dict(entry)
+            self.entries = self.entries[:idx] + self.entries[idx + 1:]
+            if deleted_sid is not None:
+                self._shift_segment_ids_from_index(idx, delta=-1)
+            self._rebuild_suspect_indices()
+            self.current_index = max(0, min(idx, len(self.entries) - 1))
+            self._show_segment(self.current_index)
+            self.status_var.set(f"已删除 seg={deleted.get('segment_id')}（可撤回）")
+        except Exception as exc:
+            self.status_var.set(f"删除当前段失败: {exc}")
+
+    def _default_insert_times(self, direction: int) -> tuple[float, float]:
+        cur_st, cur_ed = self._entry_times(self.current_index)
+        if direction < 0:
+            end = max(0.0, cur_st)
+            prev_idx = self._neighbor_index_by_segment_id(-1)
+            if prev_idx is not None:
+                _, prev_ed = self._entry_times(prev_idx)
+                start = max(0.0, min(prev_ed, end))
+            else:
+                start = max(0.0, end - 1.0)
+            if end <= start:
+                start = max(0.0, end - 1.0)
+            return start, max(start, end)
+
+        start = max(0.0, cur_ed)
+        next_idx = self._neighbor_index_by_segment_id(1)
+        if next_idx is not None:
+            next_st, _ = self._entry_times(next_idx)
+            end = max(start, next_st)
+        else:
+            end = start + 1.0
+        if end <= start:
+            end = start + 1.0
+        return start, end
+
+    def _insert_segment(self, direction: int) -> None:
+        if not self.entries:
+            self.status_var.set("无分段，无法插入")
+            return
+        try:
+            active = self._active_dialog_state()
+            if active is not None:
+                win = active.get("window")
+                if win is not None:
+                    win.lift()
+                    win.focus_set()
+                self.status_var.set("已有插入段窗口，请先确认或取消")
+                return
+            self._save_current_entry()
+            anchor_idx = self.current_index
+            st, ed = self._default_insert_times(direction)
+            self._open_insert_dialog(
+                anchor_idx=anchor_idx,
+                st=st,
+                ed=ed,
+                direction=direction,
+            )
+        except Exception as exc:
+            self.status_var.set(f"插入段失败: {exc}")
+
+    def _active_dialog_state(self) -> dict[str, Any] | None:
+        if hasattr(self, "_active_dialog") and self._active_dialog:
+            win = self._active_dialog.get("window")
+            try:
+                if win is not None and win.winfo_exists():
+                    return self._active_dialog
+            except Exception:
+                pass
+            self._active_dialog = None
+            
+        state = self._insert_dialog
+        if not state:
+            return None
+        win = state.get("window")
+        try:
+            if win is not None and win.winfo_exists():
+                return state
+        except Exception:
+            pass
+        self._insert_dialog = None
+        return None
+
+    def _set_active_dialog_time(self, key: str, value: float) -> bool:
+        state = self._active_dialog_state()
+        if state is None:
+            return False
+            
+        # check merge dialog format
+        cb = state.get("on_time_capture")
+        if cb:
+            cb(key, value)
+            self.status_var.set(f"已将时间提取至弹窗 ({key}={float(value):.3f}s)")
+            return True
+            
+        # check insert dialog format
+        var = state.get("time_start_var" if key == "start" else "time_end_var")
+        if isinstance(var, tk.StringVar):
+            var.set(f"{float(value):.3f}")
+            self.status_var.set(f"已将弹窗{'开始' if key == 'start' else '结束'}时间设置为 {float(value):.3f}s")
+            return True
+            
+        return False
+
+    def _positive_segment_id(self, entry: dict[str, Any]) -> int | None:
+        try:
+            sid = int(entry.get("segment_id"))
+        except Exception:
+            return None
+        return sid if sid > 0 else None
+
+    def _insert_target_segment_id(self, anchor_idx: int, direction: int) -> int:
+        base_sid = self._positive_segment_id(self.entries[anchor_idx])
+        if base_sid is not None:
+            return base_sid if direction < 0 else base_sid + 1
+        positive_ids = [sid for e in self.entries if (sid := self._positive_segment_id(e)) is not None]
+        return min(positive_ids) if positive_ids else 1
+
+    def _shift_segment_ids_from_index(self, start_idx: int, *, delta: int = 1) -> None:
+        for entry in self.entries[max(0, int(start_idx)):]:
+            sid = self._positive_segment_id(entry)
+            if sid is not None:
+                new_sid = sid + int(delta)
+                if new_sid > 0:
+                    entry["segment_id"] = new_sid
+
+    def _speaker_choices(self) -> list[str]:
+        choices: list[str] = []
+        seen: set[str] = set()
+        for entry in self.entries:
+            speaker = str(entry.get("speaker", "") or "").strip()
+            if not speaker or speaker in seen:
+                continue
+            choices.append(speaker)
+            seen.add(speaker)
+        return choices
+
+    def _subtitle_style_for_speaker(self, speaker: str, dialogue_type: str) -> tuple[dict[str, Any], list[str]]:
+        dt = str(dialogue_type or "").strip().lower()
+        if dt in {"blank_no_name", "blank", "title"}:
+            return {}, []
+        style, ambiguous = _resolve_speaker_subtitle_style(speaker, self.subtitle_style_cfg)
+        return style, ["speaker_style_ambiguous"] if ambiguous else []
+
+    def _make_title_entry(self, st: float, ed: float, original: str, translated: str) -> dict[str, Any]:
+        return self._entry_with_review_metadata(
+            {
+                "segment_id": 0,
+                "raw_id": 0,
+                "time_start": float(st),
+                "time_end": float(ed),
+                "dialogue_type": "title",
+                "speaker": str(self.title_info_var.get() or "").strip(),
+                "text_original": str(original or "").strip(),
+                "translation_subtitle": normalize_quotes_for_subtitle(str(translated or "").strip()),
+            }
+        )
+
+    def _open_insert_dialog(
+        self,
+        *,
+        anchor_idx: int,
+        st: float,
+        ed: float,
+        direction: int,
+    ) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("插入段")
+        win.geometry("720x520")
+        win.transient(self.root)
+        win.resizable(True, True)
+
+        target_seg_id = self._insert_target_segment_id(anchor_idx, direction)
+        time_start_var = tk.StringVar(value=f"{float(st):.3f}")
+        time_end_var = tk.StringVar(value=f"{float(ed):.3f}")
+        type_var = tk.StringVar(value="speaker_dialogue")
+        base_speaker = str(self.entries[anchor_idx].get("speaker", "") or "").strip()
+        speaker_var = tk.StringVar(value=base_speaker)
+        speaker_choices = self._speaker_choices()
+
+        body = ttk.Frame(win, padding=8)
+        body.pack(fill=tk.BOTH, expand=True)
+        label = "当前段前" if direction < 0 else "当前段后"
+        ttk.Label(
+            body,
+            text=(
+                f"插入位置：{label}；新段 segment_id={target_seg_id}，"
+                "确认后后续非 Title 段会自动 +1；raw_id=manual_insert。"
+            ),
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        ttk.Label(body, text="开始(秒)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(body, textvariable=time_start_var, width=14).grid(row=1, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(body, text="结束(秒)").grid(row=1, column=2, sticky="w")
+        ttk.Entry(body, textvariable=time_end_var, width=14).grid(row=1, column=3, sticky="w", padx=(6, 0))
+
+        ttk.Label(body, text="类型").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            body,
+            textvariable=type_var,
+            values=["speaker_dialogue", "blank_no_name"],
+            state="readonly",
+            width=18,
+        ).grid(row=2, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Label(body, text="speaker").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            body,
+            textvariable=speaker_var,
+            values=speaker_choices,
+            width=14,
+        ).grid(row=2, column=3, sticky="ew", padx=(6, 0), pady=(8, 0))
+
+        ttk.Label(body, text="原文").grid(row=3, column=0, sticky="nw", pady=(8, 0))
+        original_text = tk.Text(body, height=5, wrap=tk.WORD, font=("Consolas", 10))
+        original_text.grid(row=3, column=1, columnspan=3, sticky="nsew", padx=(6, 0), pady=(8, 0))
+
+        ttk.Label(body, text="译文").grid(row=4, column=0, sticky="nw", pady=(8, 0))
+        translation_text = tk.Text(body, height=5, wrap=tk.WORD, font=("Consolas", 10))
+        translation_text.grid(row=4, column=1, columnspan=3, sticky="nsew", padx=(6, 0), pady=(8, 0))
+
+        ttk.Label(body, text="预览").grid(row=5, column=0, sticky="nw", pady=(8, 0))
+        preview_text = tk.Text(body, height=8, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED, bg="#f5f5f5")
+        preview_text.grid(row=5, column=1, columnspan=3, sticky="nsew", padx=(6, 0), pady=(8, 0))
+        body.columnconfigure(3, weight=1)
+        body.rowconfigure(3, weight=1)
+        body.rowconfigure(4, weight=1)
+        body.rowconfigure(5, weight=1)
+
+        def _build_entry() -> dict[str, Any]:
+            start = self._parse_time_input(time_start_var.get())
+            end = self._parse_time_input(time_end_var.get())
+            if end < start:
+                raise RuntimeError("结束时间必须大于等于开始时间")
+            dialogue_type = str(type_var.get() or "speaker_dialogue").strip()
+            speaker = str(speaker_var.get() or "").strip()
+            original = original_text.get("1.0", tk.END).strip()
+            translation = normalize_quotes_for_subtitle(translation_text.get("1.0", tk.END).strip())
+            if dialogue_type == "blank_no_name":
+                speaker = ""
+                original = ""
+                translation = ""
+            subtitle_style, style_reasons = self._subtitle_style_for_speaker(speaker, dialogue_type)
+            review_reasons: list[str] = []
+            if self.auto_mark_manual_review.get():
+                review_reasons.append("manual_insert")
+            review_reasons.extend(style_reasons)
+            entry = {
+                "segment_id": target_seg_id,
+                "raw_id": MANUAL_INSERT_RAW_ID,
+                "time_start": float(start),
+                "time_end": float(end),
+                "dialogue_type": dialogue_type,
+                "speaker": speaker,
+                "text_original": original,
+                "translation_subtitle": translation,
+                "review_reason": review_reasons,
+                "subtitle_style": subtitle_style,
+            }
+            return self._entry_with_review_metadata(entry)
+
+        def _refresh_preview(*_: object) -> None:
+            try:
+                payload = _build_entry()
+                text = json.dumps(payload, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                text = f"预览失败: {exc}"
+            preview_text.configure(state=tk.NORMAL)
+            preview_text.delete("1.0", tk.END)
+            preview_text.insert("1.0", text)
+            preview_text.configure(state=tk.DISABLED)
+
+        def _on_ok() -> None:
+            try:
+                inserted = _build_entry()
+                self._save_current_entry()
+            except Exception as exc:
+                self.status_var.set(f"插入段参数无效: {exc}")
+                return
+            self._save_undo_snapshot("insert")
+            insert_idx = anchor_idx if direction < 0 else anchor_idx + 1
+            self._shift_segment_ids_from_index(insert_idx, delta=1)
+            self.entries = self.entries[:insert_idx] + [inserted] + self.entries[insert_idx:]
+            self.current_index = insert_idx
+            self._rebuild_suspect_indices()
+            label_text = "前" if direction < 0 else "后"
+            self._insert_dialog = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._show_segment(insert_idx)
+            self.status_var.set(
+                f"已在原第 {anchor_idx + 1} 段{label_text}插入 seg={inserted.get('segment_id')} "
+                f"({inserted.get('time_start'):.2f}s-{inserted.get('time_end'):.2f}s)（可撤回）"
+            )
+
+        def _on_cancel() -> None:
+            self._insert_dialog = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        for var in (time_start_var, time_end_var, type_var, speaker_var):
+            var.trace_add("write", _refresh_preview)
+        original_text.bind("<KeyRelease>", _refresh_preview)
+        translation_text.bind("<KeyRelease>", _refresh_preview)
+
+        btns = ttk.Frame(body)
+        btns.grid(row=6, column=0, columnspan=4, sticky="e", pady=(8, 0))
+        ttk.Button(btns, text="确认插入", command=_on_ok).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btns, text="取消", command=_on_cancel).pack(side=tk.RIGHT, padx=2)
+        win.protocol("WM_DELETE_WINDOW", _on_cancel)
+        win.bind("<Escape>", lambda _e: _on_cancel())
+        _refresh_preview()
+        self.root.update_idletasks()
+        win.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        ww = win.winfo_width()
+        wh = win.winfo_height()
+        px = rx + max(0, (rw - ww) // 2)
+        py = ry + max(0, (rh - wh) // 2)
+        win.geometry(f"{ww}x{wh}+{px}+{py}")
+        self._insert_dialog = {
+            "window": win,
+            "time_start_var": time_start_var,
+            "time_end_var": time_end_var,
+        }
+        win.focus_set()
 
     def _merge_segments(self, idx_a: int, idx_b: int, current_idx: int, label: str) -> None:
         self._save_current_entry()
@@ -975,55 +1432,98 @@ class CacheReviewApp:
                     dt_choices.append(dt)
             if dt_choices[0] != default_dt and len(dt_choices) > 1:
                 dt_choices.sort(key=lambda x: (x == "blank_no_name", x))
-        dbg_a = str(entry_a.get("debug_subtitle", "") or "")
-        dbg_b = str(entry_b.get("debug_subtitle", "") or "")
-        current_dbg = str(self.entries[current_idx].get("debug_subtitle", "") or "")
-        choices = self._ask_merge_options(
+        current_raw_id = self.entries[current_idx].get(
+            "raw_id",
+            self.entries[current_idx].get("segment_id", current_idx + 1),
+        )
+
+        def _on_merge_confirm(choices: dict[str, Any]) -> None:
+            speaker = choices["speaker"]
+            original = choices["original"]
+            translation = choices["translation"]
+            dialogue_type = choices.get("dialogue_type", default_dt)
+            if dialogue_type == "blank_no_name":
+                speaker = ""
+                original = ""
+                translation = ""
+            
+            st = choices.get("time_start", min(ts_a, ts_b))
+            ed = choices.get("time_end", max(te_a, te_b))
+            
+            reason_source = choices.get("reason_source", "合并")
+            style_source = choices.get("style_source", "重新生成")
+
+            new_speaker_style, speaker_style_reasons = self._subtitle_style_for_speaker(speaker, dialogue_type)
+            
+            # 1. Handle reasons
+            final_reasons: list[Any] = []
+            if self.auto_mark_manual_review.get():
+                final_reasons.append("manual_merge")
+            if reason_source == "合并":
+                final_reasons.extend(entry_a.get("review_reason") or [])
+                final_reasons.extend(entry_b.get("review_reason") or [])
+            elif reason_source == "保留当前段":
+                final_reasons.extend((entry_a if current_idx == idx_a else entry_b).get("review_reason") or [])
+            elif reason_source.startswith("保留"):
+                final_reasons.extend((entry_b if current_idx == idx_a else entry_a).get("review_reason") or [])
+            
+            # 2. Handle subtitle style (except colors)
+            base_style: dict[str, Any] = {}
+            if style_source == "保留当前段":
+                base_style = dict((entry_a if current_idx == idx_a else entry_b).get("subtitle_style") or {})
+            elif style_source.startswith("保留"):
+                base_style = dict((entry_b if current_idx == idx_a else entry_a).get("subtitle_style") or {})
+            elif style_source == "合并":
+                base_style = dict(entry_a.get("subtitle_style") or {})
+                base_style.update(entry_b.get("subtitle_style") or {})
+                
+            final_style = dict(base_style)
+            if style_source == "重新生成":
+                final_style = dict(new_speaker_style)
+                final_reasons.extend(speaker_style_reasons)
+            else:
+                color_keys = ["primary_colour", "secondary_colour", "outline_colour", "back_colour"]
+                for k in color_keys:
+                    if k in base_style:
+                        final_style.pop(k, None)
+                    if k in new_speaker_style:
+                        final_style[k] = new_speaker_style[k]
+                        
+            merged_reasons_list = _merge_review_reasons(*final_reasons)
+            
+            merged: dict[str, Any] = dict(entry_a)
+            merged.update({
+                "segment_id": self.entries[current_idx].get("segment_id", current_idx + 1),
+                "raw_id": current_raw_id,
+                "time_start": float(st),
+                "time_end": float(ed),
+                "dialogue_type": dialogue_type,
+                "speaker": speaker,
+                "text_original": original,
+                "translation_subtitle": translation,
+                "subtitle_style": final_style,
+                "review_reason": merged_reasons_list,
+            })
+            merged = self._entry_with_review_metadata(merged)
+            self._save_undo_snapshot("merge")
+            new_entries = self.entries[:idx_a] + [merged] + self.entries[idx_b + 1:]
+            self.entries = new_entries
+            self._rebuild_suspect_indices()
+            self.current_index = max(0, min(idx_a, len(self.entries) - 1))
+            self._show_segment(self.current_index)
+            self.status_var.set(f"已合并 {label} → seg={merged.get('segment_id')} ({st:.2f}s-{ed:.2f}s)（可撤回）")
+
+        self._ask_merge_options(
             entry_a, entry_b, a_label, b_label,
+            current_idx_is_a=(current_idx == idx_a),
+            merge_dir_label=label,
             seg_id=self.entries[current_idx].get("segment_id", current_idx + 1),
+            raw_id=current_raw_id,
             st=min(ts_a, ts_b), ed=max(te_a, te_b),
             dialogue_type=default_dt,
             dt_choices=dt_choices,
-            dbg_a=dbg_a, dbg_b=dbg_b, current_dbg=current_dbg,
+            on_ok_callback=_on_merge_confirm,
         )
-        if choices is None:
-            return
-        speaker = choices["speaker"]
-        original = choices["original"]
-        translation = choices["translation"]
-        dialogue_type = choices.get("dialogue_type", default_dt)
-        if dialogue_type == "blank_no_name":
-            speaker = ""
-            original = ""
-            translation = ""
-            debug = dbg_a if dt_a == "blank_no_name" else dbg_b
-        else:
-            debug = current_dbg
-        st = min(ts_a, ts_b)
-        ed = max(te_a, te_b)
-        merged: dict[str, Any] = {
-            "segment_id": self.entries[current_idx].get("segment_id", current_idx + 1),
-            "time_start": float(st),
-            "time_end": float(ed),
-            "dialogue_type": dialogue_type,
-            "speaker": speaker,
-            "text_original": original,
-            "translation_subtitle": translation,
-            "debug_subtitle": debug,
-        }
-        merged = self._entry_with_review_metadata(merged)
-        self._merge_undo = {
-            "entries": [dict(entry_a), dict(entry_b)],
-            "idx_a": idx_a,
-            "idx_b": idx_b,
-            "current_idx": current_idx,
-        }
-        new_entries = self.entries[:idx_a] + [merged] + self.entries[idx_b + 1:]
-        self.entries = new_entries
-        self._rebuild_suspect_indices()
-        self.current_index = max(0, min(idx_a, len(self.entries) - 1))
-        self._show_segment(self.current_index)
-        self.status_var.set(f"已合并 {label} → seg={merged.get('segment_id')} ({st:.2f}s-{ed:.2f}s)（可撤回）")
 
     def _ask_merge_options(
         self,
@@ -1032,21 +1532,22 @@ class CacheReviewApp:
         a_label: str,
         b_label: str,
         *,
+        current_idx_is_a: bool,
+        merge_dir_label: str,
         seg_id: int | str,
+        raw_id: Any,
         st: float,
         ed: float,
         dialogue_type: str,
         dt_choices: list[str] | None = None,
-        dbg_a: str = "",
-        dbg_b: str = "",
-        current_dbg: str = "",
-    ) -> dict[str, str] | None:
-        result: dict[str, str | None] = {"speaker": None, "original": None, "translation": None, "dialogue_type": None}
+        on_ok_callback: Callable[[dict[str, Any]], None],
+    ) -> None:
+        result: dict[str, Any] = {"speaker": None, "original": None, "translation": None, "dialogue_type": None}
         win = tk.Toplevel(self.root)
         win.title("合并选项")
-        win.geometry("680x400")
+        win.geometry("780x600")
         win.transient(self.root)
-        win.resizable(False, False)
+        win.resizable(True, True)
 
         spk_a = str(entry_a.get("speaker", "") or "").strip()
         spk_b = str(entry_b.get("speaker", "") or "").strip()
@@ -1055,104 +1556,242 @@ class CacheReviewApp:
         trans_a = str(entry_a.get("translation_subtitle", "") or "").strip()
         trans_b = str(entry_b.get("translation_subtitle", "") or "").strip()
 
+        def _join_non_empty(a_val: str, b_val: str) -> str:
+            if a_val and b_val:
+                return a_val + "\n" + b_val
+            return a_val or b_val
+
         body = ttk.Frame(win, padding=8)
         body.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(body, text=f"A: {a_label}").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
-        ttk.Label(body, text=f"B: {b_label}").grid(row=1, column=0, columnspan=2, sticky="w")
+        if current_idx_is_a:
+            name_a = "当前段"
+            name_b = merge_dir_label # "下一段"
+            opt_other = f"保留{merge_dir_label}"
+        else:
+            name_a = merge_dir_label # "上一段"
+            name_b = "当前段"
+            opt_other = f"保留{merge_dir_label}"
+            
+        ttk.Label(body, text=f"{name_a} (A): {a_label}").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        ttk.Label(body, text=f"{name_b} (B): {b_label}").grid(row=1, column=0, columnspan=4, sticky="w")
 
-        left = ttk.Frame(body)
-        left.grid(row=2, column=0, sticky="nw", pady=(8, 0))
-        right = ttk.Frame(body)
-        right.grid(row=2, column=1, sticky="nsew", padx=(16, 0), pady=(8, 0))
-        body.columnconfigure(0, weight=0)
-        body.columnconfigure(1, weight=1)
+        all_dt_choices: list[str] = []
+        for item in [dialogue_type, *(dt_choices or []), "speaker_dialogue", "blank_no_name"]:
+            if item and item not in all_dt_choices:
+                all_dt_choices.append(item)
+        type_var = tk.StringVar(value=dialogue_type)
+        speaker_var = tk.StringVar(value=(spk_a if current_idx_is_a else spk_b) or spk_a or spk_b)
+        speaker_choices = self._speaker_choices()
+        for speaker in (spk_a, spk_b):
+            if speaker and speaker not in speaker_choices:
+                speaker_choices.append(speaker)
+        speaker_source_var = tk.StringVar(value="保留当前段")
+        original_source_var = tk.StringVar(value="保留当前段")
+        translation_source_var = tk.StringVar(value="保留当前段")
+        reason_source_var = tk.StringVar(value="清除")
+        style_source_var = tk.StringVar(value="保留当前段")
 
-        vars_speaker = tk.StringVar(value="合并")
-        vars_content = tk.StringVar(value="合并")
-        options = ["合并", "保留A", "保留B"]
+        source_options = ["合并", "保留当前段", opt_other]
+        reason_options = ["合并", "保留当前段", opt_other, "清除"]
+        style_options = ["合并", "保留当前段", opt_other, "重新生成"]
 
-        row = 0
-        for name, var in [("Speaker", vars_speaker), ("原文+译文", vars_content)]:
-            ttk.Label(left, text=name).grid(row=row, column=0, sticky="w", pady=(4, 0))
-            ttk.Combobox(left, textvariable=var, values=options, state="readonly", width=14).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
-            row += 1
+        time_frame = ttk.Frame(body)
+        time_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(time_frame, text="开始(秒)").pack(side=tk.LEFT)
+        start_var = tk.StringVar(value=f"{st:.2f}")
+        ttk.Entry(time_frame, textvariable=start_var, width=10).pack(side=tk.LEFT, padx=(4, 16))
+        ttk.Label(time_frame, text="结束(秒)").pack(side=tk.LEFT)
+        end_var = tk.StringVar(value=f"{ed:.2f}")
+        ttk.Entry(time_frame, textvariable=end_var, width=10).pack(side=tk.LEFT, padx=(4, 0))
 
-        vars_type: tk.StringVar | None = None
-        if dt_choices and len(dt_choices) > 1:
-            vars_type = tk.StringVar(value=dialogue_type)
-            ttk.Label(left, text="类型").grid(row=row, column=0, sticky="w", pady=(4, 0))
-            ttk.Combobox(left, textvariable=vars_type, values=dt_choices, state="readonly", width=14).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
-            row += 1
+        ttk.Label(body, text="类型").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            body,
+            textvariable=type_var,
+            values=all_dt_choices,
+            state="readonly",
+            width=18,
+        ).grid(row=3, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+        ttk.Label(body, text="speaker").grid(row=3, column=2, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            body,
+            textvariable=speaker_var,
+            values=speaker_choices,
+            width=14,
+        ).grid(row=3, column=3, sticky="ew", padx=(6, 0), pady=(8, 0))
 
-        ttk.Label(right, text="预览").pack(anchor="w")
-        preview_text = tk.Text(right, height=14, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED, bg="#f5f5f5")
-        preview_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        source_frame = ttk.Frame(body)
+        source_frame.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        for label_text, var, opts in (
+            ("speaker", speaker_source_var, source_options),
+            ("原文", original_source_var, source_options),
+            ("译文", translation_source_var, source_options),
+            ("needs_review", reason_source_var, reason_options),
+            ("style", style_source_var, style_options),
+        ):
+            ttk.Label(source_frame, text=label_text).pack(side=tk.LEFT, padx=(0, 2))
+            ttk.Combobox(
+                source_frame,
+                textvariable=var,
+                values=opts,
+                state="readonly",
+                width=10,
+            ).pack(side=tk.LEFT, padx=(0, 6))
 
-        def _refresh_preview(*_: object) -> None:
-            def _pick(var: tk.StringVar, a_val: str, b_val: str) -> str:
-                v = var.get()
-                if v == "保留A":
-                    return a_val
-                if v == "保留B":
-                    return b_val
-                if a_val and b_val:
-                    return a_val + "\n" + b_val
-                return a_val or b_val
-            dt = vars_type.get() if vars_type else dialogue_type
+        ttk.Label(body, text="原文").grid(row=5, column=0, sticky="nw", pady=(8, 0))
+        original_text = tk.Text(body, height=5, wrap=tk.WORD, font=("Consolas", 10))
+        original_text.grid(row=5, column=1, columnspan=3, sticky="nsew", padx=(6, 0), pady=(8, 0))
+        original_text.insert("1.0", orig_a if current_idx_is_a else orig_b)
+
+        ttk.Label(body, text="译文").grid(row=6, column=0, sticky="nw", pady=(8, 0))
+        translation_text = tk.Text(body, height=5, wrap=tk.WORD, font=("Consolas", 10))
+        translation_text.grid(row=6, column=1, columnspan=3, sticky="nsew", padx=(6, 0), pady=(8, 0))
+        translation_text.insert("1.0", trans_a if current_idx_is_a else trans_b)
+
+        ttk.Label(body, text="预览").grid(row=7, column=0, sticky="nw", pady=(8, 0))
+        preview_text = tk.Text(body, height=8, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED, bg="#f5f5f5")
+        preview_text.grid(row=7, column=1, columnspan=3, sticky="nsew", padx=(6, 0), pady=(8, 0))
+        body.columnconfigure(3, weight=1)
+        body.rowconfigure(5, weight=1)
+        body.rowconfigure(6, weight=1)
+        body.rowconfigure(7, weight=1)
+
+        def _build_merge_entry() -> dict[str, Any]:
+            try:
+                curr_st = float(start_var.get() or "0")
+            except ValueError:
+                curr_st = st
+            try:
+                curr_ed = float(end_var.get() or "0")
+            except ValueError:
+                curr_ed = ed
+
+            dt = type_var.get()
             if dt == "blank_no_name":
                 s = ""
                 o = ""
                 t = ""
-                d = dbg_a if entry_a.get("dialogue_type", "") == "blank_no_name" else dbg_b
             else:
-                s = _pick(vars_speaker, spk_a, spk_b)
-                o = _pick(vars_content, orig_a, orig_b)
-                t = _pick(vars_content, trans_a, trans_b)
-                d = current_dbg
-            payload = {
+                s = str(speaker_var.get() or "").strip()
+                o = original_text.get("1.0", tk.END).strip()
+                t = normalize_quotes_for_subtitle(translation_text.get("1.0", tk.END).strip())
+
+            style, _ = self._subtitle_style_for_speaker(s, dt)
+            entry: dict[str, Any] = {
                 "segment_id": seg_id,
-                "time_start": st,
-                "time_end": ed,
+                "raw_id": raw_id,
+                "time_start": curr_st,
+                "time_end": curr_ed,
                 "dialogue_type": dt,
                 "speaker": s,
                 "text_original": o,
                 "translation_subtitle": t,
-                "debug_subtitle": d,
             }
-            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            if style:
+                entry["subtitle_style"] = style
+            return entry
+
+        def _refresh_preview(*_: object) -> None:
+            try:
+                payload = _build_merge_entry()
+                text = json.dumps(payload, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                text = f"预览失败: {exc}"
             preview_text.configure(state=tk.NORMAL)
             preview_text.delete("1.0", tk.END)
             preview_text.insert("1.0", text)
             preview_text.configure(state=tk.DISABLED)
 
-        vars_speaker.trace_add("write", _refresh_preview)
-        vars_content.trace_add("write", _refresh_preview)
-        if vars_type:
-            vars_type.trace_add("write", _refresh_preview)
+        def _source_value(source: str, a_val: str, b_val: str, current_val: str = "") -> str:
+            if source == "保留当前段":
+                return current_val
+            if source == opt_other:
+                return b_val if current_idx_is_a else a_val
+            return _join_non_empty(a_val, b_val)
+
+        def _apply_source_fields(*_: object) -> None:
+            c_spk = spk_a if current_idx_is_a else spk_b
+            c_orig = orig_a if current_idx_is_a else orig_b
+            c_trans = trans_a if current_idx_is_a else trans_b
+            
+            speaker_var.set(_source_value(speaker_source_var.get(), spk_a, spk_b, c_spk))
+            original_text.delete("1.0", tk.END)
+            original_text.insert("1.0", _source_value(original_source_var.get(), orig_a, orig_b, c_orig))
+            translation_text.delete("1.0", tk.END)
+            translation_text.insert("1.0", _source_value(translation_source_var.get(), trans_a, trans_b, c_trans))
+            _refresh_preview()
+
+        start_var.trace_add("write", _refresh_preview)
+        end_var.trace_add("write", _refresh_preview)
+        type_var.trace_add("write", _refresh_preview)
+        speaker_var.trace_add("write", _refresh_preview)
+        speaker_source_var.trace_add("write", _apply_source_fields)
+        original_source_var.trace_add("write", _apply_source_fields)
+        translation_source_var.trace_add("write", _apply_source_fields)
+        original_text.bind("<KeyRelease>", _refresh_preview)
+        translation_text.bind("<KeyRelease>", _refresh_preview)
 
         btns = ttk.Frame(body)
-        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        btns.grid(row=8, column=0, columnspan=4, sticky="e", pady=(8, 0))
+
+        def _on_time_capture_event(event_type: str, t: float) -> None:
+            if event_type == "start":
+                start_var.set(f"{t:.2f}")
+            elif event_type == "end":
+                end_var.set(f"{t:.2f}")
+
+        self._active_dialog = {
+            "window": win,
+            "on_time_capture": _on_time_capture_event,
+        }
 
         def _on_ok() -> None:
-            def _pick(var: tk.StringVar, a_val: str, b_val: str) -> str:
-                v = var.get()
-                if v == "保留A":
-                    return a_val
-                if v == "保留B":
-                    return b_val
-                if a_val and b_val:
-                    return a_val + "\n" + b_val
-                return a_val or b_val
-            result["speaker"] = _pick(vars_speaker, spk_a, spk_b)
-            result["original"] = _pick(vars_content, orig_a, orig_b)
-            result["translation"] = _pick(vars_content, trans_a, trans_b)
-            if vars_type:
-                result["dialogue_type"] = vars_type.get()
+            dt = type_var.get()
+            if dt == "blank_no_name":
+                result["speaker"] = ""
+                result["original"] = ""
+                result["translation"] = ""
+            else:
+                result["speaker"] = str(speaker_var.get() or "").strip()
+                result["original"] = original_text.get("1.0", tk.END).strip()
+                result["translation"] = normalize_quotes_for_subtitle(translation_text.get("1.0", tk.END).strip())
+            result["dialogue_type"] = dt
+            result["reason_source"] = reason_source_var.get()
+            result["style_source"] = style_source_var.get()
+            try:
+                result["time_start"] = float(start_var.get() or "0")
+            except ValueError:
+                result["time_start"] = st
+            try:
+                result["time_end"] = float(end_var.get() or "0")
+            except ValueError:
+                result["time_end"] = ed
             try:
                 win.destroy()
             except Exception:
                 pass
+            if hasattr(self, "_active_dialog") and self._active_dialog and self._active_dialog.get("window") == win:
+                self._active_dialog = None
+                
+            dt = result.get("dialogue_type") or ""
+            if dt == "blank_no_name":
+                if result.get("original") is None:
+                    return
+            elif result.get("speaker") is None:
+                return
+            
+            payload = {
+                "speaker": result.get("speaker") or "",
+                "original": result.get("original") or "",
+                "translation": result.get("translation") or "",
+                "dialogue_type": dt,
+                "reason_source": result.get("reason_source", "合并"),
+                "style_source": result.get("style_source", "重新生成"),
+                "time_start": result.get("time_start", st),
+                "time_end": result.get("time_end", ed),
+            }
+            on_ok_callback(payload)
 
         def _on_cancel() -> None:
             result["speaker"] = None
@@ -1160,11 +1799,15 @@ class CacheReviewApp:
                 win.destroy()
             except Exception:
                 pass
+            if self._active_dialog and self._active_dialog.get("window") == win:
+                self._active_dialog = None
 
-        ttk.Button(btns, text="确认合并", command=_on_ok).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(btns, text="取消", command=_on_cancel).pack(side=tk.RIGHT, padx=2)
         win.protocol("WM_DELETE_WINDOW", _on_cancel)
         win.bind("<Escape>", lambda _e: _on_cancel())
+        
+        ttk.Button(btns, text="确认合并", command=_on_ok).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btns, text="取消", command=_on_cancel).pack(side=tk.RIGHT, padx=2)
+        
         _refresh_preview()
         self.root.update_idletasks()
         win.update_idletasks()
@@ -1177,40 +1820,32 @@ class CacheReviewApp:
         px = rx + max(0, (rw - ww) // 2)
         py = ry + max(0, (rh - wh) // 2)
         win.geometry(f"{ww}x{wh}+{px}+{py}")
-        try:
-            win.grab_set()
-        except Exception:
-            pass
-        win.focus_set()
-        self.root.wait_window(win)
-        dt = result.get("dialogue_type") or ""
-        if dt == "blank_no_name":
-            if result["original"] is None:
-                return None
-        elif result["speaker"] is None:
-            return None
-        return {
-            "speaker": result["speaker"] or "",
-            "original": result["original"] or "",
-            "translation": result["translation"] or "",
-            "dialogue_type": dt,
-        }
+        
+        # Don't use grab_set() to allow non-modal behavior
+        # win.focus_set()
+        # No wait_window because it's non-modal
+        # self.root.wait_window(win)
+        pass
 
     def _undo_merge(self) -> None:
-        if self._merge_undo is None:
-            self.status_var.set("没有可撤回的合并操作")
+        if not self._undo_stack:
+            self.status_var.set("没有可撤回的操作")
             return
-        saved = self._merge_undo
-        idx_a = int(saved["idx_a"])
-        restored_a = dict(saved["entries"][0])
-        restored_b = dict(saved["entries"][1])
-        new_entries = self.entries[:idx_a] + [restored_a, restored_b] + self.entries[idx_a + 1:]
-        self.entries = new_entries
-        self._rebuild_suspect_indices()
-        self._merge_undo = None
-        self.current_index = max(0, min(int(saved.get("current_idx", idx_a)), len(self.entries) - 1))
-        self._show_segment(self.current_index)
-        self.status_var.set("已撤回合并")
+        saved = self._undo_stack.pop()
+        kind = str(saved.get("kind", "操作") or "操作")
+        self._redo_stack.append(self._current_snapshot(kind))
+        self._restore_snapshot(saved)
+        self.status_var.set(f"已撤回{self._undo_label(kind)}")
+
+    def _redo_operation(self) -> None:
+        if not self._redo_stack:
+            self.status_var.set("没有可恢复的操作")
+            return
+        saved = self._redo_stack.pop()
+        kind = str(saved.get("kind", "操作") or "操作")
+        self._undo_stack.append(self._current_snapshot(kind))
+        self._restore_snapshot(saved)
+        self.status_var.set(f"已恢复{self._undo_label(kind)}")
 
     def _save_cache_file(self, *, apply_current: bool = True) -> None:
         if apply_current:
@@ -1614,18 +2249,7 @@ class CacheReviewApp:
                 history_items=None,
                 custom_prompt=self._get_custom_prompt(),
             )
-            translated_text = normalize_quotes_for_subtitle(str(translated_text or "").strip())
-            title_entry: dict[str, Any] = {
-                "segment_id": 0,
-                "time_start": float(st),
-                "time_end": float(ed),
-                "dialogue_type": "title",
-                "speaker": str(self.title_info_var.get() or "").strip(),
-                "text_original": str(original_text or "").strip(),
-                "translation_subtitle": str(translated_text or "").strip(),
-                "debug_subtitle": "[TITLE]",
-            }
-            title_entry = self._entry_with_review_metadata(title_entry)
+            title_entry = self._make_title_entry(st, ed, str(original_text or ""), str(translated_text or ""))
             idx = self._upsert_title_entry(title_entry)
             self.last_review_result = dict(title_entry)
             self.root.after(
@@ -1645,17 +2269,7 @@ class CacheReviewApp:
             ed = self._parse_time_input(self.title_end_var.get())
             if ed < st:
                 raise RuntimeError("Title End 必须大于等于 Title Start")
-            title_entry: dict[str, Any] = {
-                "segment_id": 0,
-                "time_start": float(st),
-                "time_end": float(ed),
-                "dialogue_type": "title",
-                "speaker": str(self.title_info_var.get() or "").strip(),
-                "text_original": "",
-                "translation_subtitle": "",
-                "debug_subtitle": "[TITLE]",
-            }
-            title_entry = self._entry_with_review_metadata(title_entry)
+            title_entry = self._make_title_entry(st, ed, "", "")
             idx = self._upsert_title_entry(title_entry)
             self.last_review_result = dict(title_entry)
             self._show_segment(idx)
@@ -1907,13 +2521,15 @@ class CacheReviewApp:
         self._step_frames(-10)
 
     def _set_segment_start_to_current_time(self) -> None:
-        if not self.entries:
-            return
-        idx = self.current_index
         try:
             val = float(self.current_sec or 0.0)
         except Exception:
             return
+        if self._set_active_dialog_time("start", val):
+            return
+        if not self.entries:
+            return
+        idx = self.current_index
         entry = dict(self.entries[idx])
         entry["time_start"] = float(val)
         # preserve other metadata
@@ -1926,13 +2542,15 @@ class CacheReviewApp:
         self.status_var.set(f"已将第 {idx + 1} 段开始时间更新为 {val:.3f}s（内存）")
 
     def _set_segment_end_to_current_time(self) -> None:
-        if not self.entries:
-            return
-        idx = self.current_index
         try:
             val = float(self.current_sec or 0.0)
         except Exception:
             return
+        if self._set_active_dialog_time("end", val):
+            return
+        if not self.entries:
+            return
+        idx = self.current_index
         entry = dict(self.entries[idx])
         entry["time_end"] = float(val)
         self.entries[idx] = self._entry_with_review_metadata(entry)
@@ -2641,7 +3259,6 @@ class CacheReviewApp:
         e["speaker"] = str(self.last_review_result.get("speaker", "") or e.get("speaker", ""))
         e["text_original"] = str(self.last_review_result.get("text_original", "") or e.get("text_original", ""))
         e["translation_subtitle"] = str(self.last_review_result.get("translation_subtitle", "") or e.get("translation_subtitle", ""))
-        e["debug_subtitle"] = str(self.last_review_result.get("debug_subtitle", "") or e.get("debug_subtitle", ""))
         if bool(self.last_review_result.get("needs_review", False)):
             e["needs_review"] = True
         if self.last_review_result.get("review_reason"):
