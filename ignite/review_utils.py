@@ -39,9 +39,9 @@ def _merge_review_reasons(*values: Any) -> list[str]:
 def _attach_review_metadata(
     payload: dict[str, Any],
     reasons: list[str],
-    force_review: bool = False,
 ) -> dict[str, Any]:
-    if reasons or force_review:
+    if reasons:
+        payload.pop("review_reason", None)
         payload["needs_review"] = True
         payload["review_reason"] = reasons
     return payload

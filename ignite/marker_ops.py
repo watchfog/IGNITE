@@ -174,7 +174,7 @@ def _build_refined_subsegment(
         "marker_presence_threshold_used": marker_thr,
         "marker_seg_id": marker_seg_id,
     }
-    return _attach_review_metadata(out, reasons, force_review=bool(raw.get("needs_review", False)))
+    return _attach_review_metadata(out, reasons)
 
 
 def _split_segment_by_marker2(

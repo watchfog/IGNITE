@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,9 @@ from typing import Any
 from .datatypes import DialogueSegment
 from .review_utils import _merge_review_reasons
 from .translation_runtime import has_kanji_overlap_from_original, normalize_quotes_for_subtitle
+
+
+MANUAL_INSERT_RAW_ID = "manual_insert"
 
 
 def _load_json(path: Path) -> Any:
@@ -24,6 +28,59 @@ def _subtitle_cache_key(segment_id: int, time_start: float, time_end: float, dia
     st = int(round(float(time_start) * 1000))
     ed = int(round(float(time_end) * 1000))
     return f"id={int(segment_id)}|{st}-{ed}|{dialogue_type}"
+
+
+def _coerce_cache_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _build_debug_subtitle(
+    segment_id: int,
+    raw_id: Any,
+    time_start: float,
+    time_end: float,
+    dialogue_type: str,
+    *,
+    raw_seen_idx: int = 0,
+    raw_count: int = 1,
+) -> str:
+    dt = str(dialogue_type or "").strip().lower()
+    if dt == "title":
+        return "[TITLE]"
+    sid = _coerce_cache_int(segment_id, 0)
+    raw_text = str(raw_id or "").strip()
+    if raw_text == MANUAL_INSERT_RAW_ID:
+        label_base = "manual"
+    else:
+        label_base = f"seg {_coerce_cache_int(raw_id, sid)}"
+    label = label_base if int(raw_count) <= 1 else f"{label_base}-{int(raw_seen_idx)}"
+    state_txt = "blank" if dt in {"blank_no_name", "blank"} else "has_name=true"
+    return f"[DEBUG] {label} (id={sid}) {float(time_start):.2f}-{float(time_end):.2f}s {state_txt}"
+
+
+def _debug_subtitle_from_entry(
+    entry: dict[str, Any],
+    *,
+    default_segment_id: int = 0,
+    raw_seen_idx: int = 0,
+    raw_count: int = 1,
+) -> str:
+    legacy = str(entry.get("debug_subtitle", "") or "")
+    if legacy.strip():
+        return legacy
+    sid = _coerce_cache_int(entry.get("segment_id"), default_segment_id)
+    return _build_debug_subtitle(
+        segment_id=sid,
+        raw_id=entry.get("raw_id", sid),
+        time_start=float(entry.get("time_start", 0.0) or 0.0),
+        time_end=float(entry.get("time_end", entry.get("time_start", 0.0)) or 0.0),
+        dialogue_type=str(entry.get("dialogue_type", "speaker_dialogue") or "speaker_dialogue"),
+        raw_seen_idx=raw_seen_idx,
+        raw_count=raw_count,
+    )
 
 
 def _translation_cache_review_reasons(
@@ -50,23 +107,120 @@ def _translation_cache_review_reasons(
     return reasons
 
 
+_SPEAKER_NOISE_CHARS = set(" 　\n\r\t\u3000：:（）()「」『』【】\"'\"'｢｣“”‘’・．")
+
+
+def _normalize_speaker_name(raw: str) -> str:
+    text = unicodedata.normalize("NFKC", str(raw or ""))
+    return "".join(ch for ch in text if ch not in _SPEAKER_NOISE_CHARS)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            ins = cur[-1] + 1
+            dlt = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            cur.append(min(ins, dlt, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _copy_style(value: Any) -> dict[str, Any]:
+    return copy.deepcopy(value) if isinstance(value, dict) else {}
+
+
+def _resolve_speaker_subtitle_style(
+    speaker_raw: str,
+    subtitle_style_cfg: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    if not subtitle_style_cfg:
+        return {}, False
+    matching_cfg = subtitle_style_cfg.get("speaker_style_matching")
+    if isinstance(matching_cfg, dict) and not matching_cfg.get("enabled", True):
+        return {}, False
+    raw_styles = subtitle_style_cfg.get("speaker_styles")
+    if not isinstance(raw_styles, dict):
+        return {}, False
+    speaker_styles = {str(k).strip(): v for k, v in raw_styles.items() if str(k).strip() and isinstance(v, dict)}
+    if not speaker_styles:
+        return {}, False
+
+    normalized = _normalize_speaker_name(speaker_raw)
+    if not normalized:
+        return {}, False
+    if normalized in speaker_styles:
+        return _copy_style(speaker_styles[normalized]), False
+
+    norm_equal: list[str] = []
+    contains: list[str] = []
+    for key in speaker_styles:
+        nk = _normalize_speaker_name(key)
+        if normalized == nk:
+            norm_equal.append(key)
+        elif normalized in nk or nk in normalized:
+            contains.append(key)
+
+    if len(norm_equal) == 1:
+        return _copy_style(speaker_styles[norm_equal[0]]), False
+    if len(norm_equal) > 1:
+        return {}, True
+    if len(contains) == 1:
+        return _copy_style(speaker_styles[contains[0]]), False
+    if len(contains) > 1:
+        return {}, True
+
+    max_edit_distance = 1
+    if isinstance(matching_cfg, dict):
+        max_edit_distance = int(matching_cfg.get("max_edit_distance", 1))
+    best_keys: list[str] = []
+    best_dist = max_edit_distance + 1
+    for key in speaker_styles:
+        dist = _edit_distance(normalized, _normalize_speaker_name(key))
+        if dist < best_dist:
+            best_dist = dist
+            best_keys = [key]
+        elif dist == best_dist:
+            best_keys.append(key)
+
+    if best_dist <= max_edit_distance:
+        if len(best_keys) == 1:
+            return _copy_style(speaker_styles[best_keys[0]]), False
+        return {}, True
+    return {}, False
+
+
 def _cache_entry_with_review_metadata(entry: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(entry)
     out.pop("srt_start", None)
     out.pop("srt_end", None)
+    if "raw_id" not in out:
+        out["raw_id"] = _coerce_cache_int(out.get("segment_id"), 0)
+    debug_text = _debug_subtitle_from_entry(out)
+    out.pop("debug_subtitle", None)
     reasons = _merge_review_reasons(
         out.get("review_reason"),
         out.get("review_reasons"),
         _translation_cache_review_reasons(
             str(out.get("dialogue_type", "") or ""),
             out.get("translation_subtitle", ""),
-            out.get("debug_subtitle", ""),
+            debug_text,
             out.get("text_original", ""),
         ),
     )
-    if bool(out.get("needs_review", False)) or reasons:
+    if reasons:
+        out.pop("review_reason", None)
         out["needs_review"] = True
         out["review_reason"] = reasons
+    else:
+        out.pop("review_reason", None)
+        out.pop("needs_review", None)
     return out
 
 
@@ -91,18 +245,13 @@ def _load_translation_cache(path: Path) -> tuple[dict[str, dict[str, Any]], dict
         ts = float(e.get("time_start", 0.0) or 0.0)
         te = float(e.get("time_end", 0.0) or 0.0)
         dt = str(e.get("dialogue_type", "") or "")
-        dbg = str(e.get("debug_subtitle", "") or "")
         k1 = _subtitle_cache_key(sid, ts, te, dt)
         k2 = _subtitle_cache_key(0, ts, te, dt)
         payload = {
             "speaker": str(e.get("speaker", "") or ""),
             "text_original": original,
             "translation_subtitle": text,
-            "needs_review": bool(e.get("needs_review", False)),
-            "review_reason": _merge_review_reasons(
-                e.get("review_reason"),
-                _translation_cache_review_reasons(dt, text, dbg, original),
-            ),
+            "subtitle_style": _copy_style(e.get("subtitle_style")),
         }
         by_full_key[k1] = payload
         by_time_type[k2] = payload
@@ -114,34 +263,50 @@ def _dump_translation_cache(
     video_path: str,
     config_path: str,
     segments: list[DialogueSegment],
-    debug_texts: list[str],
     prefix_entries: list[dict[str, Any]] | None = None,
     source_work_cache: str | None = None,
+    subtitle_style_cfg: dict[str, Any] | None = None,
 ) -> None:
     entries: list[dict[str, Any]] = []
     if prefix_entries:
         entries.extend(_cache_entry_with_review_metadata(e) for e in prefix_entries)
-    for seg, dbg in zip(segments, debug_texts):
+    for seg in segments:
+        subtitle_style = _copy_style(seg.subtitle_style)
+        style_ambiguous = False
+        if not subtitle_style and str(seg.dialogue_type or "").strip().lower() not in {"blank_no_name", "blank", "title"}:
+            subtitle_style, style_ambiguous = _resolve_speaker_subtitle_style(
+                seg.speaker,
+                subtitle_style_cfg,
+            )
+        debug_text = _build_debug_subtitle(
+            segment_id=seg.segment_id,
+            raw_id=seg.raw_id or seg.segment_id,
+            time_start=seg.time_start,
+            time_end=seg.time_end,
+            dialogue_type=seg.dialogue_type,
+        )
         entry = {
             "segment_id": seg.segment_id,
+            "raw_id": seg.raw_id or seg.segment_id,
             "time_start": seg.time_start,
             "time_end": seg.time_end,
             "dialogue_type": seg.dialogue_type,
             "speaker": seg.speaker,
             "text_original": seg.text_original,
             "translation_subtitle": seg.translation_subtitle,
-            "debug_subtitle": dbg,
+            "subtitle_style": subtitle_style,
         }
         reasons = _merge_review_reasons(
             seg.review_reason,
+            ["speaker_style_ambiguous"] if style_ambiguous else [],
             _translation_cache_review_reasons(
                 seg.dialogue_type,
                 seg.translation_subtitle,
-                dbg,
+                debug_text,
                 seg.text_original,
             ),
         )
-        if seg.needs_review or reasons:
+        if reasons:
             entry["needs_review"] = True
             entry["review_reason"] = reasons
         entries.append(entry)
@@ -178,15 +343,33 @@ def _extract_title_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]
 def _segments_from_cache_entries(entries: list[dict[str, Any]]) -> tuple[list[DialogueSegment], list[DialogueSegment]]:
     segs: list[DialogueSegment] = []
     dbg_segs: list[DialogueSegment] = []
+    raw_ids: list[int | str] = []
+    raw_counts: dict[int | str, int] = {}
+    for i, e in enumerate(entries, start=1):
+        sid = _coerce_cache_int(e.get("segment_id"), i)
+        raw_id = e.get("raw_id", sid)
+        rid = MANUAL_INSERT_RAW_ID if str(raw_id or "").strip() == MANUAL_INSERT_RAW_ID else _coerce_cache_int(raw_id, sid)
+        raw_ids.append(rid)
+        raw_counts[rid] = raw_counts.get(rid, 0) + 1
+    raw_seen: dict[int | str, int] = {}
     for i, e in enumerate(entries, start=1):
         ts = float(e.get("time_start", 0.0))
         te = float(e.get("time_end", ts))
         text = normalize_quotes_for_subtitle(str(e.get("translation_subtitle", "") or ""))
-        dbg = str(e.get("debug_subtitle", "") or "")
-        sid = int(e.get("segment_id", i) or i)
+        sid = _coerce_cache_int(e.get("segment_id"), i)
+        raw_id = raw_ids[i - 1]
+        raw_seen_idx = raw_seen.get(raw_id, 0)
+        raw_seen[raw_id] = raw_seen_idx + 1
+        dbg = _debug_subtitle_from_entry(
+            e,
+            default_segment_id=sid,
+            raw_seen_idx=raw_seen_idx,
+            raw_count=raw_counts.get(raw_id, 1),
+        )
         dt = str(e.get("dialogue_type", "speaker_dialogue") or "speaker_dialogue")
         seg = DialogueSegment(
             segment_id=sid,
+            raw_id=raw_id,
             frame_start=0,
             frame_end=0,
             time_start=ts,
@@ -198,6 +381,7 @@ def _segments_from_cache_entries(entries: list[dict[str, Any]]) -> tuple[list[Di
             translation_subtitle=text,
             dialogue_type=dt,
             line_count_detected=max(1, text.count("\n") + 1) if text else 1,
+            subtitle_style=_copy_style(e.get("subtitle_style")),
         )
         dseg = copy.deepcopy(seg)
         dseg.translation_subtitle = dbg

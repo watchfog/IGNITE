@@ -763,7 +763,6 @@ def _normalize_name_subsegments_per_marker(
         return _attach_review_metadata(
             payload,
             _merge_review_reasons(*[p.get("review_reason") for p in parts]),
-            force_review=any(bool(p.get("needs_review", False)) for p in parts),
         )
 
     i = 0
