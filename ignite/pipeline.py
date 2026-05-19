@@ -84,7 +84,7 @@ def _roi_from_cfg(cfg: dict[str, Any], key: str) -> Roi:
     return Roi(int(v[0]), int(v[1]), int(v[2]), int(v[3]))
 
 
-def _collect_marker_templates(marker_cfg: dict[str, Any]) -> list[Path]:
+def _collect_marker_templates(marker_cfg: dict[str, Any], config_dir: Path | None = None) -> list[Path]:
     out: list[Path] = []
     seen: set[Path] = set()
 
@@ -100,7 +100,11 @@ def _collect_marker_templates(marker_cfg: dict[str, Any]) -> list[Path]:
         for v in tpl_paths:
             p = Path(str(v))
             if not p.is_absolute():
-                p = Path.cwd() / p
+                candidates = []
+                if config_dir is not None:
+                    candidates.append((config_dir / p).resolve())
+                candidates.append((Path.cwd() / p).resolve())
+                p = next((cand for cand in candidates if cand.exists()), candidates[0])
             _add(p)
     return out
 
@@ -577,7 +581,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         if marker_force_threshold is not None:
             marker_force_threshold = max(0.0, min(1.0, marker_force_threshold))
     if bool(marker_cfg.get("use_template", True)):
-        template_paths = _collect_marker_templates(marker_cfg)
+        template_paths = _collect_marker_templates(marker_cfg, Path(args.config).resolve().parent)
         if template_paths:
             marker_matcher = MarkerTemplateMatcher(
                 template_paths,
@@ -603,7 +607,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     marker2_threshold = float(marker2_cfg.get("force_threshold", marker2_cfg.get("presence_threshold", 0.1)))
     if bool(marker2_cfg.get("use_template", True)):
-        marker2_templates = _collect_marker_templates(marker2_cfg)
+        marker2_templates = _collect_marker_templates(marker2_cfg, Path(args.config).resolve().parent)
         if marker2_templates:
             v_shift = int(marker2_cfg.get("vertical_shift_px", 0))
             h_shift = int(marker2_cfg.get("horizontal_shift_px", 0))
