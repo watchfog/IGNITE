@@ -181,6 +181,7 @@ class ProfileEditor:
         self._applying_history = False
         self._profile_preview_after_id: str | None = None
         self._updating_profile_preview = False
+        self._dialog_dirs: dict[str, Path] = {}
         
         self._preview_seek_after_id: str | None = None
         self._last_preview_seek_ts = 0.0
@@ -201,6 +202,29 @@ class ProfileEditor:
         if str(video_path).strip() and Path(video_path).exists():
             self._open_video(video_path)
         self._refresh_canvas()
+
+    def _dialog_initial_dir(self, key: str, fallback: str | Path | None = None) -> str:
+        remembered = self._dialog_dirs.get(key)
+        if remembered is not None and remembered.exists():
+            return str(remembered)
+        base = Path(fallback).expanduser() if fallback else ROOT
+        try:
+            base = base.resolve()
+        except Exception:
+            base = ROOT
+        if base.is_file():
+            base = base.parent
+        if not base.exists():
+            base = ROOT
+        return str(base)
+
+    def _remember_dialog_dir(self, key: str, selected_path: str | Path) -> None:
+        path = Path(selected_path).expanduser()
+        try:
+            path = path.resolve()
+        except Exception:
+            return
+        self._dialog_dirs[key] = path if path.is_dir() else path.parent
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -457,9 +481,11 @@ class ProfileEditor:
     def _pick_video(self) -> None:
         p = filedialog.askopenfilename(
             title="选择视频",
+            initialdir=self._dialog_initial_dir("video", self.video_path_var.get().strip() or ROOT),
             filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
         )
         if p:
+            self._remember_dialog_dir("video", p)
             vp = Path(p).resolve()
             self.video_path_var.set(vp.as_posix())
             self._ensure_output_name_default(vp)
@@ -469,11 +495,14 @@ class ProfileEditor:
     def _pick_config(self) -> None:
         p = filedialog.askopenfilename(
             title="选择配置",
+            initialdir=self._dialog_initial_dir("config", self.config_path_var.get().strip() or (ROOT / "config")),
             filetypes=[("YAML", "*.yaml *.yml"), ("JSON", "*.json"), ("所有文件", "*.*")],
         )
         if p:
+            self._remember_dialog_dir("config", p)
             self.config_path_var.set(p)
             self._load_config_only()
+
     def _apply_video_to_current_profile(self, video_path: Path) -> None:
         raw_cfg = self.config_path_var.get().strip()
         if not raw_cfg:
@@ -564,13 +593,14 @@ class ProfileEditor:
         default_dir.mkdir(parents=True, exist_ok=True)
         save_path = filedialog.asksaveasfilename(
             title="新建配置",
-            initialdir=str(default_dir),
+            initialdir=self._dialog_initial_dir("config", default_dir),
             initialfile=self._default_profile_filename(),
             defaultextension=".yaml",
             filetypes=[("YAML", "*.yaml *.yml"), ("JSON", "*.json"), ("All Files", "*.*")],
         )
         if not save_path:
             return
+        self._remember_dialog_dir("config", save_path)
 
         out = Path(save_path).resolve()
         payload = self._empty_profile_payload()
@@ -586,11 +616,12 @@ class ProfileEditor:
         default_dir.mkdir(parents=True, exist_ok=True)
         src_path = filedialog.askopenfilename(
             title="选择要导入的现有配置",
-            initialdir=str(default_dir),
+            initialdir=self._dialog_initial_dir("config", default_dir),
             filetypes=[("YAML", "*.yaml *.yml"), ("JSON", "*.json"), ("All Files", "*.*")],
         )
         if not src_path:
             return
+        self._remember_dialog_dir("config", src_path)
         try:
             payload = _load_raw_cfg(Path(src_path).resolve())
             if not isinstance(payload, dict):
@@ -600,13 +631,14 @@ class ProfileEditor:
             return
         save_path = filedialog.asksaveasfilename(
             title="另存为新的配置",
-            initialdir=str(default_dir),
+            initialdir=self._dialog_initial_dir("config", default_dir),
             initialfile=self._default_profile_filename(),
             defaultextension=".yaml",
             filetypes=[("YAML", "*.yaml *.yml"), ("JSON", "*.json"), ("All Files", "*.*")],
         )
         if not save_path:
             return
+        self._remember_dialog_dir("config", save_path)
 
         self._apply_selected_video_to_payload(payload)
         self._remove_imported_marker_config(payload)
@@ -956,13 +988,14 @@ class ProfileEditor:
         else:
             save_path = filedialog.asksaveasfilename(
                 title="另存为修复后视频",
-                initialdir=str(src.parent),
+                initialdir=self._dialog_initial_dir("repair_video", src.parent),
                 initialfile=f"{src.stem}_repaired{src.suffix}",
                 defaultextension=src.suffix or ".mp4",
                 filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
             )
             if not save_path:
                 return
+            self._remember_dialog_dir("repair_video", save_path)
             out = Path(save_path).resolve()
             if out == src:
                 self.status_var.set("另存为路径不能与原视频相同，请选择替换原视频模式。")
@@ -1931,10 +1964,12 @@ class ProfileEditor:
     def _pick_templates(self) -> None:
         paths = filedialog.askopenfilenames(
             title="选择 Marker 模板（可多选）",
+            initialdir=self._dialog_initial_dir("marker_templates", ROOT / "config"),
             filetypes=[("图像文件", "*.png *.jpg *.jpeg *.bmp *.webp"), ("所有文件", "*.*")],
         )
         if not paths:
             return
+        self._remember_dialog_dir("marker_templates", paths[0])
         vals = [self._to_cfg_path(Path(p).resolve()) for p in paths]
         self.template_paths_var.set(";".join(vals))
         self._record_history()
@@ -1943,10 +1978,12 @@ class ProfileEditor:
     def _pick_marker2_templates(self) -> None:
         paths = filedialog.askopenfilenames(
             title="选择 Marker2 模板（可多选）",
+            initialdir=self._dialog_initial_dir("marker2_templates", ROOT / "config"),
             filetypes=[("图像文件", "*.png *.jpg *.jpeg *.bmp *.webp"), ("所有文件", "*.*")],
         )
         if not paths:
             return
+        self._remember_dialog_dir("marker2_templates", paths[0])
         vals = [self._to_cfg_path(Path(p).resolve()) for p in paths]
         self.marker2_template_paths_var.set(";".join(vals))
         self._record_history()
@@ -2013,13 +2050,20 @@ class ProfileEditor:
         save_path = filedialog.asksaveasfilename(
             title=title,
             defaultextension=".png",
-            initialdir=str(default_dir),
+            initialdir=self._dialog_initial_dir(
+                "marker2_templates" if roi_key == "marker_2_roi" else "marker_templates",
+                default_dir,
+            ),
             initialfile=default_name,
             filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg"), ("所有文件", "*.*")],
         )
         if not save_path:
             self._remove_empty_created_dir(default_dir, created_default_dir)
             return
+        self._remember_dialog_dir(
+            "marker2_templates" if roi_key == "marker_2_roi" else "marker_templates",
+            save_path,
+        )
         out = Path(save_path).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(out), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)):

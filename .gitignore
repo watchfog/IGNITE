@@ -35,9 +35,8 @@ outputs/*
 # Ignore vs code settings
 .vscode/*
 
-# Ignore archived files
+# Archive lives outside the repository; ignore any accidental local copy.
 archive/
-!archive/.gitkeep
 
 # Ignore video files
 *.mp4

@@ -77,6 +77,8 @@ python main.py --video [VIDEO] --config [PROFILE] --output-dir [NAME]
 
 也可以不指定参数，直接运行 `python main.py` 启动 GUI 后再选择视频和配置文件。
 
+文件选择对话框会按用途独立记忆本次运行中的目录，例如视频、配置、Marker 模板和输出视频互不影响。
+
 ### 2. 在 Profile 编辑器 GUI 中进行配置
 
 不传入参数时的 GUI 界面如下

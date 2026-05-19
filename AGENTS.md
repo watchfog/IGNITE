@@ -145,5 +145,6 @@ pipeline.py  ← 编排入口，import 所有下层模块
 ## .gitignore 注意
 
 - `config/` 下仅跟踪 `general_config.yaml` 和 `subtitle_style.yaml`，其他 config 文件被忽略
-- `tools/`、`outputs/`、`archive/`、`examples/` 仅保留 `.gitkeep`
+- `tools/`、`outputs/`、`examples/` 仅保留 `.gitkeep`
+- `archive/` 已移出仓库；仓库内若出现同名目录会被忽略
 - 所有视频格式（mp4/avi/mov/mkv/webm）和 API 密钥文件均被忽略

@@ -144,6 +144,7 @@ class CacheReviewApp:
         self._redo_stack: list[dict[str, Any]] = []
         self._insert_dialog: dict[str, Any] | None = None
         self.subtitle_style_cfg: dict[str, Any] | None = None
+        self._dialog_dirs: dict[str, Path] = {}
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -156,6 +157,29 @@ class CacheReviewApp:
         self._show_segment(0, request_prefetch=False)
         if self.cap is not None and self.entries:
             self._request_prefetch(0)
+
+    def _dialog_initial_dir(self, key: str, fallback: str | Path | None = None) -> str:
+        remembered = self._dialog_dirs.get(key)
+        if remembered is not None and remembered.exists():
+            return str(remembered)
+        base = Path(fallback).expanduser() if fallback else ROOT
+        try:
+            base = base.resolve()
+        except Exception:
+            base = ROOT
+        if base.is_file():
+            base = base.parent
+        if not base.exists():
+            base = ROOT
+        return str(base)
+
+    def _remember_dialog_dir(self, key: str, selected_path: str | Path) -> None:
+        path = Path(selected_path).expanduser()
+        try:
+            path = path.resolve()
+        except Exception:
+            return
+        self._dialog_dirs[key] = path if path.is_dir() else path.parent
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -1993,24 +2017,26 @@ class CacheReviewApp:
         def _browse_ffmpeg() -> None:
             p = filedialog.askopenfilename(
                 title="选择 ffmpeg",
-                initialdir=str(self.ffmpeg_path.parent if self.ffmpeg_path else ROOT),
+                initialdir=self._dialog_initial_dir("ffmpeg", self.ffmpeg_path.parent if self.ffmpeg_path else ROOT),
                 filetypes=[("ffmpeg", "*.exe"), ("所有文件", "*.*")],
                 parent=win,
             )
             if p:
+                self._remember_dialog_dir("ffmpeg", p)
                 self.embed_ffmpeg_path_var.set(str(Path(p).resolve()))
 
         def _browse_output() -> None:
             cur = Path(self.embed_output_path_var.get().strip() or self._default_embed_output_path())
             p = filedialog.asksaveasfilename(
                 title="保存内嵌字幕视频",
-                initialdir=str(cur.parent),
+                initialdir=self._dialog_initial_dir("embed_output", cur.parent),
                 initialfile=cur.name,
                 defaultextension=".mp4",
                 filetypes=[("MP4", "*.mp4"), ("所有文件", "*.*")],
                 parent=win,
             )
             if p:
+                self._remember_dialog_dir("embed_output", p)
                 self.embed_output_path_var.set(str(Path(p).resolve()))
 
         def _set_cpu_x264() -> None:
