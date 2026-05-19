@@ -29,6 +29,13 @@ from ignite.cache_manager import (
 )
 from ignite.config import load_config
 from ignite.event_detect import MarkerTemplateMatcher
+from ignite.gui.local_state import (
+    load_dialog_dirs,
+    load_window_state,
+    related_dialog_dir,
+    remember_dialog_dir,
+    remember_window_state,
+)
 from ignite.review_utils import _merge_review_reasons
 from ignite.translation_runtime import (
     BailianVlmTranslator,
@@ -58,6 +65,7 @@ class CacheReviewApp:
         self.root = tk.Tk()
         self.root.title("字幕校对工具 - IGNITE")
         self.root.geometry("1900x1020")
+        self._restore_window_geometry()
 
         self.status_var = tk.StringVar(value="就绪")
         self.seg_info_var = tk.StringVar(value="-")
@@ -145,8 +153,10 @@ class CacheReviewApp:
         self._redo_stack: list[dict[str, Any]] = []
         self._insert_dialog: dict[str, Any] | None = None
         self.subtitle_style_cfg: dict[str, Any] | None = None
-        self._dialog_dirs: dict[str, Path] = {}
+        self._dialog_dirs: dict[str, Path] = load_dialog_dirs()
         self.show_all_rois = tk.BooleanVar(value=False)
+        self._body_paned: ttk.Panedwindow | None = None
+        self._stack_paned: ttk.Panedwindow | None = None
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -159,11 +169,15 @@ class CacheReviewApp:
         self._show_segment(0, request_prefetch=False)
         if self.cap is not None and self.entries:
             self._request_prefetch(0)
+        self.root.after(100, self._restore_window_layout)
 
     def _dialog_initial_dir(self, key: str, fallback: str | Path | None = None) -> str:
         remembered = self._dialog_dirs.get(key)
         if remembered is not None and remembered.exists():
             return str(remembered)
+        related = related_dialog_dir(self._dialog_dirs, key)
+        if related is not None:
+            return str(related)
         base = Path(fallback).expanduser() if fallback else ROOT
         try:
             base = base.resolve()
@@ -176,12 +190,60 @@ class CacheReviewApp:
         return str(base)
 
     def _remember_dialog_dir(self, key: str, selected_path: str | Path) -> None:
-        path = Path(selected_path).expanduser()
+        remembered = remember_dialog_dir(key, selected_path, self._dialog_dirs)
+        if remembered is not None:
+            self._dialog_dirs[key] = remembered
+
+    def _restore_window_geometry(self) -> None:
+        state = load_window_state("review")
+        geometry = str(state.get("geometry", "") or "").strip()
+        if geometry:
+            try:
+                self.root.geometry(geometry)
+            except Exception:
+                pass
+        if str(state.get("state", "") or "").strip() == "zoomed":
+            self.root.after_idle(lambda: self._set_root_state("zoomed"))
+
+    def _set_root_state(self, state: str) -> None:
         try:
-            path = path.resolve()
+            self.root.state(state)
         except Exception:
+            pass
+
+    def _restore_window_layout(self) -> None:
+        state = load_window_state("review")
+        layout = state.get("layout")
+        if not isinstance(layout, dict):
             return
-        self._dialog_dirs[key] = path if path.is_dir() else path.parent
+        self.root.update_idletasks()
+        for key, paned in (
+            ("body_sash", self._body_paned),
+            ("stack_sash", self._stack_paned),
+        ):
+            if paned is None or key not in layout:
+                continue
+            try:
+                paned.sashpos(0, int(layout[key]))
+            except Exception:
+                pass
+
+    def _save_window_state(self) -> None:
+        try:
+            self.root.update_idletasks()
+            layout: dict[str, int] = {}
+            if self._body_paned is not None:
+                layout["body_sash"] = int(self._body_paned.sashpos(0))
+            if self._stack_paned is not None:
+                layout["stack_sash"] = int(self._stack_paned.sashpos(0))
+            remember_window_state(
+                "review",
+                geometry=str(self.root.geometry()),
+                window_state=str(self.root.state() or ""),
+                layout=layout,
+            )
+        except Exception:
+            pass
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -260,6 +322,7 @@ class CacheReviewApp:
         top.columnconfigure(1, weight=1)
 
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        self._body_paned = body
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         left = ttk.Frame(body)
         right = ttk.Frame(body)
@@ -303,6 +366,7 @@ class CacheReviewApp:
 
         # Right panel: vertical stack (JSON on top, review on bottom)
         stack = ttk.Panedwindow(right, orient=tk.VERTICAL)
+        self._stack_paned = stack
         stack.pack(fill=tk.BOTH, expand=True)
         json_panel = ttk.Frame(stack)
         review_panel = ttk.Frame(stack)
@@ -1004,36 +1068,36 @@ class CacheReviewApp:
     def _pick_video(self) -> None:
         p = filedialog.askopenfilename(
             title="选择视频",
-            initialdir=self._dialog_initial_dir("video", self.video_var.get().strip() or ROOT),
+            initialdir=self._dialog_initial_dir("review.video", self.video_var.get().strip() or ROOT),
             filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
         )
         if not p:
             return
-        self._remember_dialog_dir("video", p)
+        self._remember_dialog_dir("review.video", p)
         self.video_var.set(str(Path(p).resolve()))
         self._reload_video()
 
     def _pick_cache(self) -> None:
         p = filedialog.askopenfilename(
             title="选择缓存",
-            initialdir=self._dialog_initial_dir("cache", self.cache_var.get().strip() or ROOT),
+            initialdir=self._dialog_initial_dir("review.cache", self.cache_var.get().strip() or ROOT),
             filetypes=[("JSON", "*.json"), ("所有文件", "*.*")],
         )
         if not p:
             return
-        self._remember_dialog_dir("cache", p)
+        self._remember_dialog_dir("review.cache", p)
         self.cache_var.set(str(Path(p).resolve()))
         self._load_cache()
 
     def _pick_config(self) -> None:
         p = filedialog.askopenfilename(
             title="选择配置",
-            initialdir=self._dialog_initial_dir("config", self.config_var.get().strip() or (ROOT / "config")),
+            initialdir=self._dialog_initial_dir("review.config", self.config_var.get().strip() or (ROOT / "config")),
             filetypes=[("YAML", "*.yaml *.yml"), ("JSON", "*.json"), ("所有文件", "*.*")],
         )
         if not p:
             return
-        self._remember_dialog_dir("config", p)
+        self._remember_dialog_dir("review.config", p)
         self.config_var.set(str(Path(p).resolve()))
         self._load_config()
 
@@ -1078,6 +1142,7 @@ class CacheReviewApp:
 
     def _on_close(self) -> None:
         try:
+            self._save_window_state()
             if self._decode_spinner_after_id is not None:
                 try:
                     self.root.after_cancel(self._decode_spinner_after_id)
@@ -2126,28 +2191,31 @@ class CacheReviewApp:
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(1, weight=1)
 
-        dest_root_var = tk.StringVar(value=self._dialog_initial_dir("archive_root", ROOT.parent))
+        dest_root_var = tk.StringVar(value=self._dialog_initial_dir("review.archive_root", ROOT.parent))
         hard_video_var = tk.StringVar(value=str(found_hard) if found_hard else "")
 
         def _browse_dest_root() -> None:
             p = filedialog.askdirectory(
                 title="选择归档根目录",
-                initialdir=self._dialog_initial_dir("archive_root", dest_root_var.get() or ROOT.parent),
+                initialdir=self._dialog_initial_dir("review.archive_root", dest_root_var.get() or ROOT.parent),
                 parent=win,
             )
             if p:
-                self._remember_dialog_dir("archive_root", p)
+                self._remember_dialog_dir("review.archive_root", p)
                 dest_root_var.set(str(Path(p).resolve()))
 
         def _browse_hard_video() -> None:
             p = filedialog.askopenfilename(
                 title="选择硬字幕视频（可选）",
-                initialdir=self._dialog_initial_dir("hard_sub_video", hard_video_var.get() or self.video_var.get() or ROOT),
+                initialdir=self._dialog_initial_dir(
+                    "review.hard_sub_video",
+                    hard_video_var.get() or self.video_var.get() or ROOT,
+                ),
                 filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
                 parent=win,
             )
             if p:
-                self._remember_dialog_dir("hard_sub_video", p)
+                self._remember_dialog_dir("review.hard_sub_video", p)
                 hard_video_var.set(str(Path(p).resolve()))
 
         def _open_generate_hard_video() -> None:
@@ -2221,26 +2289,26 @@ class CacheReviewApp:
         def _browse_ffmpeg() -> None:
             p = filedialog.askopenfilename(
                 title="选择 ffmpeg",
-                initialdir=self._dialog_initial_dir("ffmpeg", self.ffmpeg_path.parent if self.ffmpeg_path else ROOT),
+                initialdir=self._dialog_initial_dir("review.ffmpeg", self.ffmpeg_path.parent if self.ffmpeg_path else ROOT),
                 filetypes=[("ffmpeg", "*.exe"), ("所有文件", "*.*")],
                 parent=win,
             )
             if p:
-                self._remember_dialog_dir("ffmpeg", p)
+                self._remember_dialog_dir("review.ffmpeg", p)
                 self.embed_ffmpeg_path_var.set(str(Path(p).resolve()))
 
         def _browse_output() -> None:
             cur = Path(self.embed_output_path_var.get().strip() or self._default_embed_output_path())
             p = filedialog.asksaveasfilename(
                 title="保存内嵌字幕视频",
-                initialdir=self._dialog_initial_dir("embed_output", cur.parent),
+                initialdir=self._dialog_initial_dir("review.embed_output", cur.parent),
                 initialfile=cur.name,
                 defaultextension=".mp4",
                 filetypes=[("MP4", "*.mp4"), ("所有文件", "*.*")],
                 parent=win,
             )
             if p:
-                self._remember_dialog_dir("embed_output", p)
+                self._remember_dialog_dir("review.embed_output", p)
                 self.embed_output_path_var.set(str(Path(p).resolve()))
 
         def _set_cpu_x264() -> None:
