@@ -129,7 +129,10 @@ pipeline.py  ← 编排入口，import 所有下层模块
 - **撤销/恢复**：undo/redo 栈，支持合并、插入、删除三种操作，新操作清空 redo 栈
 - **`segment_id` 自动顺延**：插入/删除时级联更新后续正编号段
 - **插入/合并额外review标记**：操作条复选框，默认关闭。勾选时才会在 `review_reason` 中追加 `manual_insert` / `manual_merge`
-- cache 中的视频路径失效时，Review GUI 仍允许编辑 JSON；顶部“选择视频/加载视频”可重新绑定视频，保存 cache 时同步新的有效视频路径
+- cache 中的视频路径失效时，Review GUI 仍允许编辑 JSON；顶部可重新绑定视频和配置，保存 cache 时同步新的有效路径
+- **选择缓存/配置**：顶部新增选择按钮，选择后自动加载；缓存和配置路径互不覆盖
+- **Marker 模板解析**：相对路径优先按 config 所在目录解析，过滤无效路径后仍能用有效模板显示分数
+- **ROI 显示开关**：勾选后在画布上叠加所有配置过的 ROI 矩形，默认关闭
 - **归档项目**：Review GUI 操作条提供入口；自动保存当前 cache 后异步归档原视频（保留原文件名）、合并后的 `config.yaml`、Marker 模板图片、`translation_cache_latest.json`、ASS 字幕和可选硬字幕视频；归档 cache 内 `video`/`config_path` 改为同目录相对路径，归档 config 内 marker 模板路径改为 `marker_templates/` 相对路径
 
 ### 线程模型
