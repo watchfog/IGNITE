@@ -21,8 +21,6 @@ python -m ignite.gui.review --cache <path>   # 重新打开校对 GUI
 python -m ignite.archive --cache <path> --dest-root <dir>  # 归档视频/config/cache/字幕
 python -m ignite.archive --batch --cache-root outputs --dest-root <dir>  # 批量归档
 
-python tools/debug_rapidocr_single_image.py \       # OCR 调试
-    --image <path> --config <path>
 ```
 
 **本项目无测试、无 lint、无 CI**。不要尝试运行 `pytest`、`npm run` 等命令。

@@ -257,9 +257,6 @@ python -m ignite.pipeline \
 ## 辅助工具
 
 ```bash
-# 单张图片 OCR 调试
-python tools/debug_rapidocr_single_image.py --image <path> --config <path>
-
 # 归档单个已处理项目
 python -m ignite.archive --cache outputs/<名称>/translation_cache_latest.json --dest-root D:/Archive
 
