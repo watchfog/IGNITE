@@ -21,6 +21,7 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
+from ignite.archive_manager import archive_project, find_hard_subtitle_video
 from ignite.cache_manager import (
     MANUAL_INSERT_RAW_ID,
     _debug_subtitle_from_entry,
@@ -60,7 +61,7 @@ class CacheReviewApp:
 
         self.status_var = tk.StringVar(value="就绪")
         self.seg_info_var = tk.StringVar(value="-")
-        self.marker_score_var = tk.StringVar(value="")
+        self.marker_score_var = tk.StringVar(value="Marker: N/A")
         self.review_meta_var = tk.StringVar(value="")
         self.goto_var = tk.StringVar(value="1")
         self.time_var = tk.StringVar(value="0.00")
@@ -145,6 +146,7 @@ class CacheReviewApp:
         self._insert_dialog: dict[str, Any] | None = None
         self.subtitle_style_cfg: dict[str, Any] | None = None
         self._dialog_dirs: dict[str, Path] = {}
+        self.show_all_rois = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -190,15 +192,18 @@ class CacheReviewApp:
         self.config_var = tk.StringVar(value=str(self.config_path))
 
         ttk.Label(top, text="缓存").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.cache_var, width=108).grid(row=0, column=1, columnspan=8, sticky="ew", padx=(6, 4))
+        ttk.Entry(top, textvariable=self.cache_var, width=108).grid(row=0, column=1, columnspan=7, sticky="ew", padx=(6, 4))
+        ttk.Button(top, text="选择缓存", command=self._pick_cache).grid(row=0, column=8, padx=2)
         ttk.Button(top, text="重载缓存", command=self._load_cache).grid(row=0, column=9, padx=2)
 
         ttk.Label(top, text="视频").grid(row=1, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.video_var, width=108).grid(row=1, column=1, columnspan=8, sticky="ew", padx=(6, 4))
-        ttk.Button(top, text="加载视频", command=self._reload_video).grid(row=1, column=9, padx=2)
+        ttk.Entry(top, textvariable=self.video_var, width=108).grid(row=1, column=1, columnspan=7, sticky="ew", padx=(6, 4))
+        ttk.Button(top, text="选择视频", command=self._pick_video).grid(row=1, column=8, padx=2)
+        ttk.Button(top, text="重载视频", command=self._reload_video).grid(row=1, column=9, padx=2)
 
         ttk.Label(top, text="配置").grid(row=2, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.config_var, width=108).grid(row=2, column=1, columnspan=8, sticky="ew", padx=(6, 4))
+        ttk.Entry(top, textvariable=self.config_var, width=108).grid(row=2, column=1, columnspan=7, sticky="ew", padx=(6, 4))
+        ttk.Button(top, text="选择配置", command=self._pick_config).grid(row=2, column=8, padx=2)
         ttk.Button(top, text="重载配置", command=self._load_config).grid(row=2, column=9, padx=2)
 
         nav = ttk.Frame(top)
@@ -211,7 +216,8 @@ class CacheReviewApp:
         ttk.Label(nav, text="跳转段号").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(nav, textvariable=self.goto_var, width=10).pack(side=tk.LEFT)
         ttk.Button(nav, text="跳转", command=self._jump_segment).pack(side=tk.LEFT, padx=2)
-        ttk.Button(nav, text="保存全部", command=self._save_cache_file).pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Button(nav, text="保存缓存", command=self._save_cache_file).pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Button(nav, text="归档项目", command=self._open_archive_dialog).pack(side=tk.LEFT, padx=2)
         ttk.Button(
             nav,
             text="生成字幕（当前Cache）",
@@ -292,6 +298,7 @@ class CacheReviewApp:
         ttk.Label(roi_bar, text="拖拽编辑ROI").pack(side=tk.LEFT)
         ttk.OptionMenu(roi_bar, self.roi_key_var, self.roi_key_var.get(), *ROI_KEYS).pack(side=tk.LEFT, padx=6)
         ttk.Button(roi_bar, text="恢复默认ROI", command=self._reset_rois).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(roi_bar, text="显示ROI", variable=self.show_all_rois, command=self._refresh_canvas).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(roi_bar, textvariable=self.marker_score_var, foreground="#9a4b00").pack(side=tk.LEFT, padx=(16, 0))
 
         # Right panel: vertical stack (JSON on top, review on bottom)
@@ -514,33 +521,53 @@ class CacheReviewApp:
         marker_cfg = self.cfg.get("marker", {})
         marker_tpl_paths = marker_cfg.get("template_paths")
         if isinstance(marker_tpl_paths, list) and marker_tpl_paths:
-            try:
-                self._marker_matcher = MarkerTemplateMatcher(
-                    template_paths=[str(p) for p in marker_tpl_paths],
-                    center_width=marker_cfg.get("template_center_width"),
-                    vertical_shift_px=int(marker_cfg.get("vertical_shift_px", 6)),
-                    vertical_shift_step=int(marker_cfg.get("vertical_shift_step", 1)),
-                    horizontal_shift_px=int(marker_cfg.get("horizontal_shift_px", 0)),
-                    horizontal_shift_step=int(marker_cfg.get("horizontal_shift_step", 1)),
-                    shift_mode=str(marker_cfg.get("shift_mode", "vertical")),
-                )
-            except Exception:
-                self._marker_matcher = None
+            valid = [p for p in self._resolve_config_asset_paths(marker_tpl_paths) if p.exists()]
+            if valid:
+                try:
+                    self._marker_matcher = MarkerTemplateMatcher(
+                        template_paths=valid,
+                        center_width=marker_cfg.get("template_center_width"),
+                        vertical_shift_px=int(marker_cfg.get("vertical_shift_px", 6)),
+                        vertical_shift_step=int(marker_cfg.get("vertical_shift_step", 1)),
+                        horizontal_shift_px=int(marker_cfg.get("horizontal_shift_px", 0)),
+                        horizontal_shift_step=int(marker_cfg.get("horizontal_shift_step", 1)),
+                        shift_mode=str(marker_cfg.get("shift_mode", "vertical")),
+                    )
+                except Exception:
+                    self._marker_matcher = None
         marker2_cfg = self.cfg.get("marker_2", {})
         marker2_tpl_paths = marker2_cfg.get("template_paths")
         if isinstance(marker2_tpl_paths, list) and marker2_tpl_paths:
-            try:
-                self._marker2_matcher = MarkerTemplateMatcher(
-                    template_paths=[str(p) for p in marker2_tpl_paths],
-                    center_width=marker2_cfg.get("template_center_width"),
-                    vertical_shift_px=int(marker2_cfg.get("vertical_shift_px", 6)),
-                    vertical_shift_step=int(marker2_cfg.get("vertical_shift_step", 1)),
-                    horizontal_shift_px=int(marker2_cfg.get("horizontal_shift_px", 0)),
-                    horizontal_shift_step=int(marker2_cfg.get("horizontal_shift_step", 1)),
-                    shift_mode=str(marker2_cfg.get("shift_mode", "vertical")),
-                )
-            except Exception:
-                self._marker2_matcher = None
+            valid = [p for p in self._resolve_config_asset_paths(marker2_tpl_paths) if p.exists()]
+            if valid:
+                try:
+                    self._marker2_matcher = MarkerTemplateMatcher(
+                        template_paths=valid,
+                        center_width=marker2_cfg.get("template_center_width"),
+                        vertical_shift_px=int(marker2_cfg.get("vertical_shift_px", 6)),
+                        vertical_shift_step=int(marker2_cfg.get("vertical_shift_step", 1)),
+                        horizontal_shift_px=int(marker2_cfg.get("horizontal_shift_px", 0)),
+                        horizontal_shift_step=int(marker2_cfg.get("horizontal_shift_step", 1)),
+                        shift_mode=str(marker2_cfg.get("shift_mode", "vertical")),
+                    )
+                except Exception:
+                    self._marker2_matcher = None
+
+    def _resolve_config_asset_paths(self, paths: list[Any]) -> list[Path]:
+        out: list[Path] = []
+        for raw in paths:
+            p = Path(str(raw))
+            if p.is_absolute():
+                out.append(p.resolve())
+                continue
+            for base in (self.config_path.parent, ROOT):
+                cand = (base / p).resolve()
+                if cand.exists():
+                    out.append(cand)
+                    break
+            else:
+                out.append((self.config_path.parent / p).resolve())
+        return out
 
     def _load_marker_score_cache(self) -> None:
         self.marker_score_cache = None
@@ -692,7 +719,7 @@ class CacheReviewApp:
             parts.append(f"Marker: {ms:.3f}")
         if m2s is not None:
             parts.append(f"Marker2: {m2s:.3f}")
-        self.marker_score_var.set(" | ".join(parts) if parts else "")
+        self.marker_score_var.set(" | ".join(parts) if parts else "Marker: N/A")
 
     def _load_cache(self) -> None:
         p = Path(self.cache_var.get().strip() or self.cache_path).resolve()
@@ -931,19 +958,99 @@ class CacheReviewApp:
         video = self.cache_payload.get("video")
         if not video:
             return
-        v = Path(str(video))
-        if not v.is_absolute():
-            # cache 里保存的是相对项目根目录的路径（与主程序一致）
-            v = (ROOT / v).resolve()
+        v = self._resolve_cache_ref_path(video)
         self.video_path = v
         self.video_var.set(str(v))
+        if not v.exists():
+            self.status_var.set(f"视频不存在，可继续编辑 JSON；如需预览/重译请重新选择视频: {v}")
+
+    def _resolve_cache_ref_path(self, value: Any) -> Path:
+        p = Path(str(value or ""))
+        if p.is_absolute():
+            return p.resolve()
+        for base in (self.cache_path.resolve().parent, ROOT):
+            cand = (base / p).resolve()
+            if cand.exists():
+                return cand
+        return (self.cache_path.resolve().parent / p).resolve()
+
+    def _path_for_cache(self, path: Path) -> str:
+        resolved = path.resolve()
+        try:
+            return resolved.relative_to(self.cache_path.resolve().parent).as_posix()
+        except Exception:
+            pass
+        try:
+            return resolved.relative_to(ROOT).as_posix()
+        except Exception:
+            return str(resolved)
+
+    def _sync_video_path_to_cache(self) -> None:
+        raw = self.video_var.get().strip()
+        if not raw:
+            return
+        path = Path(raw).resolve()
+        if path.exists():
+            self.cache_payload["video"] = self._path_for_cache(path)
+
+    def _sync_config_path_to_cache(self) -> None:
+        raw = self.config_var.get().strip()
+        if not raw:
+            return
+        path = Path(raw).resolve()
+        if path.exists():
+            self.cache_payload["config_path"] = self._path_for_cache(path)
+
+    def _pick_video(self) -> None:
+        p = filedialog.askopenfilename(
+            title="选择视频",
+            initialdir=self._dialog_initial_dir("video", self.video_var.get().strip() or ROOT),
+            filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
+        )
+        if not p:
+            return
+        self._remember_dialog_dir("video", p)
+        self.video_var.set(str(Path(p).resolve()))
+        self._reload_video()
+
+    def _pick_cache(self) -> None:
+        p = filedialog.askopenfilename(
+            title="选择缓存",
+            initialdir=self._dialog_initial_dir("cache", self.cache_var.get().strip() or ROOT),
+            filetypes=[("JSON", "*.json"), ("所有文件", "*.*")],
+        )
+        if not p:
+            return
+        self._remember_dialog_dir("cache", p)
+        self.cache_var.set(str(Path(p).resolve()))
+        self._load_cache()
+
+    def _pick_config(self) -> None:
+        p = filedialog.askopenfilename(
+            title="选择配置",
+            initialdir=self._dialog_initial_dir("config", self.config_var.get().strip() or (ROOT / "config")),
+            filetypes=[("YAML", "*.yaml *.yml"), ("JSON", "*.json"), ("所有文件", "*.*")],
+        )
+        if not p:
+            return
+        self._remember_dialog_dir("config", p)
+        self.config_var.set(str(Path(p).resolve()))
+        self._load_config()
 
     def _reload_video(self) -> None:
         raw = self.video_var.get().strip()
         if not raw:
             return
         self.video_path = Path(raw).resolve()
-        self._open_video(self.video_path)
+        if not self.video_path.exists():
+            self.status_var.set(f"视频不存在，可继续编辑 JSON；如需预览/重译请重新选择视频: {self.video_path}")
+            return
+        try:
+            self._open_video(self.video_path)
+        except Exception as exc:
+            self.status_var.set(f"打开视频失败，可继续编辑 JSON: {exc}")
+            return
+        self._sync_video_path_to_cache()
         self._seek_to_segment(self.current_index, request_prefetch=False)
         if self.entries:
             self._request_prefetch(self.current_index)
@@ -1876,6 +1983,8 @@ class CacheReviewApp:
             self._save_current_entry()
         self.entries = [self._entry_with_review_metadata(e) for e in self.entries]
         self._rebuild_suspect_indices()
+        self._sync_video_path_to_cache()
+        self._sync_config_path_to_cache()
         self.cache_payload["entries"] = self.entries
         self.cache_path.write_text(json.dumps(self.cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         sync_msg = self._sync_all_cache_files()
@@ -1994,6 +2103,101 @@ class CacheReviewApp:
         if not self.embed_ffmpeg_path_var.get().strip():
             self.embed_ffmpeg_path_var.set(str(self.ffmpeg_path))
         self.embed_output_path_var.set(str(self._default_embed_output_path()))
+
+    def _current_existing_path(self, raw: str) -> Path | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        path = Path(text).resolve()
+        return path if path.exists() else None
+
+    def _open_archive_dialog(self) -> None:
+        if not self._autosave_cache_for_action("归档项目"):
+            return
+        video_path = self._current_existing_path(self.video_var.get())
+        config_path = self._current_existing_path(self.config_var.get())
+        found_hard = find_hard_subtitle_video(self.cache_path.resolve(), video_path)
+
+        win = tk.Toplevel(self.root)
+        win.title("归档当前项目")
+        win.geometry("820x230")
+        win.transient(self.root)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+
+        dest_root_var = tk.StringVar(value=self._dialog_initial_dir("archive_root", ROOT.parent))
+        hard_video_var = tk.StringVar(value=str(found_hard) if found_hard else "")
+
+        def _browse_dest_root() -> None:
+            p = filedialog.askdirectory(
+                title="选择归档根目录",
+                initialdir=self._dialog_initial_dir("archive_root", dest_root_var.get() or ROOT.parent),
+                parent=win,
+            )
+            if p:
+                self._remember_dialog_dir("archive_root", p)
+                dest_root_var.set(str(Path(p).resolve()))
+
+        def _browse_hard_video() -> None:
+            p = filedialog.askopenfilename(
+                title="选择硬字幕视频（可选）",
+                initialdir=self._dialog_initial_dir("hard_sub_video", hard_video_var.get() or self.video_var.get() or ROOT),
+                filetypes=[("视频文件", "*.mp4 *.mkv *.mov *.avi *.webm"), ("所有文件", "*.*")],
+                parent=win,
+            )
+            if p:
+                self._remember_dialog_dir("hard_sub_video", p)
+                hard_video_var.set(str(Path(p).resolve()))
+
+        def _open_generate_hard_video() -> None:
+            self._refresh_embed_defaults()
+            hard_video_var.set(self.embed_output_path_var.get().strip())
+            self._open_embed_subtitles_dialog()
+
+        def _run_archive() -> None:
+            dest_root = Path(dest_root_var.get().strip()).resolve()
+            hard_video = Path(hard_video_var.get().strip()).resolve() if hard_video_var.get().strip() else None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+            def _job() -> None:
+                result = archive_project(
+                    cache_path=self.cache_path.resolve(),
+                    dest_root=dest_root,
+                    video_path=video_path,
+                    config_path=config_path,
+                    hard_sub_video=hard_video,
+                )
+                missing = "；缺失可选文件: " + ", ".join(result.missing) if result.missing else ""
+
+                def _done() -> None:
+                    self.status_var.set(f"已归档到: {result.archive_dir}{missing}")
+                    messagebox.showinfo(
+                        "归档完成",
+                        f"已归档到:\n{result.archive_dir}\n\ncache:\n{result.cache_path}{missing}",
+                        parent=self.root,
+                    )
+
+                self.root.after(0, _done)
+
+            self.status_var.set(f"开始归档到: {dest_root}")
+            self._run_bg("归档项目", _job)
+
+        ttk.Label(body, text="归档根目录").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(body, textvariable=dest_root_var).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=4)
+        ttk.Button(body, text="浏览", command=_browse_dest_root).grid(row=0, column=2, sticky="ew", pady=4)
+        ttk.Label(body, text="硬字幕视频").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(body, textvariable=hard_video_var).grid(row=1, column=1, sticky="ew", padx=(8, 4), pady=4)
+        ttk.Button(body, text="选择", command=_browse_hard_video).grid(row=1, column=2, sticky="ew", pady=4)
+        ttk.Label(body, text="不填写硬字幕视频时会自动查找；找不到则跳过。config 会归档为合并后的独立 config.yaml。", foreground="#555").grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 4))
+        btns = ttk.Frame(body)
+        btns.grid(row=3, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="生成硬字幕视频...", command=_open_generate_hard_video).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="开始归档", command=_run_archive).pack(side=tk.LEFT, padx=4)
 
     def _open_embed_subtitles_dialog(self) -> None:
         if not self._autosave_cache_for_action("生成内嵌字幕视频"):
@@ -3016,6 +3220,7 @@ class CacheReviewApp:
                         self._suppress_scale_callback = False
                 if sync_segment:
                     self._sync_segment_ui_by_time(target_sec)
+                self._update_marker_score_display(target_sec)
                 if request_prefetch:
                     center = self.current_index if prefetch_center_idx is None else int(prefetch_center_idx)
                     self._request_prefetch(center)
@@ -3060,6 +3265,7 @@ class CacheReviewApp:
             ):
                 self.current_sec = sec
                 self.time_var.set(f"{sec:.2f}")
+                self._update_marker_score_display(sec)
                 return
             self.current_sec = sec
             cached = self._cache_get(frame_idx)
@@ -3116,16 +3322,17 @@ class CacheReviewApp:
         self._offset_y = max(0, (canvas_h - self._render_h) // 2)
         self.canvas.create_image(self._offset_x, self._offset_y, anchor="nw", image=self._img)
         self.canvas.configure(scrollregion=(0, 0, canvas_w, canvas_h))
-        for key in ROI_KEYS:
-            rect = self.review_rois.get(key)
-            if not rect:
-                continue
-            x0, y0 = self._src_to_canvas(rect[0], rect[1])
-            x1, y1 = self._src_to_canvas(rect[2], rect[3])
-            color = ROI_COLORS.get(key, "#fff")
-            width = 3 if key == self.roi_key_var.get() else 2
-            self.canvas.create_rectangle(x0, y0, x1, y1, outline=color, width=width)
-            self.canvas.create_text(x0 + 4, y0 + 4, text=key, anchor="nw", fill=color, font=("Segoe UI", 11, "bold"))
+        if self.show_all_rois.get():
+            for key in ROI_KEYS:
+                rect = self.review_rois.get(key)
+                if not rect:
+                    continue
+                x0, y0 = self._src_to_canvas(rect[0], rect[1])
+                x1, y1 = self._src_to_canvas(rect[2], rect[3])
+                color = ROI_COLORS.get(key, "#fff")
+                width = 3 if key == self.roi_key_var.get() else 2
+                self.canvas.create_rectangle(x0, y0, x1, y1, outline=color, width=width)
+                self.canvas.create_text(x0 + 4, y0 + 4, text=key, anchor="nw", fill=color, font=("Segoe UI", 11, "bold"))
         if self.drag_start and self.drag_now:
             x0, y0 = self.drag_start
             x1, y1 = self.drag_now
@@ -3337,8 +3544,13 @@ def main() -> int:
             )
         config_path = Path(cache_cfg)
         if not config_path.is_absolute():
-            # Relative path in cache is resolved against project root.
-            config_path = (ROOT / config_path).resolve()
+            for base in (cache_path.resolve().parent, ROOT):
+                cand = (base / config_path).resolve()
+                if cand.exists():
+                    config_path = cand
+                    break
+            else:
+                config_path = (cache_path.resolve().parent / config_path).resolve()
     assert config_path is not None
     if not config_path.exists():
         raise RuntimeError(f"配置不存在: {config_path}")

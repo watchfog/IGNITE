@@ -18,6 +18,9 @@ python -m ignite.pipeline \  # 直接运行 pipeline（无 GUI）
 
 python -m ignite.gui.review --cache <path>   # 重新打开校对 GUI
 
+python -m ignite.archive --cache <path> --dest-root <dir>  # 归档视频/config/cache/字幕
+python -m ignite.archive --batch --cache-root outputs --dest-root <dir>  # 批量归档
+
 python tools/debug_rapidocr_single_image.py \       # OCR 调试
     --image <path> --config <path>
 ```
@@ -33,6 +36,7 @@ python tools/debug_rapidocr_single_image.py \       # OCR 调试
 | `main.py` | Profile 编辑器 GUI（ROI 框选、marker 配置、启动流程） |
 | `ignite/pipeline.py` | 核心流水线：分段 → OCR → VLM 翻译 → 缓存 → 字幕生成 |
 | `ignite/gui/review.py` | 字幕校对 GUI（编辑翻译、复译、生成字幕） |
+| `ignite/archive.py` | 归档 CLI：复制视频/config/cache/字幕并重写 cache 相对路径 |
 
 ### 核心模块 (`ignite/`)
 
@@ -48,6 +52,7 @@ python tools/debug_rapidocr_single_image.py \       # OCR 调试
 | `ffmpeg_utils.py` | 270 | FFmpeg/FFprobe 封装（取帧、视频信息）+ 统一四路输出 |
 | `datatypes.py` | 50 | 数据类：`VideoMeta`、`Roi`、`OcrResult`、`DialogueSegment` |
 | `cache_manager.py` | 226 | 翻译缓存 JSON 读写、索引、命中检查 |
+| `archive_manager.py` | — | 归档核心逻辑：复制产物、生成合并 config、重写 cache 路径、manifest |
 | `name_splitter.py` | 808 | Name OCR 分割 (`_split_segment_by_name_ocr`) + 子段标准化 |
 | `marker_ops.py` | 326 | Marker/Marker2 评分、裁剪、分割 (`_split_segment_by_marker2`、`_build_refined_subsegment`) |
 | `name_ocr_runner.py` | 218 | `NameOcrRunner` 类（姓名区域 mask/OCR 检测，线程池并发） |
@@ -124,6 +129,8 @@ pipeline.py  ← 编排入口，import 所有下层模块
 - **撤销/恢复**：undo/redo 栈，支持合并、插入、删除三种操作，新操作清空 redo 栈
 - **`segment_id` 自动顺延**：插入/删除时级联更新后续正编号段
 - **插入/合并额外review标记**：操作条复选框，默认关闭。勾选时才会在 `review_reason` 中追加 `manual_insert` / `manual_merge`
+- cache 中的视频路径失效时，Review GUI 仍允许编辑 JSON；顶部“选择视频/加载视频”可重新绑定视频，保存 cache 时同步新的有效视频路径
+- **归档项目**：Review GUI 操作条提供入口；自动保存当前 cache 后异步归档原视频（保留原文件名）、合并后的 `config.yaml`、Marker 模板图片、`translation_cache_latest.json`、ASS 字幕和可选硬字幕视频；归档 cache 内 `video`/`config_path` 改为同目录相对路径，归档 config 内 marker 模板路径改为 `marker_templates/` 相对路径
 
 ### 线程模型
 
