@@ -60,6 +60,7 @@ class DialogueSegment:
     needs_review: bool = False
     review_reason: list[str] = field(default_factory=list)
     subtitle_style: dict[str, Any] = field(default_factory=dict)
+    auto_review_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

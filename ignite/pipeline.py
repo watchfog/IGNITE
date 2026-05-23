@@ -7,6 +7,7 @@ from datetime import datetime
 import io
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import yaml
@@ -28,6 +29,7 @@ from .cache_manager import (
     _segments_from_cache_entries,
     _subtitle_cache_key,
 )
+from .auto_review import _profile_chat_params, run_auto_review_entries
 from .config import load_config
 from .debug_utils import (
     _export_marker_frames_for_segment,
@@ -73,8 +75,13 @@ from .review_utils import (
 from .state_machine import StateMachineConfig, segment_from_metrics
 from .subtitle_export import write_ass
 from .translation_runtime import (
-    BailianVlmTranslator,
+    ChatCompletionsTextTranslator,
+    TranslationModelProfile,
+    VlmResponsesTranslator,
     load_api_key,
+    resolve_responses_base_url,
+    resolve_translation_model_profile,
+    translate_ocr_text_segment_with_retry,
     translate_segment_with_retry,
 )
 
@@ -109,34 +116,45 @@ def _collect_marker_templates(marker_cfg: dict[str, Any], config_dir: Path | Non
     return out
 
 
-def _resolve_active_vlm_model(cfg: dict[str, Any]) -> str:
-    tr = cfg.get("translation", {}) if isinstance(cfg, dict) else {}
-    raw_models = tr.get("vlm_models", [])
-    models: list[str] = []
-    if isinstance(raw_models, list):
-        models = [str(x).strip() for x in raw_models if str(x).strip()]
-    elif isinstance(raw_models, str) and raw_models.strip():
-        models = [raw_models.strip()]
-    raw_model = str(tr.get("model", "") or "").strip()
-    if not models:
-        models = ["qwen3.6-plus"]
-    if raw_model and raw_model not in models:
-        raise ValueError(
-            "Invalid config: translation.model must be one item in translation.vlm_models."
-        )
-    active = raw_model if raw_model else models[0]
-    return active
+def _normalize_translation_mode(value: Any) -> str:
+    mode = str(value or "vlm_responses").strip().lower()
+    vlm_responses_aliases = {
+        "vlm",
+        "vlm_responses",
+        "responses_vlm",
+        "vlm_bailian",
+        "qwen_vlm",
+        "bailian",
+    }
+    ocr_chat_aliases = {
+        "ocr_chat",
+        "ocr_chat_completions",
+        "ocr_chat_completion",
+        "ocr_llm",
+        "text_chat",
+    }
+    if mode in vlm_responses_aliases:
+        return "vlm_responses"
+    if mode in ocr_chat_aliases:
+        return "ocr_chat_completions"
+    return mode
 
 
-def _require_non_empty_translation_str(tr_cfg: dict[str, Any], key: str) -> str:
-    raw = tr_cfg.get(key, None)
-    value = str(raw or "").strip()
-    if value:
-        return value
-    raise ValueError(
-        f"Invalid config: translation.{key} is empty. "
-        f"Please set translation.{key} in config/general_config.yaml."
-    )
+def _load_api_key_for_pipeline_profile(
+    profile: TranslationModelProfile,
+    *,
+    config_dir: Path,
+    project_root: Path,
+) -> str:
+    if profile.api_key:
+        return profile.api_key
+    if not profile.api_key_file:
+        return ""
+    p = Path(profile.api_key_file)
+    if not p.is_absolute():
+        candidates = [(config_dir / p).resolve(), (project_root / p).resolve()]
+        p = next((cand for cand in candidates if cand.exists()), candidates[0])
+    return load_api_key(p)
 
 
 def _cleanup_old_work_runs(base_work_dir: Path, keep_latest: int = 3) -> None:
@@ -363,6 +381,8 @@ def _resolve_run_prefix(args: argparse.Namespace) -> str:
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     cfg = load_config(args.config)
     project_root = Path(__file__).resolve().parents[1]
     video_arg = str(getattr(args, "video", "") or "").strip()
@@ -897,6 +917,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "Missing --dialogue-presence-mode. Use 'marker2' or 'ocr' for normal pipeline runs."
         )
     name_ocr: NameOcrRunner | None = None
+    ocr_engine: Any | None = None
     if dialogue_presence_mode == "marker2":
         if marker2_matcher is None:
             raise RuntimeError(
@@ -934,7 +955,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
         raw_segments = refined
         _save_json(raw_seg_json, raw_segments)
     elif dialogue_presence_mode == "ocr":
-        ocr_engine = None
         _log("Initializing OCR engine (dialogue presence verification).")
         ocr_engine = build_ocr_engine(cfg["ocr"])
         ocr_info = ocr_engine.info()
@@ -1059,58 +1079,109 @@ def run_pipeline(args: argparse.Namespace) -> int:
     llm_preserve_thinking = bool(tr_cfg.get("preserve_thinking", False))
     vlm_io_log_enabled = bool(tr_cfg.get("io_log_enabled", False))
     vlm_extra_requirements = str(game_cfg.get("extra_requirements", "")).strip()
-    vlm_translator: BailianVlmTranslator | None = None
-    translation_mode = str(tr_cfg.get("mode", "vlm_bailian")).lower()
+    vlm_translator: VlmResponsesTranslator | None = None
+    text_translator: ChatCompletionsTextTranslator | None = None
+    translation_mode = _normalize_translation_mode(
+        getattr(args, "translation_mode", "") or tr_cfg.get("mode", "vlm_responses")
+    )
+    translation_model_arg = str(getattr(args, "translation_model", "") or "").strip()
     translate_llm = str(tr_cfg.get("translate_llm", "")).strip().lower()
-    if translate_llm in {"vlm", "vlm_bailian", "qwen_vlm", "bailian"}:
-        translation_mode = "vlm_bailian"
+    if translate_llm:
+        translation_mode = _normalize_translation_mode(translate_llm)
     recog_mode = str(tr_cfg.get("recognition_mode", "")).strip().lower()
     if recog_mode in {"vlm", "vlm_translate", "image_translate"}:
-        translation_mode = "vlm_bailian"
+        translation_mode = "vlm_responses"
     if not args.skip_translation:
-        if translation_mode != "vlm_bailian":
-            _log(
-                f"Translation mode '{translation_mode}' is disabled. "
-                "Force switching to 'vlm_bailian' (local OCR text translation path removed)."
-            )
-        _log("Initializing Bailian VLM translator.")
-        api_key = str(tr_cfg.get("api_key", "")).strip()
-        if not api_key:
-            api_key_file = _require_non_empty_translation_str(tr_cfg, "api_key_file")
-            api_key = load_api_key(api_key_file)
-        vlm_api = _require_non_empty_translation_str(tr_cfg, "vlm_api")
-        vlm_translator = BailianVlmTranslator(
-            api_key=api_key,
-            model=_resolve_active_vlm_model(cfg),
-            base_url=vlm_api,
-            temperature=llm_temperature,
-            enable_thinking=llm_enable_thinking,
-            thinking_budget=llm_thinking_budget,
-            preserve_thinking=llm_preserve_thinking,
-            timeout_sec=int(tr_cfg.get("timeout_sec", 90)),
-            timeout_backoff_sec=int(tr_cfg.get("timeout_backoff_sec", 15)),
-            max_retries=int(tr_cfg.get("max_retries", 2)),
-            retry_delay_sec=float(tr_cfg.get("retry_delay_sec", 1.5)),
-            disable_env_proxy=bool(tr_cfg.get("disable_env_proxy", True)),
-            game_name=game_name,
-            source_language=source_lang,
-            target_language=target_lang,
-            log_fn=lambda m: _log(f"[VLM] {m}"),
-            io_log_path=work_dir / "vlm_io.log",
-            io_log_enabled=vlm_io_log_enabled,
-            enable_web_search=enable_web_search,
+        profile = resolve_translation_model_profile(tr_cfg, translation_mode, translation_model_arg)
+        api_key = _load_api_key_for_pipeline_profile(
+            profile,
+            config_dir=Path(args.config).resolve().parent,
+            project_root=project_root,
         )
+        if translation_mode == "vlm_responses":
+            _log("Initializing VLM Responses translator.")
+            vlm_translator = VlmResponsesTranslator(
+                api_key=api_key,
+                model=profile.model,
+                responses_base_url=profile.base_url or resolve_responses_base_url(tr_cfg),
+                temperature=llm_temperature,
+                enable_thinking=llm_enable_thinking,
+                thinking_budget=llm_thinking_budget,
+                preserve_thinking=llm_preserve_thinking,
+                timeout_sec=int(tr_cfg.get("timeout_sec", 90)),
+                timeout_backoff_sec=int(tr_cfg.get("timeout_backoff_sec", 15)),
+                max_retries=int(tr_cfg.get("max_retries", 2)),
+                retry_delay_sec=float(tr_cfg.get("retry_delay_sec", 1.5)),
+                empty_max_attempts=int(tr_cfg.get("empty_max_attempts", 3)),
+                disable_env_proxy=bool(tr_cfg.get("disable_env_proxy", True)),
+                game_name=game_name,
+                source_language=source_lang,
+                target_language=target_lang,
+                log_fn=lambda m: _log(f"[VLM] {m}"),
+                io_log_path=work_dir / "vlm_io.log",
+                io_log_enabled=vlm_io_log_enabled,
+                enable_web_search=enable_web_search,
+            )
+            _log(
+                "Translation mode: VLM Responses "
+                f"profile={profile.name} model={profile.model} "
+                f"responses_base_url={profile.base_url} "
+                f"temp={llm_temperature:.2f} thinking={llm_enable_thinking} "
+                f"thinking_budget={(llm_thinking_budget if llm_thinking_budget is not None else 'default')} "
+                f"preserve_thinking={llm_preserve_thinking} "
+                f"io_log={vlm_io_log_enabled} "
+                f"web_search={enable_web_search}"
+            )
+        elif translation_mode == "ocr_chat_completions":
+            _log("Initializing OCR + Chat Completions translator.")
+            profile_temp, profile_top_p, profile_top_k = _profile_chat_params(tr_cfg, profile.name)
+            chat_temp = profile_temp if profile_temp is not None else llm_temperature
+            ctx_window = int(tr_cfg.get("chat_context_window", 8))
+            text_translator = ChatCompletionsTextTranslator(
+                api_key=api_key,
+                model=profile.model,
+                base_url=profile.base_url,
+                temperature=chat_temp,
+                top_p=profile_top_p,
+                top_k=profile_top_k,
+                context_window=ctx_window,
+                timeout_sec=int(tr_cfg.get("timeout_sec", 90)),
+                timeout_backoff_sec=int(tr_cfg.get("timeout_backoff_sec", 15)),
+                max_retries=int(tr_cfg.get("max_retries", 2)),
+                retry_delay_sec=float(tr_cfg.get("retry_delay_sec", 1.5)),
+                empty_max_attempts=int(tr_cfg.get("empty_max_attempts", 3)),
+                disable_env_proxy=bool(tr_cfg.get("disable_env_proxy", True)),
+                game_name=game_name,
+                source_language=source_lang,
+                target_language=target_lang,
+                log_fn=lambda m: _log(f"[LLM] {m}"),
+                io_log_path=work_dir / "chat_io.log",
+                io_log_enabled=vlm_io_log_enabled,
+                enable_web_search=enable_web_search,
+            )
+            _log(
+                "Translation mode: OCR + Chat Completions "
+                f"profile={profile.name} model={profile.model} base_url={profile.base_url} "
+                f"temp={chat_temp:.2f} top_p={profile_top_p} top_k={profile_top_k} "
+                f"io_log={vlm_io_log_enabled} "
+                f"web_search={enable_web_search} auth={'yes' if api_key else 'no'}"
+            )
+        else:
+            raise RuntimeError(f"Unsupported translation mode: {translation_mode}")
+
+    if text_translator is not None and ocr_engine is None:
+        _log("Initializing OCR engine (OCR + Chat Completions text extraction).")
+        ocr_engine = build_ocr_engine(cfg["ocr"])
+        ocr_info = ocr_engine.info()
         _log(
-            "Translation mode: VLM "
-            f"({tr_cfg.get('model', 'qwen3.6-plus')}) "
-            f"temp={llm_temperature:.2f} thinking={llm_enable_thinking} "
-            f"thinking_budget={(llm_thinking_budget if llm_thinking_budget is not None else 'default')} "
-            f"preserve_thinking={llm_preserve_thinking} "
-            f"io_log={vlm_io_log_enabled} "
-            f"web_search={enable_web_search}"
+            "OCR engine: "
+            f"{ocr_info.get('engine')} / runtime={ocr_info.get('runtime')} / "
+            f"target={ocr_info.get('target_lang')} / actual={ocr_info.get('actual_lang')} / "
+            f"charset={ocr_info.get('charset_size')}"
         )
 
     final_segments: list[DialogueSegment] = []
+    debug_text_by_segment_id: dict[int, str] = {}
     _log("Running OCR fusion and translation.")
     vlm_history_enabled = bool(tr_cfg.get("history_enabled", False))
     vlm_history_n = int(tr_cfg.get("history_n", 5))
@@ -1234,6 +1305,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             raw_seen_idx=marker_seen_idx,
             raw_count=marker_count,
         )
+        debug_text_by_segment_id[seg.segment_id] = debug_text
         if args.skip_translation:
             seg.text_original = ""
             seg.speaker = ""
@@ -1480,6 +1552,251 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 )
                 pending_vlm[fut] = (seg, debug_text)
 
+    work_relative = str(run_cache_path.resolve().relative_to(output_dir.resolve()))
+
+    if text_translator is not None and not args.skip_translation:
+        if ocr_engine is None:
+            raise RuntimeError("OCR engine is required for ocr_chat_completions mode")
+        _log("OCR + Chat Completions: sliding OCR lookahead with background prefetch.")
+        ctx_window = max(0, int(getattr(text_translator, "context_window", 0)))
+        ocr_done_indices: set[int] = set()
+        ocr_lock = threading.Lock()
+        ocr_pool = ThreadPoolExecutor(max_workers=1)
+        ocr_futures: dict[int, Future[None]] = {}
+
+        def _is_chat_dialogue(seg: DialogueSegment) -> bool:
+            return str(seg.dialogue_type or "").strip().lower() not in {"blank_no_name", "blank", "title"}
+
+        def _run_ocr_for_index(seg_idx: int) -> None:
+            with ocr_lock:
+                if seg_idx in ocr_done_indices:
+                    return
+                ocr_done_indices.add(seg_idx)
+            seg = final_segments[seg_idx]
+            if not _is_chat_dialogue(seg):
+                return
+            raw = raw_segments[seg_idx]
+            anchor_fid = _pick_marker_anchor_frame(raw=raw, from_end_frames=marker_anchor_from_end_frames)
+            ts = float(raw["start_sec"]) + (float(anchor_fid) / float(raw["scan_fps"]))
+            ridx = int(raw["range_index"])
+            dialogue_cache_dir = work_dir / f"fine_{ridx:03d}_dialogue"
+            name_cache_dir = work_dir / f"fine_{ridx:03d}_name"
+            dialogue_image, dialogue_cache_status, dialogue_cache_frame_num = _try_load_cached_roi_frame_with_status(
+                ts,
+                dialogue_cache_dir,
+                float(raw["start_sec"]),
+                float(raw["scan_fps"]),
+            )
+            name_image, name_cache_status, name_cache_frame_num = _try_load_cached_roi_frame_with_status(
+                ts,
+                name_cache_dir,
+                float(raw["start_sec"]),
+                float(raw["scan_fps"]),
+            )
+            fallback_image: Image.Image | None = None
+            if dialogue_image is None or name_image is None:
+                _log(
+                    f"[OCR_CHAT_IMAGE_CACHE] fallback_ffmpeg segment={seg.segment_id} "
+                    f"dialogue={dialogue_cache_status}:{dialogue_cache_frame_num:06d} "
+                    f"name={name_cache_status}:{name_cache_frame_num:06d} ts={ts:.3f}"
+                )
+                frame_bytes = extract_frame_to_memory(
+                    ffmpeg_path=ffmpeg_path,
+                    video_path=args.video,
+                    time_sec=ts,
+                )
+                fallback_image = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
+                if dialogue_image is None:
+                    dialogue_image = fallback_image.crop(
+                        (dialogue_roi.x1, dialogue_roi.y1, dialogue_roi.x2, dialogue_roi.y2)
+                    )
+                if name_image is None:
+                    name_image = fallback_image.crop(
+                        (name_roi.x1, name_roi.y1, name_roi.x2, name_roi.y2)
+                    )
+
+            debug_text = debug_text_by_segment_id.get(seg.segment_id, "")
+            if dialogue_image is None or name_image is None:
+                seg.translation_subtitle = debug_text
+                seg.review_reason = _merge_review_reasons(seg.review_reason, ["ocr_image_prepare_failed"])
+                seg.needs_review = True
+                if fallback_image is not None:
+                    fallback_image.close()
+                return
+
+            name_arr = np.asarray(name_image, dtype=np.uint8)
+            dialogue_arr = np.asarray(dialogue_image, dtype=np.uint8)
+            name_image.close()
+            dialogue_image.close()
+            if fallback_image is not None:
+                fallback_image.close()
+
+            try:
+                speaker_ocr = ocr_engine.recognize_array(name_arr)
+                dialogue_ocr = ocr_engine.recognize_array(dialogue_arr)
+                seg.speaker = str(speaker_ocr.text or "").strip()
+                seg.speaker_confidence = float(speaker_ocr.confidence or 0.0)
+                seg.text_original = str(dialogue_ocr.text or "").strip()
+                seg.text_ocr_confidence = float(dialogue_ocr.confidence or 0.0)
+                seg.line_count_detected = max(1, seg.text_original.count("\n") + 1) if seg.text_original else 1
+                if not seg.text_original:
+                    seg.translation_subtitle = debug_text
+                    seg.review_reason = _merge_review_reasons(seg.review_reason, ["ocr_text_missing"])
+                    seg.needs_review = True
+                _log(
+                    f"[OCR_CHAT] segment {seg.segment_id}: "
+                    f"speaker_chars={len(seg.speaker)} text_chars={len(seg.text_original)} "
+                    f"speaker_conf={seg.speaker_confidence:.3f} text_conf={seg.text_ocr_confidence:.3f}"
+                )
+            except Exception as exc:
+                seg.translation_subtitle = debug_text
+                seg.review_reason = _merge_review_reasons(
+                    seg.review_reason,
+                    [f"ocr_error:{exc.__class__.__name__}"],
+                )
+                seg.needs_review = True
+                _log(f"[OCR_CHAT] segment {seg.segment_id}: OCR failed ({exc.__class__.__name__}): {exc}")
+
+        def _submit_ocr(idx: int) -> None:
+            if idx < 0 or idx >= len(final_segments):
+                return
+            with ocr_lock:
+                if idx in ocr_futures:
+                    return
+                ocr_futures[idx] = ocr_pool.submit(_run_ocr_for_index, idx)
+
+        def _wait_ocr(idx: int) -> None:
+            with ocr_lock:
+                fut = ocr_futures.get(idx)
+            if fut is not None:
+                fut.result()
+                return
+            with ocr_lock:
+                if idx in ocr_done_indices:
+                    return
+            _run_ocr_for_index(idx)
+
+        for i in range(min(len(final_segments), 1 + ctx_window)):
+            _submit_ocr(i)
+
+        _log("Chat Completions strict sequential mode: concurrent_workers=1")
+
+        def _context_item(seg_idx: int, include_translation: bool) -> dict[str, str] | None:
+            seg = final_segments[seg_idx]
+            if not _is_chat_dialogue(seg):
+                return None
+            original = str(seg.text_original or "").strip()
+            if not original:
+                return None
+            item = {"speaker": str(seg.speaker or "").strip(), "original": original}
+            if include_translation:
+                translation = str(seg.translation_subtitle or "").strip()
+                debug_text = debug_text_by_segment_id.get(seg.segment_id, "")
+                if translation and translation != debug_text:
+                    item["translation"] = translation
+            return item
+
+        def _context_before_with_translations(seg_idx: int) -> list[dict[str, str]] | None:
+            if ctx_window <= 0:
+                return None
+            items: list[dict[str, str]] = []
+            scan_idx = seg_idx - 1
+            while scan_idx >= 0 and len(items) < ctx_window:
+                item = _context_item(scan_idx, include_translation=True)
+                if item is not None:
+                    items.insert(0, item)
+                scan_idx -= 1
+            return items or None
+
+        def _context_after_with_lookahead(seg_idx: int) -> list[dict[str, str]] | None:
+            if ctx_window <= 0:
+                return None
+            items: list[dict[str, str]] = []
+            scan_idx = seg_idx + 1
+            while scan_idx < len(final_segments) and len(items) < ctx_window:
+                _wait_ocr(scan_idx)
+                item = _context_item(scan_idx, include_translation=False)
+                if item is not None:
+                    items.append(item)
+                scan_idx += 1
+            return items or None
+
+        for seg_idx, seg in enumerate(final_segments):
+            _wait_ocr(seg_idx)
+            _submit_ocr(seg_idx + ctx_window + 1)
+            if str(seg.dialogue_type or "").strip().lower() in {"blank_no_name", "blank", "title"}:
+                continue
+            debug_text = debug_text_by_segment_id.get(seg.segment_id, "")
+            if not str(seg.text_original or "").strip():
+                if not seg.translation_subtitle:
+                    seg.translation_subtitle = debug_text
+                continue
+            cached_item = None
+            k1 = _subtitle_cache_key(seg.segment_id, seg.time_start, seg.time_end, seg.dialogue_type)
+            k2 = _subtitle_cache_key(0, seg.time_start, seg.time_end, seg.dialogue_type)
+            candidate = cache_full.get(k1) or cache_time_type.get(k2)
+            if candidate and str(candidate.get("text_original", "") or "").strip() == str(seg.text_original or "").strip():
+                cached_item = candidate
+            if cached_item and str(cached_item.get("translation_subtitle", "") or "").strip():
+                cached_speaker = str(cached_item.get("speaker", "") or "")
+                if cached_speaker:
+                    seg.speaker = cached_speaker
+                seg.translation_subtitle = str(cached_item.get("translation_subtitle", "") or "")
+                cached_style = cached_item.get("subtitle_style")
+                seg.subtitle_style = copy.deepcopy(cached_style) if isinstance(cached_style, dict) else {}
+                _mark_kanji_overlap_for_review(seg)
+                cache_hit_count += 1
+                _log(f"[LLM] segment {seg.segment_id}: cache hit after OCR, skip request")
+                continue
+
+            history_items = None
+            ctx_before = _context_before_with_translations(seg_idx)
+            ctx_after = _context_after_with_lookahead(seg_idx)
+            try:
+                translated, usage = translate_ocr_text_segment_with_retry(
+                    seg.segment_id,
+                    text_translator,
+                    seg.text_original,
+                    seg.speaker,
+                    history_items=history_items,
+                    extra_requirements=vlm_extra_requirements,
+                    context_before=ctx_before,
+                    context_after=ctx_after,
+                )
+                vlm_prompt_tokens_total += int(usage.get("prompt_tokens", 0))
+                vlm_completion_tokens_total += int(usage.get("completion_tokens", 0))
+                vlm_total_tokens_total += int(
+                    usage.get(
+                        "total_tokens",
+                        int(usage.get("prompt_tokens", 0)) + int(usage.get("completion_tokens", 0)),
+                    )
+                )
+                if translated and translated.strip():
+                    seg.translation_subtitle = translated
+                    _mark_kanji_overlap_for_review(seg)
+                else:
+                    seg.translation_subtitle = debug_text
+                    seg.review_reason.append("llm_translation_empty")
+                    seg.needs_review = True
+                if seg.translation_subtitle and seg.translation_subtitle != debug_text:
+                    history_records.append(
+                        {
+                            "time": f"{seg.time_start:.2f}-{seg.time_end:.2f}s",
+                            "speaker": seg.speaker,
+                            "original": seg.text_original,
+                            "translation": seg.translation_subtitle,
+                        }
+                    )
+                    if len(history_records) > max(0, vlm_history_n):
+                        history_records = history_records[-max(0, vlm_history_n):]
+            except Exception as exc:
+                seg.translation_subtitle = debug_text
+                seg.review_reason.append(f"llm_translation_error:{exc.__class__.__name__}")
+                seg.needs_review = True
+                _log(f"[LLM] segment {seg.segment_id}: request failed ({exc.__class__.__name__}): {exc}")
+
+        ocr_pool.shutdown(wait=True)
+
     if pending_vlm:
         _log(f"Waiting for VLM tasks: {len(pending_vlm)}")
         for fut in as_completed(list(pending_vlm.keys())):
@@ -1519,9 +1836,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _log("All VLM tasks finished.")
     if cache_hit_count > 0:
         _log(f"Translation cache hits: {cache_hit_count}")
-    if vlm_translator is not None and not args.skip_translation:
+    if (vlm_translator is not None or text_translator is not None) and not args.skip_translation:
         _log(
-            "VLM token usage summary: "
+            "Translation token usage summary: "
             f"input={vlm_prompt_tokens_total}, "
             f"output={vlm_completion_tokens_total}, "
             f"total={vlm_total_tokens_total}"
@@ -1531,7 +1848,87 @@ def run_pipeline(args: argparse.Namespace) -> int:
     if name_ocr is not None:
         name_ocr.close()
 
-    work_relative = str(run_cache_path.resolve().relative_to(output_dir.resolve()))
+    auto_review_enabled = bool(getattr(args, "auto_review", False)) or bool(tr_cfg.get("auto_review_enabled", False))
+    if auto_review_enabled and not args.skip_translation:
+        auto_review_entries = []
+        for seg in final_segments:
+            if str(seg.dialogue_type or "").strip().lower() in {"blank_no_name", "blank", "title"}:
+                continue
+            original = str(seg.text_original or "").strip()
+            translation = str(seg.translation_subtitle or "").strip()
+            if not original or not translation:
+                continue
+            auto_review_entries.append(
+                {
+                    "id": int(seg.segment_id),
+                    "speaker": str(seg.speaker or "").strip(),
+                    "original": original,
+                    "translation": translation,
+                }
+            )
+        if auto_review_entries:
+            auto_review_model = str(
+                getattr(args, "auto_review_model", "")
+                or tr_cfg.get("auto_review_model_profile", "")
+                or ""
+            ).strip()
+            auto_review_chunk_size = int(
+                getattr(args, "auto_review_chunk_size", 0)
+                or tr_cfg.get("auto_review_chunk_size", 80)
+                or 80
+            )
+            _log(
+                "自动review 开始: "
+                f"entries={len(auto_review_entries)} chunk_size={auto_review_chunk_size} "
+                f"model={auto_review_model or '(default)'}"
+            )
+            updates, report = run_auto_review_entries(
+                entries=auto_review_entries,
+                glossary=vlm_extra_requirements,
+                tr_cfg=tr_cfg,
+                model_profile=auto_review_model,
+                chunk_size=auto_review_chunk_size,
+                timeout_sec=int(tr_cfg.get("auto_review_timeout_sec", tr_cfg.get("timeout_sec", 120))),
+                temperature=None,
+                max_tokens=int(tr_cfg.get("auto_review_max_tokens", 0) or 0),
+                parse_retries=int(tr_cfg.get("auto_review_parse_retries", 1)),
+                repair_max_tokens=int(tr_cfg.get("auto_review_repair_max_tokens", 0) or 0),
+                review_mode=str(tr_cfg.get("auto_review_mode", "thorough") or "thorough"),
+                stream=False,
+                log_fn=None,
+            )
+            update_map: dict[int, str] = {}
+            reason_map: dict[int, str] = {}
+            for item in updates:
+                if item.get("changed"):
+                    update_map[int(item["id"])] = str(item.get("new_translation", "") or "").strip()
+                    reason_map[int(item["id"])] = str(item.get("reason", "") or "").strip()
+            changed_count = 0
+            for seg in final_segments:
+                new_text = update_map.get(int(seg.segment_id))
+                if not new_text:
+                    continue
+                old_text = str(seg.translation_subtitle or "").strip()
+                if old_text == new_text:
+                    continue
+                seg.translation_subtitle = new_text
+                reason = reason_map.get(int(seg.segment_id), "")
+                if reason:
+                    seg.auto_review_reason = reason
+                changed_count += 1
+                _log(
+                    f"[自动review] seg {seg.segment_id} {seg.speaker}: "
+                    f"{old_text} → {new_text}"
+                )
+                _mark_kanji_overlap_for_review(seg)
+            _log(
+                "自动review 结束: "
+                f"model_updates={report.get('model_update_count', 0)} "
+                f"changed={changed_count} parse_errors={report.get('parse_error_count', 0)}"
+            )
+        else:
+            _log("自动review 已启用但没有可用的对话条目。")
+
     _dump_translation_cache(
         run_cache_path,
         video_path=str(args.video),
@@ -1707,6 +2104,33 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["marker2", "ocr"],
         default="",
         help="How to suppress blank marker segments: marker2 template or name OCR. Required for normal runs.",
+    )
+    parser.add_argument(
+        "--translation-mode",
+        choices=["vlm_responses", "ocr_chat_completions"],
+        default="",
+        help="Translation backend. Overrides translation.mode in config.",
+    )
+    parser.add_argument(
+        "--translation-model",
+        default="",
+        help="translation.model_profiles key to use. Overrides translation.mode_models/config model.",
+    )
+    parser.add_argument(
+        "--auto-review",
+        action="store_true",
+        help="翻译后运行 LLM 自动review，将修改后的译文写入 cache。",
+    )
+    parser.add_argument(
+        "--auto-review-model",
+        default="",
+        help="自动review 使用的 translation.model_profiles key。默认读取 translation.auto_review_model_profile/qwen。",
+    )
+    parser.add_argument(
+        "--auto-review-chunk-size",
+        type=int,
+        default=0,
+        help="自动review chunk size。默认读取 translation.auto_review_chunk_size 或 80。",
     )
     return parser
 

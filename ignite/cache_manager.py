@@ -200,6 +200,7 @@ def _cache_entry_with_review_metadata(entry: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(entry)
     out.pop("srt_start", None)
     out.pop("srt_end", None)
+    out.pop("auto_review_reason", None)
     if "raw_id" not in out:
         out["raw_id"] = _coerce_cache_int(out.get("segment_id"), 0)
     debug_text = _debug_subtitle_from_entry(out)
@@ -296,6 +297,9 @@ def _dump_translation_cache(
             "translation_subtitle": seg.translation_subtitle,
             "subtitle_style": subtitle_style,
         }
+        auto_reason = str(getattr(seg, "auto_review_reason", "") or "").strip()
+        if auto_reason:
+            entry["auto_review_reason"] = auto_reason
         reasons = _merge_review_reasons(
             seg.review_reason,
             ["speaker_style_ambiguous"] if style_ambiguous else [],
