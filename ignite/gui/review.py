@@ -4,6 +4,7 @@ import argparse
 from collections import OrderedDict
 import copy
 import json
+import os
 import re
 import shlex
 import shutil
@@ -22,6 +23,13 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
 from ignite.archive_manager import archive_project, find_hard_subtitle_video
+from ignite.auto_review import (
+    _profile_chat_params,
+    apply_updates_to_cache_entries,
+    default_auto_review_profile,
+    dialogue_review_entries_from_cache_entries,
+    run_auto_review_entries,
+)
 from ignite.cache_manager import (
     MANUAL_INSERT_RAW_ID,
     _debug_subtitle_from_entry,
@@ -36,12 +44,17 @@ from ignite.gui.local_state import (
     remember_dialog_dir,
     remember_window_state,
 )
+from ignite.ocr_engines import build_ocr_engine
 from ignite.review_utils import _merge_review_reasons
 from ignite.translation_runtime import (
-    BailianVlmTranslator,
+    available_translation_model_profiles,
+    ChatCompletionsTextTranslator,
+    TranslationModelProfile,
+    VlmResponsesTranslator,
     has_kanji_overlap_from_original,
     normalize_quotes_for_subtitle,
     load_api_key,
+    resolve_translation_model_profile,
 )
 
 
@@ -141,7 +154,9 @@ class CacheReviewApp:
         self.drag_now: tuple[int, int] | None = None
 
         self.cfg: dict[str, Any] = {}
-        self.translator: BailianVlmTranslator | None = None
+        self.translator: VlmResponsesTranslator | None = None
+        self.text_translator: ChatCompletionsTextTranslator | None = None
+        self.auto_review_model_var = tk.StringVar(value="")
         self.last_review_result: dict[str, Any] | None = None
         self._busy = False
         self.marker_score_cache: dict[str, Any] | None = None
@@ -280,6 +295,15 @@ class CacheReviewApp:
         ttk.Button(nav, text="跳转", command=self._jump_segment).pack(side=tk.LEFT, padx=2)
         ttk.Button(nav, text="保存缓存", command=self._save_cache_file).pack(side=tk.LEFT, padx=(12, 2))
         ttk.Button(nav, text="归档项目", command=self._open_archive_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Label(nav, text="自动review模型").pack(side=tk.LEFT, padx=(12, 2))
+        self._auto_review_model_combo = ttk.Combobox(
+            nav,
+            textvariable=self.auto_review_model_var,
+            state="readonly",
+            width=18,
+        )
+        self._auto_review_model_combo.pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav, text="再次自动review", command=self._auto_review_current_cache).pack(side=tk.LEFT, padx=2)
         ttk.Button(
             nav,
             text="生成字幕（当前Cache）",
@@ -559,8 +583,22 @@ class CacheReviewApp:
             self._marker2_roi = None
         self._init_marker_matchers()
         self._load_marker_score_cache()
+        self._refresh_auto_review_model_choices()
         self.status_var.set(f"已加载配置: {p}")
         self._refresh_canvas()
+
+    def _refresh_auto_review_model_choices(self) -> None:
+        tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+        model_list = available_translation_model_profiles(tcfg, "ocr_chat_completions")
+        try:
+            self._auto_review_model_combo["values"] = model_list
+        except Exception:
+            pass
+        cur = str(self.auto_review_model_var.get() or "").strip()
+        if model_list and cur not in model_list:
+            self.auto_review_model_var.set(default_auto_review_profile(tcfg, str(tcfg.get("auto_review_model_profile", "") or "")))
 
     def _load_subtitle_style_cfg(self) -> dict[str, Any] | None:
         subtitle_style: dict[str, Any] | None = None
@@ -665,7 +703,7 @@ class CacheReviewApp:
             except Exception:
                 pass
 
-    def _build_translator(self) -> BailianVlmTranslator:
+    def _build_translator(self) -> VlmResponsesTranslator:
         want_web_search = bool(self.review_web_search_var.get())
         if (
             self.translator is not None
@@ -675,30 +713,12 @@ class CacheReviewApp:
         self.translator = None
         tcfg = self.cfg.get("translation", {})
         game_cfg = self.cfg.get("game", {})
-        raw_models = tcfg.get("vlm_models", [])
-        models: list[str] = []
-        if isinstance(raw_models, list):
-            models = [str(x).strip() for x in raw_models if str(x).strip()]
-        elif isinstance(raw_models, str) and raw_models.strip():
-            models = [raw_models.strip()]
-        selected_model = str(tcfg.get("model", "") or "").strip()
-        if not models:
-            models = ["qwen3.6-plus"]
-        if selected_model and selected_model not in models:
-            raise RuntimeError("Invalid config: translation.model must be in translation.vlm_models")
-        if not selected_model:
-            selected_model = models[0]
-        api_key_file = str(tcfg.get("api_key_file", "")).strip()
-        if not api_key_file:
-            raise RuntimeError("translation.api_key_file 未配置")
-        api_key_path = Path(api_key_file)
-        if not api_key_path.is_absolute():
-            api_key_path = (ROOT / api_key_path).resolve()
-        api_key = load_api_key(api_key_path)
-        self.translator = BailianVlmTranslator(
+        profile = resolve_translation_model_profile(tcfg, "vlm_responses")
+        api_key = self._api_key_for_profile(profile)
+        self.translator = VlmResponsesTranslator(
             api_key=api_key,
-            model=selected_model,
-            base_url=str(tcfg.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")),
+            model=profile.model,
+            responses_base_url=profile.base_url,
             temperature=float(tcfg.get("temperature", 1.3)),
             enable_thinking=bool(tcfg.get("enable_thinking", True)),
             thinking_budget=tcfg.get("thinking_budget", None),
@@ -707,6 +727,7 @@ class CacheReviewApp:
             timeout_backoff_sec=int(tcfg.get("timeout_backoff_sec", 15)),
             max_retries=int(tcfg.get("max_retries", 2)),
             retry_delay_sec=float(tcfg.get("retry_delay_sec", 1.5)),
+            empty_max_attempts=int(tcfg.get("empty_max_attempts", 3)),
             disable_env_proxy=bool(tcfg.get("disable_env_proxy", True)),
             game_name=str(game_cfg.get("name", "")),
             source_language=str(game_cfg.get("source_language", "ja")),
@@ -717,6 +738,85 @@ class CacheReviewApp:
             enable_web_search=want_web_search,
         )
         return self.translator
+
+    def _translation_mode(self) -> str:
+        mode = str(self.cfg.get("translation", {}).get("mode", "vlm_responses") or "vlm_responses").strip().lower()
+        return "ocr_chat_completions" if mode in {"ocr_chat", "ocr_chat_completions", "ocr_llm"} else "vlm_responses"
+
+    def _api_key_for_profile(self, profile: TranslationModelProfile) -> str:
+        if profile.api_key:
+            return profile.api_key
+        if not profile.api_key_file:
+            return ""
+        p = Path(profile.api_key_file)
+        if not p.is_absolute():
+            cfg_dir = self.config_path.resolve().parent if self.config_path else ROOT
+            candidates = [(cfg_dir / p).resolve(), (ROOT / p).resolve()]
+            p = next((cand for cand in candidates if cand.exists()), candidates[0])
+        return load_api_key(p)
+
+    def _build_text_translator(self) -> ChatCompletionsTextTranslator:
+        want_web_search = bool(self.review_web_search_var.get())
+        if (
+            self.text_translator is not None
+            and bool(getattr(self.text_translator, "enable_web_search", False)) == want_web_search
+        ):
+            return self.text_translator
+        self.text_translator = None
+        tcfg = self.cfg.get("translation", {})
+        game_cfg = self.cfg.get("game", {})
+        profile = resolve_translation_model_profile(tcfg, "ocr_chat_completions")
+        api_key = self._api_key_for_profile(profile)
+        profile_temp, profile_top_p, profile_top_k = _profile_chat_params(tcfg, profile.name)
+        self.text_translator = ChatCompletionsTextTranslator(
+            api_key=api_key,
+            model=profile.model,
+            base_url=profile.base_url,
+            temperature=profile_temp if profile_temp is not None else 1.3,
+            top_p=profile_top_p,
+            top_k=profile_top_k,
+            timeout_sec=int(tcfg.get("timeout_sec", 45)),
+            timeout_backoff_sec=int(tcfg.get("timeout_backoff_sec", 15)),
+            max_retries=int(tcfg.get("max_retries", 2)),
+            retry_delay_sec=float(tcfg.get("retry_delay_sec", 1.5)),
+            empty_max_attempts=int(tcfg.get("empty_max_attempts", 3)),
+            disable_env_proxy=bool(tcfg.get("disable_env_proxy", True)),
+            game_name=str(game_cfg.get("name", "")),
+            source_language=str(game_cfg.get("source_language", "ja")),
+            target_language=str(game_cfg.get("target_language", "zh-CN")),
+            io_log_enabled=True,
+            io_log_path=self.cache_path.parent / "review_chat_io.log",
+            log_fn=lambda s: self._set_status_threadsafe(f"[LLM] {s}"),
+            enable_web_search=want_web_search,
+            context_window=int(tcfg.get("chat_context_window", 8)),
+        )
+        return self.text_translator
+
+    def _get_context_around_index(self, index: int, before: bool) -> list[str | dict[str, str]] | None:
+        ctx_window = max(0, int(getattr(self.text_translator, "context_window", 0)))
+        if ctx_window <= 0 or index < 0 or index >= len(self.entries):
+            return None
+        entries = self.entries
+        result: list[str | dict[str, str]] = []
+        if before:
+            start = max(0, index - ctx_window)
+            for i in range(index - 1, start - 1, -1):
+                t = str(entries[i].get("text_original", "") or "").strip()
+                if t:
+                    speaker = str(entries[i].get("speaker", "") or "").strip()
+                    translation = str(entries[i].get("translation_subtitle", "") or "").strip()
+                    if translation:
+                        result.insert(0, {"speaker": speaker, "original": t, "translation": translation})
+                    else:
+                        result.insert(0, {"speaker": speaker, "original": t})
+        else:
+            end = min(len(entries), index + 1 + ctx_window)
+            for i in range(index + 1, end):
+                t = str(entries[i].get("text_original", "") or "").strip()
+                if t:
+                    speaker = str(entries[i].get("speaker", "") or "").strip()
+                    result.append({"speaker": speaker, "original": t})
+        return result or None
 
     def _get_cached_marker_score(self, sec: float) -> tuple[float | None, float | None]:
         """Return (marker_score, marker2_score) from cache, or (None, None)."""
@@ -2087,6 +2187,54 @@ class CacheReviewApp:
             self.status_var.set(f"{action}前自动保存失败: {exc}")
             return False
 
+    def _auto_review_current_cache(self) -> None:
+        try:
+            self._save_current_entry()
+        except Exception as exc:
+            messagebox.showerror("自动review", f"当前段 JSON 保存失败：{exc}", parent=self.root)
+            return
+        entries_snapshot = copy.deepcopy(self.entries)
+        tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+        game_cfg = self.cfg.get("game", {}) if isinstance(self.cfg.get("game"), dict) else {}
+        glossary = str(game_cfg.get("extra_requirements", "") or "").strip()
+        model_profile = str(self.auto_review_model_var.get() or "").strip()
+        review_entries = dialogue_review_entries_from_cache_entries(entries_snapshot)
+        if not review_entries:
+            messagebox.showinfo("自动review", "没有可 review 的 dialogue 条目。", parent=self.root)
+            return
+
+        def _job() -> None:
+            updates, report = run_auto_review_entries(
+                entries=review_entries,
+                glossary=glossary,
+                tr_cfg=tcfg,
+                model_profile=model_profile,
+                chunk_size=int(tcfg.get("auto_review_chunk_size", 80) or 80),
+                timeout_sec=int(tcfg.get("auto_review_timeout_sec", tcfg.get("timeout_sec", 120))),
+                max_tokens=int(tcfg.get("auto_review_max_tokens", 0) or 0),
+                parse_retries=int(tcfg.get("auto_review_parse_retries", 1)),
+                repair_max_tokens=int(tcfg.get("auto_review_repair_max_tokens", 0) or 0),
+                review_mode=str(tcfg.get("auto_review_mode", "thorough") or "thorough"),
+                stream=False,
+                log_fn=lambda s: self._set_status_threadsafe(f"[自动review] {s}"),
+            )
+
+            def _apply() -> None:
+                changed = apply_updates_to_cache_entries(self.entries, updates)
+                self._rebuild_suspect_indices()
+                self._show_segment(self.current_index)
+                self._save_cache_file(apply_current=False)
+                self.review_text.delete("1.0", tk.END)
+                self.review_text.insert(tk.END, json.dumps(report, ensure_ascii=False, indent=2))
+                self.review_meta_var.set(f"自动review: changed={changed} updates={len(updates)}")
+                self.status_var.set(f"自动review 完成：修改 {changed} 条，已保存缓存。")
+
+            self.root.after(0, _apply)
+
+        self._run_bg("自动review", _job, show_review_progress=True)
+
     def _resolve_output_dir_from_cache(self, cache_path: Path) -> Path:
         cur = cache_path.parent
         while cur != cur.parent:
@@ -2142,6 +2290,7 @@ class CacheReviewApp:
             encoding="utf-8",
             errors="replace",
             check=False,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         if proc.returncode != 0:
             tail = "\n".join((proc.stdout or "").splitlines()[-30:])
@@ -3478,7 +3627,6 @@ class CacheReviewApp:
             self._save_current_entry()
             if not self.entries:
                 raise RuntimeError("无分段")
-            tr = self._build_translator()
             name_crop = self._crop(self.review_rois["name_roi"])
             dia_crop = self._crop(self.review_rois["dialogue_roi"])
             out_dir = self.cache_path.parent / "review_tmp"
@@ -3491,14 +3639,33 @@ class CacheReviewApp:
             cv2.imwrite(str(dia_img), cv2.cvtColor(dia_crop, cv2.COLOR_RGB2BGR))
             speaker_hint = str(self.entries[self.current_index].get("speaker", "") or "")
             custom = self._get_custom_prompt()
-            spk, orig, trans, usage = tr.translate_image_ja_to_zh_cn_structured_with_tag(
-                image_path=dia_img,
-                speaker_image_path=name_img,
-                speaker=speaker_hint,
-                request_tag=f"review-seg-{seg_no}",
-                history_items=None,
-                custom_prompt=custom,
-            )
+            if self._translation_mode() == "ocr_chat_completions":
+                ocr = build_ocr_engine(self.cfg.get("ocr", {}))
+                spk_result = ocr.recognize(name_img)
+                orig_result = ocr.recognize(dia_img)
+                spk = str(spk_result.text or "").strip() or speaker_hint
+                orig = str(orig_result.text or "").strip()
+                if not orig:
+                    raise RuntimeError("OCR 未识别到对话原文")
+                tr_text = self._build_text_translator()
+                trans, usage = tr_text.translate_text_with_prompt(
+                    original_text=orig,
+                    speaker=spk,
+                    request_tag=f"review-ocr-chat-{seg_no}",
+                    custom_prompt=custom,
+                    context_before=self._get_context_around_index(self.current_index, before=True),
+                    context_after=self._get_context_around_index(self.current_index, before=False),
+                )
+            else:
+                tr = self._build_translator()
+                spk, orig, trans, usage = tr.translate_image_ja_to_zh_cn_structured_with_tag(
+                    image_path=dia_img,
+                    speaker_image_path=name_img,
+                    speaker=speaker_hint,
+                    request_tag=f"review-seg-{seg_no}",
+                    history_items=None,
+                    custom_prompt=custom,
+                )
             base_entry = self.entries[self.current_index]
             result = self._build_review_entry(
                 base_entry=base_entry,
@@ -3514,17 +3681,28 @@ class CacheReviewApp:
     def _review_by_text_only(self) -> None:
         def _job() -> None:
             parsed = self._read_current_json_from_editor()
-            tr = self._build_translator()
             original_text = str(parsed.get("text_original", "") or "").strip()
             if not original_text:
                 raise RuntimeError("当前段 text_original 为空")
             speaker = str(parsed.get("speaker", "") or "").strip()
-            translated, usage = tr.translate_text_with_prompt(
-                original_text=original_text,
-                speaker=speaker,
-                request_tag=f"review-text-{self.current_index + 1}",
-                custom_prompt=self._get_custom_prompt(),
-            )
+            if self._translation_mode() == "ocr_chat_completions":
+                tr_text = self._build_text_translator()
+                translated, usage = tr_text.translate_text_with_prompt(
+                    original_text=original_text,
+                    speaker=speaker,
+                    request_tag=f"review-text-{self.current_index + 1}",
+                    custom_prompt=self._get_custom_prompt(),
+                    context_before=self._get_context_around_index(self.current_index, before=True),
+                    context_after=self._get_context_around_index(self.current_index, before=False),
+                )
+            else:
+                tr = self._build_translator()
+                translated, usage = tr.translate_text_with_prompt(
+                    original_text=original_text,
+                    speaker=speaker,
+                    request_tag=f"review-text-{self.current_index + 1}",
+                    custom_prompt=self._get_custom_prompt(),
+                )
             base_entry = self.entries[self.current_index]
             result = self._build_review_entry(
                 base_entry=base_entry,

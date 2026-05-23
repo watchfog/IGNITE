@@ -28,6 +28,10 @@ from ignite.gui.local_state import (
     remember_dialog_dir,
     remember_window_state,
 )
+from ignite.translation_runtime import (
+    available_translation_model_profiles,
+    resolve_translation_model_profile,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -114,8 +118,11 @@ class ProfileEditor:
         self.extra_requirements_var = tk.StringVar(value="")
         self.source_lang_var = tk.StringVar(value="ja")
         self.target_lang_var = tk.StringVar(value="zh-CN")
+        self.translation_mode_var = tk.StringVar(value="vlm_responses")
         self.vlm_models_var = tk.StringVar(value="")
         self.vlm_model_var = tk.StringVar(value="")
+        self.auto_review_enabled_var = tk.BooleanVar(value=False)
+        self.auto_review_model_var = tk.StringVar(value="")
         self.match_score_var = tk.StringVar(value="Marker匹配分数: N/A")
         self.marker2_template_paths_var = tk.StringVar(value="")
         self.marker2_template_selected_var = tk.StringVar(value="")
@@ -317,8 +324,21 @@ class ProfileEditor:
         ).grid(row=3, column=5, sticky="w")
         ttk.Checkbutton(top, text="Debug", variable=self.debug_mode_var).grid(row=3, column=6, sticky="w")
         ttk.Checkbutton(top, text="跳过翻译", variable=self.skip_translation_var).grid(row=3, column=7, sticky="w")
-        ttk.Checkbutton(top, text="启用OCR", variable=self.enable_name_ocr_var).grid(row=3, column=8, sticky="w")
-        ttk.Button(top, text="运行流程", command=self._run_pipeline_from_gui).grid(row=3, column=9, padx=2)
+        ttk.Checkbutton(top, text="OCR分段", variable=self.enable_name_ocr_var).grid(row=3, column=8, sticky="w")
+        ttk.Checkbutton(
+            top,
+            text="自动review",
+            variable=self.auto_review_enabled_var,
+            command=self._schedule_profile_preview_refresh,
+        ).grid(row=3, column=9, sticky="w", padx=(2, 0))
+        self._auto_review_model_combo = ttk.Combobox(
+            top,
+            textvariable=self.auto_review_model_var,
+            state="readonly",
+            width=18,
+        )
+        self._auto_review_model_combo.grid(row=3, column=10, sticky="w", padx=(2, 0))
+        ttk.Button(top, text="运行流程", command=self._run_pipeline_from_gui).grid(row=3, column=11, padx=(6, 2))
 
         self.time_scale = ttk.Scale(
             top,
@@ -424,12 +444,20 @@ class ProfileEditor:
         )
         ttk.Label(top, text="目标语言").grid(row=14, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(top, textvariable=self.target_lang_var, width=12).grid(row=14, column=3, sticky="w", pady=(4, 0))
-        ttk.Label(top, text="VLM模型").grid(row=15, column=0, sticky="w", pady=(4, 0))
-        self._vlm_model_combo = ttk.Combobox(
-            top, textvariable=self.vlm_model_var, state="readonly", width=20,
+        ttk.Label(top, text="翻译模式").grid(row=15, column=0, sticky="w", pady=(4, 0))
+        self._translation_mode_combo = ttk.Combobox(
+            top,
+            textvariable=self.translation_mode_var,
+            state="readonly",
+            values=["vlm_responses", "ocr_chat_completions"],
+            width=22,
         )
-        self._vlm_model_combo.grid(row=15, column=1, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0))
-
+        self._translation_mode_combo.grid(row=15, column=1, sticky="w", padx=(6, 4), pady=(4, 0))
+        ttk.Label(top, text="翻译模型").grid(row=15, column=2, sticky="e", padx=(10, 0), pady=(4, 0))
+        self._vlm_model_combo = ttk.Combobox(
+            top, textvariable=self.vlm_model_var, state="readonly", width=24,
+        )
+        self._vlm_model_combo.grid(row=15, column=3, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0))
         top.columnconfigure(1, weight=1)
 
         info = ttk.Frame(self.root, padding=(8, 0, 8, 6))
@@ -486,6 +514,7 @@ class ProfileEditor:
         ]:
             var.trace_add("write", lambda *_: self._update_marker2_match_score())
         self.output_name_var.trace_add("write", lambda *_: self._on_output_name_changed())
+        self.translation_mode_var.trace_add("write", lambda *_: self._on_translation_mode_changed())
         for var in [
             self.video_path_var,
             self.template_paths_var,
@@ -508,8 +537,10 @@ class ProfileEditor:
             self.game_name_var,
             self.source_lang_var,
             self.target_lang_var,
+            self.translation_mode_var,
             self.vlm_models_var,
             self.vlm_model_var,
+            self.auto_review_model_var,
             self.output_name_var,
             self.extra_requirements_var,
         ]:
@@ -542,6 +573,43 @@ class ProfileEditor:
             self._remember_dialog_dir("profile.config_open", p)
             self.config_path_var.set(p)
             self._load_config_only()
+
+    def _on_translation_mode_changed(self) -> None:
+        tr_cfg = self.cfg_merged.get("translation", {}) if isinstance(self.cfg_merged, dict) else {}
+        if not isinstance(tr_cfg, dict):
+            tr_cfg = {}
+        mode = str(self.translation_mode_var.get() or "vlm_responses").strip()
+        model_list = available_translation_model_profiles(tr_cfg, mode)
+        self.vlm_models_var.set(", ".join(model_list))
+        try:
+            self._vlm_model_combo["values"] = model_list
+        except Exception:
+            pass
+        cur = str(self.vlm_model_var.get() or "").strip()
+        if model_list and cur not in model_list:
+            mode_models = tr_cfg.get("mode_models")
+            preferred = ""
+            if isinstance(mode_models, dict):
+                preferred = str(mode_models.get(mode, "") or "").strip()
+            self.vlm_model_var.set(preferred if preferred in model_list else model_list[0])
+        self._refresh_auto_review_model_choices(tr_cfg)
+
+    def _refresh_auto_review_model_choices(self, tr_cfg: dict[str, Any] | None = None) -> None:
+        if tr_cfg is None:
+            tr_cfg = self.cfg_merged.get("translation", {}) if isinstance(self.cfg_merged, dict) else {}
+        if not isinstance(tr_cfg, dict):
+            tr_cfg = {}
+        model_list = available_translation_model_profiles(tr_cfg, "ocr_chat_completions")
+        try:
+            self._auto_review_model_combo["values"] = model_list
+        except Exception:
+            pass
+        cur = str(self.auto_review_model_var.get() or "").strip()
+        if model_list and cur not in model_list:
+            preferred = str(tr_cfg.get("auto_review_model_profile", "") or "").strip()
+            if preferred not in model_list:
+                preferred = "qwen3.6-plus" if "qwen3.6-plus" in model_list else model_list[0]
+            self.auto_review_model_var.set(preferred)
 
     def _apply_video_to_current_profile(self, video_path: Path) -> None:
         raw_cfg = self.config_path_var.get().strip()
@@ -824,17 +892,28 @@ class ProfileEditor:
         self.source_lang_var.set(str(game_cfg.get("source_language", "ja")))
         self.target_lang_var.set(str(game_cfg.get("target_language", "zh-CN")))
         tr_cfg = self.cfg_merged.get("translation", {})
-        models = tr_cfg.get("vlm_models", [])
-        if isinstance(models, list):
-            model_list = [str(x).strip() for x in models if str(x).strip()]
-        else:
-            model_list = ["qwen3.6-plus"]
+        mode = str(tr_cfg.get("mode", "vlm_responses") or "vlm_responses").strip()
+        if mode not in {"vlm_responses", "ocr_chat_completions"}:
+            mode = "vlm_responses"
+        self.translation_mode_var.set(mode)
+        model_list = available_translation_model_profiles(tr_cfg, mode)
         self.vlm_models_var.set(", ".join(model_list))
         self._vlm_model_combo["values"] = model_list
-        cur_model = str(tr_cfg.get("model", "") or "").strip()
+        mode_models = tr_cfg.get("mode_models")
+        cur_model = ""
+        if isinstance(mode_models, dict):
+            cur_model = str(mode_models.get(mode, "") or "").strip()
+        if not cur_model:
+            cur_model = str(tr_cfg.get("model", "") or "").strip()
         if not cur_model or cur_model not in model_list:
             cur_model = model_list[0] if model_list else "qwen3.6-plus"
         self.vlm_model_var.set(cur_model)
+        self.auto_review_enabled_var.set(bool(tr_cfg.get("auto_review_enabled", False)))
+        self._refresh_auto_review_model_choices(tr_cfg)
+        review_model = str(tr_cfg.get("auto_review_model_profile", "") or "").strip()
+        review_models = list(self._auto_review_model_combo["values"] or [])
+        if review_model and review_model in review_models:
+            self.auto_review_model_var.set(review_model)
         cfg_out_name = str(self.cfg_merged.get("output_name", "") or "").strip()
         if cfg_out_name:
             self._set_output_name_value(cfg_out_name, is_auto=False)
@@ -1271,26 +1350,24 @@ class ProfileEditor:
             if not isinstance(tr_cfg, dict):
                 tr_cfg = {}
 
-            vlm_api = str(tr_cfg.get("vlm_api", "") or "").strip()
-            if not vlm_api:
-                errs.append(
-                    "未勾选“跳过翻译”时必须配置 translation.vlm_api（请在 config/general_config.yaml 中填写）。"
-                )
-
-            api_key_inline = str(tr_cfg.get("api_key", "") or "").strip()
-            api_key_file = str(tr_cfg.get("api_key_file", "") or "").strip()
-            if not api_key_inline and not api_key_file:
-                errs.append(
-                    "未勾选“跳过翻译”时必须配置 translation.api_key 或 translation.api_key_file。"
-                )
-            elif (not api_key_inline) and api_key_file:
-                key_path = Path(api_key_file)
-                if not key_path.is_absolute():
-                    key_path = (ROOT / key_path).resolve()
-                if not key_path.exists() or not key_path.is_file():
-                    errs.append(
-                        f"api_key_file 不存在：{key_path}（请检查 translation.api_key_file）。"
-                    )
+            mode = str(self.translation_mode_var.get().strip() or tr_cfg.get("mode", "vlm_responses"))
+            model = str(self.vlm_model_var.get().strip())
+            try:
+                profile = resolve_translation_model_profile(tr_cfg, mode, model)
+            except Exception as exc:
+                errs.append(f"翻译模型配置无效：{exc}")
+            else:
+                api_key_file = str(profile.api_key_file or "").strip()
+                if api_key_file:
+                    key_path = Path(api_key_file)
+                    if not key_path.is_absolute():
+                        cfg_dir = Path(raw_cfg).resolve().parent if raw_cfg else ROOT
+                        candidates = [(cfg_dir / key_path).resolve(), (ROOT / key_path).resolve()]
+                        key_path = next((cand for cand in candidates if cand.exists()), candidates[0])
+                    if not key_path.exists() or not key_path.is_file():
+                        errs.append(
+                            f"api_key_file 不存在：{key_path}（请检查 translation.model_profiles）。"
+                        )
         return errs
 
     def _append_run_log(self, text: str) -> None:
@@ -1412,6 +1489,7 @@ class ProfileEditor:
         run_log_file.parent.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         self.root.after(0, lambda: self._append_run_log(f"$ {' '.join(cmd)}\n"))
         with run_log_file.open("a", encoding="utf-8") as wf:
             wf.write(f"$ {' '.join(cmd)}\n")
@@ -1480,6 +1558,15 @@ class ProfileEditor:
         if bool(self.debug_mode_var.get()):
             cmd.append("--debug")
         if "--subtitles-from-cache" not in extra_args:
+            cmd.extend(["--translation-mode", str(self.translation_mode_var.get().strip() or "vlm_responses")])
+            model = str(self.vlm_model_var.get().strip())
+            if model:
+                cmd.extend(["--translation-model", model])
+            if bool(self.auto_review_enabled_var.get()):
+                cmd.append("--auto-review")
+                review_model = str(self.auto_review_model_var.get().strip())
+                if review_model:
+                    cmd.extend(["--auto-review-model", review_model])
             cmd.extend(
                 [
                     "--dialogue-presence-mode",
@@ -2521,11 +2608,25 @@ class ProfileEditor:
         data.setdefault("translation", {})
         if not isinstance(data["translation"], dict):
             data["translation"] = {}
+        mode = str(self.translation_mode_var.get().strip() or "vlm_responses")
+        data["translation"]["mode"] = mode
         sel_model = str(self.vlm_model_var.get().strip())
         if sel_model:
             data["translation"]["model"] = sel_model
+            mode_models = data["translation"].get("mode_models")
+            if not isinstance(mode_models, dict):
+                mode_models = {}
+                data["translation"]["mode_models"] = mode_models
+            mode_models[mode] = sel_model
         else:
             data["translation"].pop("model", None)
+        data["translation"]["auto_review_enabled"] = bool(self.auto_review_enabled_var.get())
+        review_model = str(self.auto_review_model_var.get().strip())
+        if review_model:
+            data["translation"]["auto_review_model_profile"] = review_model
+        else:
+            data["translation"].pop("auto_review_model_profile", None)
+        data["translation"].setdefault("auto_review_chunk_size", 80)
 
     def _save_config(self) -> bool:
         raw_cfg = self.config_path_var.get().strip()
