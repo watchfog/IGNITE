@@ -70,6 +70,84 @@ def _add_black_border_for_ocr(img: np.ndarray, border_ratio: float, min_border_p
     )
 
 
+def _normalize_box_pts(box: Any) -> list[tuple[float, float]]:
+    if hasattr(box, "tolist"):
+        try:
+            box = box.tolist()
+        except Exception:
+            pass
+    if not isinstance(box, (list, tuple)):
+        return []
+    pts: list[tuple[float, float]] = []
+    for pt in box:
+        if hasattr(pt, "tolist"):
+            try:
+                pt = pt.tolist()
+            except Exception:
+                return []
+        if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+            return []
+        try:
+            pts.append((float(pt[0]), float(pt[1])))
+        except (ValueError, TypeError):
+            return []
+    return pts
+
+
+def _sort_ocr_texts_ltr_topdown(
+    txts: list[str],
+    scores: list[float],
+    boxes: Any,
+) -> tuple[list[str], list[float], list[int]]:
+    raw_boxes: list[Any] = []
+    if hasattr(boxes, "tolist"):
+        raw_boxes = list(boxes.tolist())
+    elif isinstance(boxes, (list, tuple)):
+        raw_boxes = list(boxes)
+    else:
+        return txts, scores, [len(txts)]
+
+    if len(raw_boxes) <= 1 or len(raw_boxes) != len(txts):
+        return txts, scores, [len(txts)]
+
+    items: list[tuple[float, float, float, int]] = []
+    for i, box in enumerate(raw_boxes):
+        pts = _normalize_box_pts(box)
+        if len(pts) < 2:
+            return txts, scores, [len(txts)]
+        ys = [p[1] for p in pts]
+        xs = [p[0] for p in pts]
+        items.append((min(ys), max(ys), sum(xs) / len(xs), i))
+
+    items.sort(key=lambda it: it[0])
+
+    rows: list[list[tuple[float, float, float, int]]] = []
+    current_row = [items[0]]
+    current_bottom = items[0][1]
+    for it in items[1:]:
+        min_y, max_y, _, _ = it
+        if min_y < current_bottom:
+            current_row.append(it)
+            if max_y > current_bottom:
+                current_bottom = max_y
+        else:
+            rows.append(current_row)
+            current_row = [it]
+            current_bottom = max_y
+    rows.append(current_row)
+
+    ordered: list[int] = []
+    row_lengths: list[int] = []
+    for row in rows:
+        row.sort(key=lambda it: it[2])
+        ordered.extend(idx for _, _, _, idx in row)
+        row_lengths.append(len(row))
+
+    new_txts = [txts[i] for i in ordered]
+    new_scores = [scores[i] for i in ordered]
+    return new_txts, new_scores, row_lengths
+
+
 class RapidOcrEngine(OcrEngine):
     def __init__(
         self,
@@ -79,13 +157,18 @@ class RapidOcrEngine(OcrEngine):
         model_root_dir: str | None = None,
         input_border_ratio: float = 0.5,
         input_border_min_px: int = 40,
+        rec_only: bool = False,
+        model_type: str = "mobile",
+        provider: str = "cpu",
     ) -> None:
         _install_rapidocr_log_filter()
-        self._runtime = ""
+        self._provider = str(provider or "cpu").strip().lower()
         self._requested_lang = rec_lang
         self._target_lang = "ch"
         self._input_border_ratio = max(0.0, float(input_border_ratio))
         self._input_border_min_px = max(0, int(input_border_min_px))
+        self._rec_only = bool(rec_only)
+        self._model_type = "server" if str(model_type or "mobile").strip().lower() == "server" else "mobile"
         if disable_env_proxy:
             for k in [
                 "HTTP_PROXY",
@@ -103,21 +186,26 @@ class RapidOcrEngine(OcrEngine):
             params: dict[str, Any] = {
                 "Det.engine_type": EngineType.ONNXRUNTIME,
                 "Det.lang_type": LangDet.CH,
-                "Det.model_type": ModelType.MOBILE,
+                "Det.model_type": ModelType.SERVER if self._model_type == "server" else ModelType.MOBILE,
                 "Det.ocr_version": OCRVersion.PPOCRV5,
                 "Rec.engine_type": EngineType.ONNXRUNTIME,
                 "Rec.lang_type": LangRec.CH,
-                "Rec.model_type": ModelType.MOBILE,
+                "Rec.model_type": ModelType.SERVER if self._model_type == "server" else ModelType.MOBILE,
                 "Rec.ocr_version": OCRVersion.PPOCRV5,
                 "Cls.engine_type": EngineType.ONNXRUNTIME,
                 "Cls.lang_type": LangDet.CH,
-                "Cls.model_type": ModelType.MOBILE,
+                "Cls.model_type": ModelType.SERVER if self._model_type == "server" else ModelType.MOBILE,
                 "Cls.ocr_version": OCRVersion.PPOCRV5,
             }
 
             custom_model_root = str(model_root_dir or "").strip()
             if custom_model_root:
                 params["Global.model_root_dir"] = str(Path(custom_model_root).resolve())
+
+            if self._provider == "dml":
+                params["EngineConfig.onnxruntime.use_dml"] = True
+            elif self._provider == "cuda":
+                params["EngineConfig.onnxruntime.use_cuda"] = True
 
             self._engine = RapidOCR(params=params)
             self._runtime = "rapidocr"
@@ -132,19 +220,41 @@ class RapidOcrEngine(OcrEngine):
             )
 
     def recognize(self, image_path: str | Path) -> OcrResult:
-        img = _load_for_ocr(image_path)
+        return self.recognize_array(_load_for_ocr(image_path))
+
+    def recognize_array(self, img: np.ndarray) -> OcrResult:
         img = _add_black_border_for_ocr(
             img,
             border_ratio=self._input_border_ratio,
             min_border_px=self._input_border_min_px,
         )
-        output = self._engine(img)
-        # rapidocr returns RapidOCROutput(txts=..., scores=...)
+        output = self._engine(
+            img,
+            use_det=not self._rec_only,
+            use_cls=not self._rec_only,
+        )
+        return self._parse_ocr_output(output)
+
+    def _parse_ocr_output(self, output: Any) -> OcrResult:
         if hasattr(output, "txts") and hasattr(output, "scores"):
             txts = list(getattr(output, "txts", []) or [])
             scores = [float(x) for x in (getattr(output, "scores", []) or [])]
             if not txts:
                 return OcrResult(text="", confidence=0.0)
+            boxes = getattr(output, "boxes", None)
+            if boxes is not None:
+                txts, scores, row_lengths = _sort_ocr_texts_ltr_topdown(txts, scores, boxes)
+                conf = float(np.mean(scores)) if scores else 0.0
+                if row_lengths and len(row_lengths) > 1:
+                    parts: list[str] = []
+                    idx = 0
+                    for count in row_lengths:
+                        parts.append("".join(txts[idx : idx + count]))
+                        idx += count
+                    text = "\n".join(p for p in parts if p).strip()
+                else:
+                    text = "".join(txts).strip()
+                return OcrResult(text=text, confidence=conf)
             conf = float(np.mean(scores)) if scores else 0.0
             return OcrResult(text="".join(txts).strip(), confidence=conf)
 
@@ -166,6 +276,9 @@ class RapidOcrEngine(OcrEngine):
             "requested_lang": self._requested_lang,
             "input_border_ratio": self._input_border_ratio,
             "input_border_min_px": self._input_border_min_px,
+            "rec_only": self._rec_only,
+            "model_type": self._model_type,
+            "provider": self._provider,
         }
 
 
@@ -181,5 +294,8 @@ def build_ocr_engine(cfg: dict[str, Any]) -> OcrEngine:
             model_root_dir=cfg.get("rapidocr_model_root_dir"),
             input_border_ratio=float(cfg.get("input_border_ratio", 0.5)),
             input_border_min_px=int(cfg.get("input_border_min_px", 40)),
+            rec_only=bool(cfg.get("rec_only", False)),
+            model_type=str(cfg.get("rapidocr_model_type", "mobile") or "mobile").strip(),
+            provider=str(cfg.get("rapidocr_provider", "cpu") or "cpu").strip(),
         )
     raise ValueError(f"Unsupported OCR engine: {engine}")

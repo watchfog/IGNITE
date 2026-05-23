@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import json
 import re
 import threading
@@ -11,6 +12,155 @@ from urllib import error as urlerror
 
 from .log_utils import _log
 from urllib import request
+
+
+DEFAULT_RESPONSES_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_CHAT_COMPLETIONS_BASE_URL = DEFAULT_RESPONSES_BASE_URL
+
+
+@dataclass(frozen=True)
+class TranslationModelProfile:
+    name: str
+    model: str
+    base_url: str
+    api_key: str = ""
+    api_key_file: str = ""
+
+
+def resolve_responses_base_url(cfg: dict[str, Any]) -> str:
+    for key in ("responses_base_url", "vlm_api", "base_url"):
+        value = str(cfg.get(key, "") or "").strip()
+        if value:
+            return value
+    return DEFAULT_RESPONSES_BASE_URL
+
+
+def resolve_chat_completions_base_url(cfg: dict[str, Any]) -> str:
+    for key in ("chat_completions_base_url", "responses_base_url", "vlm_api", "base_url"):
+        value = str(cfg.get(key, "") or "").strip()
+        if value:
+            return value
+    return DEFAULT_CHAT_COMPLETIONS_BASE_URL
+
+
+def _profile_base_url(cfg: dict[str, Any], mode: str) -> str:
+    if str(mode or "").strip().lower() == "ocr_chat_completions":
+        return resolve_chat_completions_base_url(cfg)
+    return resolve_responses_base_url(cfg)
+
+
+def _list_model_names(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _profile_supports_mode(raw_profile: Any, mode: str) -> bool:
+    if not isinstance(raw_profile, dict):
+        return True
+    allowed = raw_profile.get("modes")
+    if allowed is None:
+        return True
+    if not isinstance(allowed, list):
+        allowed = [allowed]
+    if not allowed:
+        return True
+    clean_mode = str(mode or "").strip().lower()
+    return clean_mode in [str(m or "").strip().lower() for m in allowed]
+
+
+def available_translation_model_profiles(cfg: dict[str, Any], mode: str = "") -> list[str]:
+    raw_profiles = cfg.get("model_profiles")
+    if isinstance(raw_profiles, dict) and raw_profiles:
+        clean_mode = str(mode or "").strip().lower()
+        return [
+            str(k).strip()
+            for k, v in raw_profiles.items()
+            if str(k).strip() and _profile_supports_mode(v, clean_mode)
+        ]
+    names = _list_model_names(cfg.get("text_models" if mode == "ocr_chat_completions" else "vlm_models"))
+    if not names:
+        names = _list_model_names(cfg.get("vlm_models")) or _list_model_names(cfg.get("text_models"))
+    raw_model = str(cfg.get("model", "") or "").strip()
+    if raw_model and raw_model not in names:
+        names.insert(0, raw_model)
+    return names or ["qwen3.6-plus"]
+
+
+def resolve_translation_model_profile(
+    cfg: dict[str, Any],
+    mode: str,
+    requested_profile: str = "",
+) -> TranslationModelProfile:
+    clean_mode = str(mode or "vlm_responses").strip().lower()
+    requested = str(requested_profile or "").strip()
+    mode_models = cfg.get("mode_models")
+    mode_default = ""
+    if isinstance(mode_models, dict):
+        mode_default = str(mode_models.get(clean_mode, "") or "").strip()
+
+    raw_profiles = cfg.get("model_profiles")
+    if isinstance(raw_profiles, dict) and raw_profiles:
+        profile_names = [str(k).strip() for k in raw_profiles.keys() if str(k).strip()]
+        if not profile_names:
+            raise ValueError("translation.model_profiles is empty")
+        selected = requested or mode_default or str(cfg.get("model", "") or "").strip() or profile_names[0]
+        if selected not in raw_profiles:
+            matched = ""
+            for name, raw_profile in raw_profiles.items():
+                if isinstance(raw_profile, dict) and str(raw_profile.get("model", "") or "").strip() == selected:
+                    matched = str(name)
+                    break
+            selected = matched or selected
+        if selected not in raw_profiles:
+            raise ValueError(f"translation model profile not found: {selected}")
+        raw = raw_profiles[selected]
+        if not _profile_supports_mode(raw, clean_mode):
+            raise ValueError(
+                f"model profile '{selected}' does not support translation mode '{clean_mode}'"
+            )
+        profile = raw if isinstance(raw, dict) else {}
+        profile_has_auth_key = "api_key" in profile
+        profile_has_auth_file = "api_key_file" in profile
+        api_key = str(profile.get("api_key", "") or "").strip()
+        api_key_file = str(profile.get("api_key_file", "") or "").strip()
+        if not api_key_file and not profile_has_auth_key and not profile_has_auth_file:
+            api_key_file = str(cfg.get("api_key_file", "") or "").strip()
+        return TranslationModelProfile(
+            name=selected,
+            model=str(profile.get("model", "") or selected).strip() or selected,
+            base_url=str(profile.get("base_url", "") or _profile_base_url(cfg, clean_mode)).strip(),
+            api_key=api_key,
+            api_key_file=api_key_file,
+        )
+
+    names = available_translation_model_profiles(cfg, clean_mode)
+    selected = requested or mode_default or str(cfg.get("model", "") or "").strip() or names[0]
+    return TranslationModelProfile(
+        name=selected,
+        model=selected,
+        base_url=_profile_base_url(cfg, clean_mode),
+        api_key=str(cfg.get("api_key", "") or "").strip(),
+        api_key_file=str(cfg.get("api_key_file", "") or "").strip(),
+    )
+
+
+def load_api_key_for_profile(profile: TranslationModelProfile) -> str:
+    if profile.api_key:
+        return profile.api_key
+    if profile.api_key_file:
+        return load_api_key(profile.api_key_file)
+    return ""
+
+
+def _auth_headers(api_key: str) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    clean_key = str(api_key or "").strip()
+    if clean_key:
+        headers["Authorization"] = f"Bearer {clean_key}"
+    return headers
 
 
 def load_api_key(path: str | Path) -> str:
@@ -167,74 +317,9 @@ def _language_label_zh(lang: str) -> str:
     return mapping.get(v, lang)
 
 
-# class DeepSeekTranslator:
-#     def __init__(
-#         self,
-#         api_url: str,
-#         api_key: str,
-#         model: str = "deepseek-chat",
-#         temperature: float = 1.3,
-#         game_name: str = "",
-#         source_language: str = "ja",
-#         target_language: str = "zh-CN",
-#     ) -> None:
-#         self.api_url = api_url
-#         self.api_key = api_key
-#         self.model = model
-#         self.temperature = float(temperature)
-#         self.game_name = game_name.strip()
-#         self.source_language = _language_label_zh(source_language.strip() or "ja")
-#         self.target_language = _language_label_zh(target_language.strip() or "zh-CN")
-
-#     def translate_ja_to_zh_cn(self, text: str) -> str:
-#         if not text.strip():
-#             return ""
-#         game_hint = f"，内容与{self.game_name}相关" if self.game_name else ""
-#         prompt = (
-#             f"将我给的{self.source_language}原文翻译为{self.target_language}{game_hint}。"
-#             "注意保留换行符和格式，绝对禁止添加和原文无关的翻译。"
-#             "不要解释翻译方式，直接给出译文。"
-#             ""
-#         )
-#         payload: dict[str, Any] = {
-#             "model": self.model,
-#             "temperature": self.temperature,
-#             "messages": [
-#                 {
-#                     "role": "system",
-#                     "content": f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。\n译文需要保留原文的换行符和格式，禁止添加和原文无关的内容。",
-#                 },
-#                 {
-#                     "role": "user",
-#                     "content": f"{prompt}\n{text}",
-#                 },
-#             ],
-#         }
-#         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-#         req = request.Request(
-#             self.api_url,
-#             data=body,
-#             headers={
-#                 "Content-Type": "application/json",
-#                 "Authorization": f"Bearer {self.api_key}",
-#             },
-#             method="POST",
-#         )
-#         with request.urlopen(req, timeout=60) as resp:
-#             raw = resp.read().decode("utf-8")
-#         data = json.loads(raw)
-#         out = (
-#             data.get("choices", [{}])[0]
-#             .get("message", {})
-#             .get("content", "")
-#             .strip()
-#         )
-#         return normalize_quotes_for_subtitle(out)
-
-
 def translate_segment_with_retry(
     seg_id: int,
-    translator: BailianVlmTranslator,
+    translator: VlmResponsesTranslator,
     speaker_image_path: Path,
     image_path: Path,
     speaker: str,
@@ -286,17 +371,71 @@ def translate_segment_with_retry(
     raise RuntimeError("VLM request failed without an exception")
 
 
-class BailianVlmTranslator:
+def translate_ocr_text_segment_with_retry(
+    seg_id: int,
+    translator: ChatCompletionsTextTranslator,
+    original_text: str,
+    speaker: str = "",
+    history_items: list[dict[str, str]] | None = None,
+    extra_requirements: str = "",
+    context_before: list[str | dict[str, str]] | None = None,
+    context_after: list[str | dict[str, str]] | None = None,
+) -> tuple[str, dict[str, int]]:
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    attempts = max(1, int(getattr(translator, "max_retries", 0)) + 1)
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        _log(f"[LLM] segment {seg_id}: request started (attempt {attempt}/{attempts})")
+        try:
+            translated_text, usage = translator.translate_text_with_prompt(
+                original_text=original_text,
+                speaker=speaker,
+                request_tag=f"segment {seg_id}",
+                history_items=history_items,
+                extra_requirements=extra_requirements,
+                context_before=context_before,
+                context_after=context_after,
+            )
+            pt = _safe_int(usage.get("prompt_tokens", 0))
+            ct = _safe_int(usage.get("completion_tokens", 0))
+            tt = _safe_int(usage.get("total_tokens", pt + ct), pt + ct)
+            _log(
+                f"[LLM] segment {seg_id}: request succeeded "
+                f"(orig_chars={len(original_text)}, trans_chars={len(translated_text)}, "
+                f"tokens_in={pt}, tokens_out={ct}, tokens_total={tt})"
+            )
+            return translated_text, usage
+        except Exception as exc:
+            last_err = exc
+            detail = str(exc).strip() or repr(exc)
+            if attempt >= attempts:
+                break
+            _log(
+                f"[LLM] segment {seg_id}: {exc.__class__.__name__} on attempt "
+                f"{attempt}/{attempts}: {detail}; retrying"
+            )
+            time.sleep(max(0.0, float(getattr(translator, "retry_delay_sec", 0.0))))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("LLM request failed without an exception")
+
+
+class VlmResponsesTranslator:
     def __init__(
         self,
         api_key: str,
         model: str = "qwen3.6-plus",
-        base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        responses_base_url: str = DEFAULT_RESPONSES_BASE_URL,
         temperature: float = 1.3,
         enable_thinking: bool = False,
         thinking_budget: int | None = None,
         preserve_thinking: bool = False,
-        empty_max_attempts: int = 5,
+        empty_max_attempts: int = 3,
         timeout_sec: int = 30,
         timeout_backoff_sec: int = 15,
         max_retries: int = 2,
@@ -312,7 +451,7 @@ class BailianVlmTranslator:
     ) -> None:
         self.api_key = api_key
         self.model = model
-        self.base_url = base_url.rstrip("/")
+        self.responses_base_url = responses_base_url.rstrip("/")
         self.temperature = float(temperature)
         self.enable_thinking = bool(enable_thinking)
         self.thinking_budget = int(thinking_budget) if thinking_budget is not None else None
@@ -408,122 +547,6 @@ class BailianVlmTranslator:
             return f"<data-url mime={mime} chars={len(s)}>"
         return str(Path(s).resolve())
 
-    def translate_image_ja_to_zh_cn(self, image_path: str | Path, speaker: str) -> str:
-        speaker_name, original_text, translated, usage = self.translate_image_ja_to_zh_cn_structured_with_tag(
-            image_path=image_path,
-            speaker_image_path=image_path,
-            speaker=speaker,
-            request_tag="",
-            history_items=None,
-        )
-        _ = speaker_name
-        _ = original_text
-        _ = usage
-        return translated
-
-    def translate_image_ja_to_zh_cn_with_tag(
-        self,
-        image_path: str | Path,
-        speaker: str,
-        request_tag: str = "",
-    ) -> str:
-        game_hint = f"，内容与{self.game_name}相关" if self.game_name else ""
-        prompt = (
-            f"识别图像中的{self.source_language}文本，翻译为{self.target_language}{game_hint}。"
-            f"说话人为{speaker}。说话人信息仅作语气和背景参考，不需要输出到译文中。"
-            "注意保留换行和格式(如果图片中有两行,则你也需要返回两行)，语气与原文和说话角色一致,绝对禁止添加和原文无关的翻译，输出且仅输出译文。"
-        )
-        if self.enable_web_search:
-            prompt += self._search_hint_cn
-        image_url = self._to_data_url(image_path)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            }
-        ]
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "input": self._messages_to_responses_input(messages),
-        }
-        # DashScope/OpenAI-compatible optional thinking/reasoning controls.
-        payload["enable_thinking"] = self.enable_thinking
-        self._attach_web_search_tool(payload)
-        if self.thinking_budget is not None and self.thinking_budget > 0:
-            payload["thinking_budget"] = int(self.thinking_budget)
-        if self.preserve_thinking:
-            payload["preserve_thinking"] = True
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = request.Request(
-            f"{self.base_url}/responses",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
-        )
-        last_err: Exception | None = None
-        empty_limit = 3
-        attempts = max(self.max_retries + 1, empty_limit)
-        empty_count = 0
-        err_count = 0
-        current_timeout = int(self.timeout_sec)
-        tag_prefix = f"{request_tag}: " if request_tag else ""
-        for i in range(attempts):
-            try:
-                with self._opener.open(req, timeout=current_timeout) as resp:
-                    raw = resp.read().decode("utf-8")
-                data = json.loads(raw)
-                text = self._extract_text(data).strip()
-                text = self._strip_thinking_content(text)
-                if text:
-                    return normalize_quotes_for_subtitle(text)
-                empty_count += 1
-                if self.log_fn is not None:
-                    self.log_fn(
-                        f"{tag_prefix}warning: empty response (chars=0) on empty-attempt {empty_count + 1}/{empty_limit}"
-                    )
-                if empty_count >= empty_limit:
-                    if self.log_fn is not None:
-                        self.log_fn(
-                            f"{tag_prefix}warning: empty response reached fixed max empty attempts ({empty_limit}); giving up this segment"
-                        )
-                    return ""
-                if i + 1 >= attempts:
-                    break
-                time.sleep(self.retry_delay_sec)
-                continue
-            except Exception as exc:
-                last_err = exc
-                err_count += 1
-                err_detail = self._exception_message(exc)
-                is_timeout_like = (
-                    isinstance(exc, TimeoutError)
-                    or "timeout" in exc.__class__.__name__.lower()
-                    or "timed out" in str(exc).lower()
-                )
-                if self.log_fn is not None:
-                    self.log_fn(
-                        f"{tag_prefix}request attempt {i + 1}/{attempts} failed: {exc.__class__.__name__} | {err_detail}"
-                    )
-                    if is_timeout_like and self.timeout_backoff_sec > 0:
-                        self.log_fn(
-                            f"{tag_prefix}timeout detected: next request timeout +{self.timeout_backoff_sec}s"
-                        )
-                if is_timeout_like and self.timeout_backoff_sec > 0:
-                    current_timeout += self.timeout_backoff_sec
-                if err_count > self.max_retries or i + 1 >= attempts:
-                    break
-                time.sleep(self.retry_delay_sec)
-        if last_err is not None:
-            raise last_err
-        return ""
-
     def translate_image_ja_to_zh_cn_structured_with_tag(
         self,
         image_path: str | Path,
@@ -535,29 +558,53 @@ class BailianVlmTranslator:
         extra_requirements: str = "",
     ) -> tuple[str, str, str, dict[str, int]]:
         system_prompt = (
-            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的日文文本翻译为中文。"
-            f"接下来会给你两张图像，图片1是当前说话人日文姓名，图片2是日文对话文本。"
-            f"请识别图像1中的日文说话人名，结合你对{self.game_name}的了解用于理解说话人的背景和性格辅助翻译。不要把说话人信息输出到译文中。"
-            f"之后识别图像2中的日文对话文本，并结合你对{self.game_name}的了解和说话人信息翻译为中文译文。当出现英文时不需要翻译，输出原文作为译文。"
-            "翻译必须在优先保证语义通顺的情况下保留原文的换行与符号，绝对禁止添加与原文无关的内容，保留原文使用的『』，不需要替换为‘’或''，禁止自行添加标点，禁止在句尾保留“ッ”等日文助词。"
-            "输出格式要求为：必须且仅能是符合Schema的JSON，包括speaker_name、original_text、translated_text三个字段。"
-            f"speaker_name字段为说话人姓名，保持日文原文，不需要翻译。original_text字段为图像2中识别的日文原文文本。translated_text字段为中文译文。"
+            f"### 角色\n"
+            f"**你是{self.game_name}的游戏文本翻译助手，负责识别日文文本并翻译为中文。**\n"
+            f"### 输入\n"
+            "**你会收到两张图像：**\n"
+            "- **图片1**：当前说话人的日文姓名\n"
+            "- **图片2**：日文对话文本\n"
+            f"### 任务\n"
+            f"**识别图片1中的日文说话人名，结合你对{self.game_name}的了解理解说话人的背景和性格辅助翻译。**\n"
+            "**不要把说话人信息输出到译文中。**\n"
+            "**识别图片2中的日文对话文本，结合说话人信息翻译为中文译文。**\n"
+            "**图像文字识别可能有误，对无法辨认的字形请结合上下文自行判断，不要强行翻译乱码内容。**\n"
+            f"### 翻译规则\n"
+            "- **语义优先**：在保证语义通顺的前提下，尽可能保留原文的换行与符号。\n"
+            "- **禁止添加**：绝对禁止添加与原文无关的内容。\n"
+            "- **保留符号**：保留原文使用的『』，禁止替换为\"\"或''。\n"
+            "- **禁止自创标点**：禁止自行添加原文没有的标点。\n"
+            "- **禁止残留**：禁止在句尾保留「ッ」等日文助词。\n"
+            "- **英文处理**：原文若为纯英文，不需要翻译，直接输出原文。\n"
+            "### 额外要求\n"
+            "**{placeholder}**\n"
+            "### 输出JSON\n"
+            "**必须返回符合以下JSON Schema的JSON对象：**\n"
+            "```json\n"
+            "{\n"
+            '  "speaker_name": "日文说话人姓名（保持原文，不翻译）",\n'
+            '  "original_text": "图片2中识别的日文原文",\n'
+            '  "translated_text": "中文译文"\n'
+            "}\n"
+            "```"
         )
-        # Only include extra requirements sentence when provided
         extra_requirements_text = str(extra_requirements or "").strip()
         if extra_requirements_text:
+            system_prompt = system_prompt.replace("**{placeholder}**", f"**{extra_requirements_text}**")
+        else:
             system_prompt = system_prompt.replace(
-                "输出格式要求为：", f"翻译需要满足：{extra_requirements_text}。输出格式要求为："
+                "### 额外要求\n**{placeholder}**\n", ""
             )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
         user_text = (
-            "下面会提供两张图片用于识别和翻译，"
-            "图片1：当前说话人。图片2：当前对话文本。"
+            "### 图片1：说话人姓名\n"
+            "### 图片2：对话文本\n"
+            "**请识别并翻译：**"
         )
         custom = str(custom_prompt or "").strip()
         if custom:
-            user_text += f"\n附加要求：{custom}"
+            user_text += f"\n### 附加要求\n**{custom}**"
         
         # Support both file paths and base64 data URLs
         def _get_data_url(image_input: str | Path | None) -> str:
@@ -619,16 +666,13 @@ class BailianVlmTranslator:
             payload["preserve_thinking"] = True
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = request.Request(
-            f"{self.base_url}/responses",
+            f"{self.responses_base_url}/responses",
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=_auth_headers(self.api_key),
             method="POST",
         )
         last_err: Exception | None = None
-        empty_limit = 3
+        empty_limit = self.empty_max_attempts
         attempts = max(self.max_retries + 1, empty_limit)
         empty_count = 0
         err_count = 0
@@ -733,23 +777,38 @@ class BailianVlmTranslator:
         game_hint = f"文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         custom = str(custom_prompt or "").strip()
         system_prompt = (
-            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。"
-            f"接下来会给你当前说话人信息和已经识别出的{self.source_language}原文文本。"
-            f"请结合你对{self.game_name}的了解和给出的说话人信息，将原文翻译为{self.target_language}译文。说话人信息仅用于参考，不要把说话人信息输出到译文中。"
-            f"{game_hint}原文也可能为纯英文，此时不需要翻译，直接输出原文作为译文即可。"
-            "翻译必须在语义通顺的情况下尽可能保留原文的换行与符号，绝对禁止添加与原文无关的内容，保留原文使用的『』，不需要替换为‘’或''。"
-            "输出格式要求为：必须且仅能是符合Schema的JSON，包括translated_text一个字段。"
-            f"translated_text 字段为将给定原文翻译成{self.target_language}的译文。"
+            f"### 角色\n"
+            f"**你是{self.game_name}的游戏文本翻译助手，负责将{self.source_language}文本翻译为{self.target_language}。**\n"
+            f"### 输入\n"
+            f"**你会收到当前说话人姓名（仅供参考，不要输出到译文中）和已识别出的{self.source_language}原文文本。**\n"
+            "**文本识别可能有误，对无法辨认的词请结合字形和上下文自行判断，不要强行翻译乱码内容。**\n"
+            f"### 任务\n"
+            f"**结合你对{self.game_name}的了解，将原文翻译为{self.target_language}译文。**{game_hint}\n"
+            f"### 翻译规则\n"
+            "- **语义优先**：在保证语义通顺的前提下，尽可能保留原文的换行与符号。\n"
+            "- **禁止添加**：绝对禁止添加与原文无关的内容。\n"
+            "- **保留符号**：保留原文使用的『』，禁止替换为\"\"或''。\n"
+            "- **禁止自创标点**：禁止自行添加原文没有的标点。\n"
+            "- **英文处理**：原文若为纯英文，不需要翻译，直接输出原文。\n"
+            "### 输出JSON\n"
+            "**必须返回符合以下JSON Schema的JSON对象：**\n"
+            "```json\n"
+            "{\n"
+            f'  "translated_text": "{self.target_language}译文"\n'
+            "}\n"
+            "```"
         )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
         user_text = (
-            f"当前说话人（仅作语气参考，不需要输出）：{speaker}\n"
-            f"当前{self.source_language}原文：\n{src}\n"
-            "请返回JSON，字段为：translated_text。"
+            f"### 当前说话人（仅供参考）\n"
+            f"**{speaker}**\n"
+            f"### 原文\n"
+            f"{src}\n"
+            "**请返回JSON：**"
         )
         if custom:
-            user_text += f"\n附加要求：{custom}"
+            user_text += f"\n### 附加要求\n**{custom}**"
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
@@ -766,15 +825,12 @@ class BailianVlmTranslator:
         if self.preserve_thinking:
             payload["preserve_thinking"] = True
         req = request.Request(
-            f"{self.base_url}/responses",
+            f"{self.responses_base_url}/responses",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=_auth_headers(self.api_key),
             method="POST",
         )
-        empty_limit = 3
+        empty_limit = self.empty_max_attempts
         attempts = max(self.max_retries + 1, empty_limit)
         empty_count = 0
         err_count = 0
@@ -845,25 +901,37 @@ class BailianVlmTranslator:
     ) -> tuple[str, str, dict[str, int]]:
         game_hint = f"图像中的文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         system_prompt = (
-            f"你是一个游戏文本翻译助手，专注于将{self.game_name}相关的{self.source_language}文本翻译为{self.target_language}。"
-            f"接下来会给你一张图像，图像中可能是标题或文本区域，不包含独立的说话人姓名图像。"
-            f"请识别图像中的{self.source_language}文本，并结合你对{self.game_name}的了解翻译为{self.target_language}译文。"
-            f"{game_hint}原文也可能为纯英文，此时不需要翻译，直接输出原文作为译文即可。"
-            "翻译必须在语义通顺的情况下尽可能保留原文的换行与符号，绝对禁止添加与原文无关的内容，保留原文使用的『』，不需要替换为‘’或''。"
-            "输出格式要求为：必须且仅能是符合Schema的JSON，包括original_text、translated_text两个字段。"
-            f"original_text 字段为图像中识别的{self.source_language}原文文本。translated_text 字段为将original_text翻译成{self.target_language}的译文。"
+            f"### 角色\n"
+            f"**你是{self.game_name}的游戏文本翻译助手，负责识别{self.source_language}文本并翻译为{self.target_language}。**\n"
+            f"### 输入\n"
+            "**你会收到一张图像，其中包含标题或文本区域（不含说话人姓名）。**\n"
+            f"### 任务\n"
+            f"**识别图像中的{self.source_language}文本，结合你对{self.game_name}的了解翻译为{self.target_language}译文。**{game_hint}\n"
+            "**图像文字识别可能有误，对无法辨认的字形请结合上下文自行判断，不要强行翻译乱码内容。**\n"
+            f"### 翻译规则\n"
+            "- **语义优先**：在保证语义通顺的前提下，尽可能保留原文的换行与符号。\n"
+            "- **禁止添加**：绝对禁止添加与原文无关的内容。\n"
+            "- **保留符号**：保留原文使用的『』，禁止替换为\"\"或''。\n"
+            "- **禁止自创标点**：禁止自行添加原文没有的标点。\n"
+            "- **英文处理**：原文若为纯英文，不需要翻译，直接输出原文。\n"
+            "### 输出JSON\n"
+            "**必须返回符合以下JSON Schema的JSON对象：**\n"
+            "```json\n"
+            "{\n"
+            f'  "original_text": "图像中识别的{self.source_language}原文",\n'
+            f'  "translated_text": "{self.target_language}译文"\n'
+            "}\n"
+            "```"
         )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
         user_text = (
-            "下面提供一张图像（标题或文本区域），请执行OCR并翻译。\n"
-            "给出的前文仅作风格和术语参考，不一定与当前图像直接相关。\n"
-            # f"前文参考：\n{history_text}\n"
-            "请返回JSON，字段为：original_text、translated_text。"
+            "### 图像：标题/文本区域\n"
+            "**请识别并翻译（前文仅作风格参考，不一定与当前图像直接相关）：**"
         )
         custom = str(custom_prompt or "").strip()
         if custom:
-            user_text += f"\n附加要求：{custom}"
+            user_text += f"\n### 附加要求\n**{custom}**"
         image_url = self._to_data_url(image_path)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -907,15 +975,12 @@ class BailianVlmTranslator:
         if self.preserve_thinking:
             payload["preserve_thinking"] = True
         req = request.Request(
-            f"{self.base_url}/responses",
+            f"{self.responses_base_url}/responses",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=_auth_headers(self.api_key),
             method="POST",
         )
-        empty_limit = 3
+        empty_limit = self.empty_max_attempts
         attempts = max(self.max_retries + 1, empty_limit)
         empty_count = 0
         err_count = 0
@@ -1051,14 +1116,6 @@ class BailianVlmTranslator:
     def _has_japanese_leak(self, original_text: str, translated_text: str, min_len: int = 3) -> bool:
         return has_kana_leak_from_original(original_text, translated_text, min_len=min_len)
 
-    def _has_reviewable_kanji_overlap(
-        self,
-        original_text: str,
-        translated_text: str,
-        min_len: int = 3,
-    ) -> bool:
-        return has_kanji_overlap_from_original(original_text, translated_text, min_len=min_len)
-
     def _append_io_log(self, record: dict[str, Any]) -> None:
         if not self.io_log_enabled or self.io_log_path is None:
             return
@@ -1092,15 +1149,6 @@ class BailianVlmTranslator:
         elif suffix == ".webp":
             mime = "image/webp"
         b64 = base64.b64encode(raw).decode("ascii")
-        return f"data:{mime};base64,{b64}"
-
-    def _to_data_url_from_base64(self, b64_str: str, mime: str = "image/png") -> str:
-        """Convert a base64-encoded image string to data URL."""
-        return f"data:{mime};base64,{b64_str}"
-
-    def _to_data_url_from_bytes(self, image_bytes: bytes, mime: str = "image/png") -> str:
-        """Convert raw image bytes to data URL."""
-        b64 = base64.b64encode(image_bytes).decode("ascii")
         return f"data:{mime};base64,{b64}"
 
     def _extract_text(self, data: dict[str, Any]) -> str:
@@ -1170,3 +1218,324 @@ class BailianVlmTranslator:
             out = out[marker_pos:].split(":", 1)[-1]
 
         return out.strip()
+
+
+class ChatCompletionsTextTranslator:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str = DEFAULT_CHAT_COMPLETIONS_BASE_URL,
+        temperature: float = 1.3,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        empty_max_attempts: int = 3,
+        timeout_sec: int = 30,
+        timeout_backoff_sec: int = 15,
+        max_retries: int = 2,
+        retry_delay_sec: float = 1.5,
+        disable_env_proxy: bool = True,
+        game_name: str = "",
+        source_language: str = "ja",
+        target_language: str = "zh-CN",
+        log_fn: Callable[[str], None] | None = None,
+        io_log_path: str | Path | None = None,
+        io_log_enabled: bool = False,
+        enable_web_search: bool = False,
+        context_window: int = 8,
+    ) -> None:
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or "").strip()
+        self.base_url = str(base_url or DEFAULT_CHAT_COMPLETIONS_BASE_URL).rstrip("/")
+        self.temperature = float(temperature)
+        self.top_p = float(top_p) if top_p is not None else None
+        self.top_k = int(top_k) if top_k is not None else None
+        self.empty_max_attempts = max(1, int(empty_max_attempts))
+        self.timeout_sec = int(timeout_sec)
+        self.timeout_backoff_sec = max(0, int(timeout_backoff_sec))
+        self.max_retries = max(0, int(max_retries))
+        self.retry_delay_sec = max(0.0, float(retry_delay_sec))
+        self.game_name = game_name.strip()
+        self.source_language = _language_label_zh(source_language.strip() or "ja")
+        self.target_language = _language_label_zh(target_language.strip() or "zh-CN")
+        self.log_fn = log_fn
+        self.io_log_path = Path(io_log_path) if io_log_path else None
+        self.io_log_enabled = bool(io_log_enabled) and (self.io_log_path is not None)
+        self.enable_web_search = bool(enable_web_search)
+        self.context_window = max(0, int(context_window))
+        self._io_lock = threading.Lock()
+        self._io_pending: dict[str, dict[str, Any]] = {}
+        self._opener = (
+            request.build_opener(request.ProxyHandler({}))
+            if disable_env_proxy
+            else request.build_opener()
+        )
+        self._search_hint_cn = "如果遇到不确定含义的词语，请联网搜索辅助翻译。"
+
+    def translate_text_with_prompt(
+        self,
+        original_text: str,
+        speaker: str = "",
+        request_tag: str = "",
+        custom_prompt: str = "",
+        history_items: list[dict[str, str]] | None = None,
+        extra_requirements: str = "",
+        context_before: list[str | dict[str, str]] | None = None,
+        context_after: list[str | dict[str, str]] | None = None,
+    ) -> tuple[str, dict[str, int]]:
+        src = str(original_text or "").strip()
+        if not src:
+            return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        game_hint = f"文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
+        system_prompt = (
+            f"### 角色\n"
+            f"**你是{self.game_name}的游戏文本翻译助手，负责将{self.source_language}文本翻译为{self.target_language}。**\n"
+            f"### 输入\n"
+            f"**你会收到当前说话人姓名（仅供参考，不要输出到译文中）和已通过OCR识别的{self.source_language}原文文本。**\n"
+            "**OCR识别可能有误，对无法辨认的词请结合字形和上下文自行判断，不要强行翻译乱码内容。**\n"
+            f"### 任务\n"
+            f"**结合你对{self.game_name}的了解，将原文翻译为{self.target_language}译文。**{game_hint}\n"
+            f"### 翻译规则\n"
+            "- **语义优先**：在保证语义通顺的前提下，尽可能保留原文的换行与符号。\n"
+            "- **禁止添加**：绝对禁止添加与原文无关的内容。\n"
+            "- **保留符号**：保留原文使用的『』，禁止替换为\"\"或''。\n"
+            "- **禁止自创标点**：禁止自行添加原文没有的标点。\n"
+            "- **禁止残留**：禁止在句尾保留「ッ」等日文助词。\n"
+            "- **英文处理**：原文若为纯英文，不需要翻译，直接输出原文。\n"
+            f"### 额外要求\n"
+            "**{placeholder}**\n"
+            "### 输出要求\n"
+            "**请直接输出译文，不要添加任何额外说明、前缀或标记。**"
+        )
+        extra_requirements_text = str(extra_requirements or "").strip()
+        if extra_requirements_text:
+            system_prompt = system_prompt.replace("**{placeholder}**", f"**{extra_requirements_text}**")
+        else:
+            system_prompt = system_prompt.replace(
+                "### 额外要求\n**{placeholder}**\n", ""
+            )
+        if self.enable_web_search:
+            system_prompt += self._search_hint_cn
+        context_block = ""
+        if context_before or context_after:
+            context_block = "### 上下文参考（仅供理解语境，不需要翻译本节内容）\n"
+            if context_before:
+                trimmed: list[str] = []
+                for item in context_before:
+                    if isinstance(item, dict):
+                        speaker_name = str(item.get("speaker", "") or "").strip() or "未知"
+                        original = str(item.get("original", "") or "").strip()
+                        translation = str(item.get("translation", "") or "").strip()
+                        if original and translation:
+                            trimmed.append(f"【说话人：{speaker_name}】原文：{original} => 译文：{translation}")
+                        elif original:
+                            trimmed.append(f"【说话人：{speaker_name}】原文：{original}")
+                    else:
+                        text = str(item or "").strip()
+                        if text:
+                            trimmed.append(text)
+                if trimmed:
+                    window = max(1, self.context_window) if self.context_window else len(trimmed)
+                    context_block += "上文（格式：【说话人】原文 => 已采用译文）：" + " | ".join(trimmed[-window:]) + "\n"
+            if context_after:
+                trimmed = []
+                for item in context_after:
+                    if isinstance(item, dict):
+                        speaker_name = str(item.get("speaker", "") or "").strip() or "未知"
+                        original = str(item.get("original", "") or "").strip()
+                        if original:
+                            trimmed.append(f"【说话人：{speaker_name}】原文：{original}")
+                    else:
+                        text = str(item or "").strip()
+                        if text:
+                            trimmed.append(text)
+                if trimmed:
+                    window = max(1, self.context_window) if self.context_window else len(trimmed)
+                    context_block += "下文（格式：【说话人】原文；不含译文）：" + " | ".join(trimmed[:window]) + "\n"
+            context_block += "\n"
+        if context_block:
+            system_prompt += context_block
+        history_text = ""
+        if history_items:
+            lines = []
+            for item in history_items:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    f"{item.get('time', '')} {item.get('speaker', '')}: "
+                    f"{item.get('original', '')} -> {item.get('translation', '')}"
+                )
+                if lines:
+                    history_text = "### 前文参考\n" + "\n".join(lines[-8:]) + "\n\n"
+        user_text = (
+            f"{history_text}"
+            f"### 当前说话人（仅供参考）\n"
+            f"**{speaker}**\n"
+            f"### 原文\n"
+            f"{src}\n"
+            f"**请直接输出译文：**"
+        )
+        custom = str(custom_prompt or "").strip()
+        if custom:
+            user_text += f"\n附加要求：{custom}"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ]
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": messages,
+        }
+        if self.top_p is not None:
+            payload["top_p"] = self.top_p
+        if self.top_k is not None:
+            payload["top_k"] = self.top_k
+        if self.io_log_enabled:
+            self._append_io_log(
+                {
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "event": "request",
+                    "request_tag": request_tag,
+                    "history_count": len(history_items or []),
+                    "prompt_preview": {
+                        "model": payload.get("model"),
+                        "temperature": payload.get("temperature"),
+                        "response_format": payload.get("response_format"),
+                        "system_prompt": system_prompt,
+                        "user_prompt": user_text,
+                    },
+                }
+            )
+        req = request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=_auth_headers(self.api_key),
+            method="POST",
+        )
+        empty_limit = self.empty_max_attempts
+        attempts = max(self.max_retries + 1, empty_limit)
+        empty_count = 0
+        err_count = 0
+        current_timeout = int(self.timeout_sec)
+        last_err: Exception | None = None
+        tag_prefix = f"{request_tag}: " if request_tag else ""
+        for i in range(attempts):
+            try:
+                with self._opener.open(req, timeout=current_timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                usage = self._extract_usage_from_data(data)
+                raw = self._extract_text(data).strip()
+                translated = self._strip_thinking_content(raw)
+                translated = normalize_quotes_for_subtitle(translated)
+                if translated and has_kana_leak_from_original(src, translated, min_len=3):
+                    translated = ""
+                if self.io_log_enabled:
+                    self._append_io_log(
+                        {
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "event": "response",
+                            "request_tag": request_tag,
+                            "attempt": i + 1,
+                            "usage": usage,
+                            "raw_response_text": raw,
+                            "parsed_translated_text": translated,
+                        }
+                    )
+                if translated:
+                    return translated, usage
+                empty_count += 1
+                if self.log_fn is not None:
+                    self.log_fn(
+                        f"{tag_prefix}warning: empty translated_text on empty-attempt {empty_count + 1}/{empty_limit}"
+                    )
+                if empty_count >= empty_limit:
+                    return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                time.sleep(self.retry_delay_sec)
+                continue
+            except Exception as exc:
+                last_err = exc
+                err_count += 1
+                err_detail = self._exception_message(exc)
+                is_timeout_like = (
+                    isinstance(exc, TimeoutError)
+                    or "timeout" in exc.__class__.__name__.lower()
+                    or "timed out" in str(exc).lower()
+                )
+                if self.log_fn is not None:
+                    self.log_fn(
+                        f"{tag_prefix}request attempt {i + 1}/{attempts} failed: {exc.__class__.__name__} | {err_detail}"
+                    )
+                if is_timeout_like and self.timeout_backoff_sec > 0:
+                    current_timeout += self.timeout_backoff_sec
+                if err_count > self.max_retries or i + 1 >= attempts:
+                    break
+                time.sleep(self.retry_delay_sec)
+        if last_err is not None:
+            raise last_err
+        return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _exception_message(self, exc: Exception) -> str:
+        msg = str(exc)
+        if isinstance(exc, urlerror.HTTPError):
+            try:
+                body = exc.read().decode("utf-8", errors="ignore").strip()
+                if body:
+                    return f"{msg} | body={body[:2000]}"
+            except Exception:
+                pass
+        return msg
+
+    def _extract_usage_from_data(self, data: dict[str, Any]) -> dict[str, int]:
+        usage = data.get("usage", {}) if isinstance(data, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        total = int(usage.get("total_tokens") or (prompt + completion))
+        return {
+            "prompt_tokens": max(0, prompt),
+            "completion_tokens": max(0, completion),
+            "total_tokens": max(0, total),
+        }
+
+    def _extract_text(self, data: dict[str, Any]) -> str:
+        choice = data.get("choices", [{}])[0]
+        msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text" and item.get("text"):
+                        parts.append(str(item.get("text")))
+                    elif item.get("content"):
+                        parts.append(str(item.get("content")))
+            return "\n".join([x for x in parts if x.strip()])
+        return ""
+
+    def _strip_thinking_content(self, text: str) -> str:
+        return VlmResponsesTranslator._strip_thinking_content(self, text)
+
+    def _append_io_log(self, record: dict[str, Any]) -> None:
+        if not self.io_log_enabled or self.io_log_path is None:
+            return
+        try:
+            self.io_log_path.parent.mkdir(parents=True, exist_ok=True)
+            event = record.get("event", "")
+            tag = record.get("request_tag", "")
+            with self._io_lock:
+                if event == "request":
+                    self._io_pending[tag] = record
+                    return
+                request_record = self._io_pending.pop(tag, None)
+                pair: dict[str, Any] = {"response": record}
+                if request_record is not None:
+                    pair["request"] = request_record
+                line = json.dumps(pair, ensure_ascii=False)
+                with self.io_log_path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception:
+            pass
