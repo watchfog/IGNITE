@@ -2,7 +2,7 @@ general:
   # Whether to render a final hard-subtitled video after subtitle generation.
   # false: only export ASS subtitle files.
   render_video: false
-  # Whether to enable online search capability in Bailian VLM requests.
+  # Whether to enable online search capability in VLM responses requests.
   # Keep false unless the selected model / account path explicitly supports it.
   enable_web_search: false
   # Fuzzy cache matching tolerance in frames (at scan_fps).
@@ -94,6 +94,11 @@ ocr:
   engine: rapidocr
   # Japanese recognition model selection for RapidOCR / PaddleOCR.
   rapidocr_rec_lang: japan
+  # Model type: "mobile" (lighter, faster) or "server" (larger, more accurate).
+  rapidocr_model_type: server
+  # ONNX Runtime execution provider: "cpu", "dml" (DirectML/GPU, Windows), "cuda" (NVIDIA GPU).
+  # dml/cuda require onnxruntime-directml or onnxruntime-gpu package respectively.
+  rapidocr_provider: dml
 
   # Parallel OCR workers used for speaker-name verification.
   name_ocr_workers: 8
@@ -127,29 +132,56 @@ ocr:
   input_border_ratio: 0.5
   # Minimum border per side in pixels.
   input_border_min_px: 40
+  # Skip text detection and recognize the whole image as a single text block.
+  # Useful for tightly cropped ROIs that always contain text (e.g. name_roi).
+  rec_only: false
   # Max OCR candidate frames collected per segment.
   max_candidates_per_segment: 8
 
 translation:
   # Translation mode used by pipeline and review GUI.
-  # Current default is Bailian VLM.
-  mode: vlm_bailian
+  # Current default is VLM via a responses-compatible API.
+  mode: vlm_responses
 
-  # VLM API base URL. Default points to DashScope compatible endpoint.
-  # In your current workflow this is used with Bailian and responses-style calls.
-  vlm_api: https://dashscope.aliyuncs.com/compatible-mode/v1
+  # Default model profile per mode. Keys are shown in GUI / accepted by CLI --translation-model.
+  mode_models:
+    vlm_responses: qwen3.6-plus
+    ocr_chat_completions: local-translator
 
-  # File that stores the API key.
-  api_key_file: config/keys/bailian_api_key
-
-  # Available VLM models for manual selection.
-  # Models listed here should support visual input.
-  vlm_models:
-    - qwen3.6-plus
-
-  # Active model used by pipeline and Cache Review.
-  # Must be one of the entries in vlm_models.
-  model: qwen3.6-plus
+  # Each model profile owns its API model name, base URL and optional auth.
+  # Empty api_key means no Authorization header (useful for local compatible servers).
+  # "modes" restricts which translation modes this profile supports.
+  # Omit or set to null to allow all modes.
+  model_profiles:
+    qwen3.6-plus:
+      model: qwen3.6-plus
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key_file: config/keys/bailian_api_key
+      temperature: 0.7
+      modes:
+        - vlm_responses
+        - ocr_chat_completions
+    local-translator:
+      model: HY-MT2-7B-Q8_0
+      base_url: http://127.0.0.1:8080/v1
+      api_key: ""
+      temperature: 0.7
+      top_p: 0.6
+      top_k: 20
+      modes:
+        - ocr_chat_completions
+    deepseek-v4-pro:
+      model: deepseek-v4-pro
+      base_url: https://api.deepseek.com
+      api_key_file: config/keys/deepseek_api_key
+      modes:
+        - ocr_chat_completions
+    deepseek-v4-flash:
+      model: deepseek-v4-flash
+      base_url: https://api.deepseek.com
+      api_key_file: config/keys/deepseek_api_key
+      modes:
+        - ocr_chat_completions
 
   # Generation controls.
   temperature: 1.3
@@ -160,15 +192,26 @@ translation:
   # Whether to preserve raw thinking content in logs / results if supported.
   preserve_thinking: false
 
+  auto_review_enabled: false
+  auto_review_model_profile: qwen3.6-plus
+  auto_review_chunk_size: 80
+  auto_review_mode: thorough
+  auto_review_max_tokens: 0
+  auto_review_parse_retries: 1
+  auto_review_repair_max_tokens: 0
+
   # Logging and concurrency controls.
   io_log_enabled: true
   vlm_concurrent_workers: 64
+  chat_completions_concurrent_workers: 1
+  chat_context_window: 8
   history_enabled: false
   history_n: 5
   timeout_sec: 90
   timeout_backoff_sec: 15
   max_retries: 5
   retry_delay_sec: 1.5
+  empty_max_attempts: 3
   concurrent_workers: 4
   disable_env_proxy: true
 
