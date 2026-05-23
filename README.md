@@ -2,12 +2,12 @@
 
 > **I**ndexing, reco**G**nition, tra**N**slation, rev**I**ew and subti**T**l**E**ing
 
-IGNITE 是一个面向游戏剧情视频的字幕流水线工具。目标是针对**画面文字驱动**的游戏剧情录屏，使用OCR配合VLM自动化完成时间轴、文本识别、翻译，经人工校对和字幕导出的GUI工具。
+IGNITE 是一个面向游戏剧情视频的字幕流水线工具。目标是针对**画面文字驱动**的游戏剧情录屏，使用 OCR/VLM 自动化完成时间轴、文本识别、翻译，经人工校对和字幕导出的 GUI 工具。
 
 ## 功能概览
 
 - 基于视频画面自动分段并生成时间轴
-- 使用VLM完成识别/翻译
+- 使用 VLM 或 OCR + chat-completions 完成识别/翻译
 - 生成可编辑的翻译缓存
 - 基于缓存进行GUI审查，支持人工复核翻译内容/重译/时间点编辑等功能
 - 从缓存生成 ASS 字幕和内嵌硬字幕视频
@@ -49,17 +49,17 @@ pip install -r requirements.txt
 
 默认值在相对路径 `tools/ffmpeg/bin/` 下，可指定外部绝对路径。可自行编译或采用编译好的二进制文件，见 [FFmpeg 官方文档](https://ffmpeg.org/download.html)。
 
-### VLM 配置
+### 翻译模型配置
 
-VLM 相关配置在 `config/general_config.yaml` 的 `translation` 部分。
+翻译相关配置在 `config/general_config.yaml` 的 `translation` 部分。
 
-必须先配置 `translation.api_key_file` 指向包含 API 密钥的文件。
+每个模型 profile 单独配置 `model`、`base_url` 和可选的 `api_key_file` / `api_key`。本地兼容服务不需要鉴权时，可将 `api_key` 留空。
 
-默认使用阿里云百炼的 OpenAI 兼容地址 `https://dashscope.aliyuncs.com/compatible-mode/v1`，默认模型 `Qwen 3.6 Plus`，`responses` 模式。
+默认 `vlm_responses` 使用阿里云 DashScope/百炼兼容地址 `https://dashscope.aliyuncs.com/compatible-mode/v1`，默认模型 `Qwen 3.6 Plus`，`responses` 模式。
 
-API 地址通过 `translation.vlm_api` 指定，模型通过 `translation.model` 指定，模型必须在 `translation.vlm_models` 列表中。
+新增的 `ocr_chat_completions` 模式会先用本地 OCR 识别 `name_roi` / `dialogue_roi`，把识别结果写入 cache 的 `speaker` / `text_original`，再调用所选 profile 的 `/chat/completions` 接口翻译。
 
-注意使用的模型必须带有视觉识别功能且支持 `responses` 模式调用。
+使用 `vlm_responses` 时，所选模型必须带有视觉识别功能且支持 `responses` 模式调用。使用 `ocr_chat_completions` 时，所选模型只需要支持 chat-completions 文本翻译。
 
 ## GUI 使用流程
 
@@ -119,7 +119,7 @@ python main.py --video [VIDEO] --config [PROFILE] --output-dir [NAME]
 
 ![Marker 1](docs/images/profile_gui_marker.png)
 
-完成后，点击 `保存配置`。在底部预览框的 `name` 处填入游戏名字，用于告知 VLM 相关背景信息。较新的游戏受限于 VLM 知识，可能效果不佳，可开启联网搜索。
+完成后，点击 `保存配置`。在底部预览框的 `name` 处填入游戏名字，用于告知翻译模型相关背景信息。较新的游戏受限于模型知识，可能效果不佳，可开启联网搜索。
 
 填入完成后，点击 `保存编辑框到文件`。
 
@@ -129,10 +129,10 @@ python main.py --video [VIDEO] --config [PROFILE] --output-dir [NAME]
 
 - **直接生成字幕**：缓存后直接生成字幕，不打开 Review
 - **Debug**：保存更多中间结果，用于解决分段错误问题
-- **跳过翻译**：跳过 VLM 翻译，只打时间轴
+- **跳过翻译**：跳过翻译，只打时间轴
 - **启用 OCR**：启用姓名 OCR 分割
 - **源语言 / 目标语言**：默认为 `ja` / `zh-CN`
-- **VLM 模型**：支持多模型逗号分隔切换
+- **翻译模式 / 翻译模型**：选择 `vlm_responses` 或 `ocr_chat_completions`，并选择对应模型 profile
 - **编辑额外要求**：添加自定义翻译提示词
 
 最后点击 `运行流程`，会弹出监控窗口，开始运行识别和翻译。
@@ -148,7 +148,7 @@ python main.py --video [VIDEO] --config [PROFILE] --output-dir [NAME]
   - **OCR 模式**（默认）：通过 OCR 检测姓名区域是否存在文字来切分
   - **Marker 2 模式**（禁用 OCR 时）：利用 Marker 2 模板匹配做空白→对话分割
 - **缓存命中检查**：与已有缓存比对，时间段一致的片段直接复用
-- **VLM 翻译**：将姓名和对话部分截图传给 VLM 进行识别和翻译，格式化保存至缓存
+- **翻译**：`vlm_responses` 会将姓名和对话截图传给 VLM 识别/翻译；`ocr_chat_completions` 会先本地 OCR 所有段，再把 OCR 文本传给 chat-completions 翻译
 - **字幕导出**：生成 ASS 字幕文件
 
 流程耗时根据视频分辨率、划分段数、文本量和电脑性能有关，一般为视频长度的 2 倍左右。
@@ -233,6 +233,7 @@ python -m ignite.gui.review --cache [CACHE] --video [VIDEO] --config [CONFIG]
 python -m ignite.pipeline \
     --video <path> --config <path> --output-dir <path> \
     --dialogue-presence-mode <marker2|ocr> \
+    --translation-mode <vlm_responses|ocr_chat_completions> \
     --skip-translation
 ```
 
@@ -248,9 +249,14 @@ python -m ignite.pipeline \
 | `--cache-only` | 仅生成/更新翻译缓存，不生成字幕 |
 | `--render-video` | 渲染硬字幕视频 |
 | `--translation-cache` | 指定翻译缓存 JSON 路径 |
+| `--translation-mode` | 翻译模式：`vlm_responses` / `ocr_chat_completions` |
+| `--translation-model` | `translation.model_profiles` 中的模型 profile 名称 |
 | `--subtitles-from-cache` | 仅从缓存生成字幕并退出 |
 | `--debug` | 启用 debug 产物 |
 | `--dialogue-presence-mode` | 对话存在判定/空白段过滤模式：`marker2` / `ocr`（正常运行必填；`--subtitles-from-cache` 不需要） |
+| `--auto-review` | 翻译完成后自动运行 LLM 校对，将修改后的译文写回缓存 |
+| `--auto-review-model` | 指定自动校对使用的模型 profile（覆盖配置文件中的设置） |
+| `--auto-review-chunk-size` | 自动校对每次调用 LLM 的条目数（默认 20，覆盖配置文件中的设置） |
 
 若想在命令行复现 GUI 默认的“禁用 OCR、使用 Marker2 判定对话出现”的流程，请配置 `roi.marker_2_roi`、`marker_2.template_paths`，并传入 `--dialogue-presence-mode marker2`。如需使用姓名 OCR 判定对话出现，则传入 `--dialogue-presence-mode ocr`。
 
