@@ -76,8 +76,11 @@ from .state_machine import StateMachineConfig, segment_from_metrics
 from .subtitle_export import write_ass
 from .translation_runtime import (
     ChatCompletionsTextTranslator,
+    TEXT_EXTRACTION_PROFILE_MODE,
     TranslationModelProfile,
+    VlmImageTextExtractor,
     VlmResponsesTranslator,
+    _normalize_text_extraction_backend,
     load_api_key,
     resolve_responses_base_url,
     resolve_translation_model_profile,
@@ -1081,9 +1084,19 @@ def run_pipeline(args: argparse.Namespace) -> int:
     vlm_extra_requirements = str(game_cfg.get("extra_requirements", "")).strip()
     vlm_translator: VlmResponsesTranslator | None = None
     text_translator: ChatCompletionsTextTranslator | None = None
+    image_text_extractor: VlmImageTextExtractor | None = None
     translation_mode = _normalize_translation_mode(
         getattr(args, "translation_mode", "") or tr_cfg.get("mode", "vlm_responses")
     )
+    text_extraction_backend = _normalize_text_extraction_backend(
+        getattr(args, "text_extraction_backend", "")
+        or tr_cfg.get("text_extraction_backend", tr_cfg.get("text_extraction_mode", "ocr"))
+    )
+    text_extraction_model_arg = str(
+        getattr(args, "text_extraction_model", "")
+        or tr_cfg.get("text_extraction_model_profile", "")
+        or ""
+    ).strip()
     translation_model_arg = str(getattr(args, "translation_model", "") or "").strip()
     translate_llm = str(tr_cfg.get("translate_llm", "")).strip().lower()
     if translate_llm:
@@ -1166,10 +1179,66 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 f"io_log={vlm_io_log_enabled} "
                 f"web_search={enable_web_search} auth={'yes' if api_key else 'no'}"
             )
+            if text_extraction_backend != "ocr":
+                extraction_profile = resolve_translation_model_profile(
+                    tr_cfg,
+                    TEXT_EXTRACTION_PROFILE_MODE,
+                    text_extraction_model_arg,
+                )
+                extraction_api_key = _load_api_key_for_pipeline_profile(
+                    extraction_profile,
+                    config_dir=Path(args.config).resolve().parent,
+                    project_root=project_root,
+                )
+                ext_temp, ext_top_p, ext_top_k = _profile_chat_params(tr_cfg, extraction_profile.name)
+                extraction_temp = ext_temp if ext_temp is not None else float(tr_cfg.get("text_extraction_temperature", 0.0))
+                extraction_max_tokens = int(tr_cfg.get("text_extraction_max_tokens", 512) or 512)
+                extraction_thinking = bool(tr_cfg.get("text_extraction_enable_thinking", False))
+                extraction_budget_raw = tr_cfg.get("text_extraction_thinking_budget", None)
+                extraction_budget: int | None = None
+                if extraction_budget_raw is not None and str(extraction_budget_raw).strip() != "":
+                    try:
+                        extraction_budget = int(extraction_budget_raw)
+                    except Exception:
+                        extraction_budget = None
+                image_text_extractor = VlmImageTextExtractor(
+                    api_key=extraction_api_key,
+                    model=extraction_profile.model,
+                    base_url=extraction_profile.base_url,
+                    backend=text_extraction_backend,
+                    temperature=extraction_temp,
+                    top_p=ext_top_p,
+                    top_k=ext_top_k,
+                    max_tokens=extraction_max_tokens,
+                    enable_thinking=extraction_thinking,
+                    thinking_budget=extraction_budget,
+                    preserve_thinking=bool(tr_cfg.get("text_extraction_preserve_thinking", False)),
+                    timeout_sec=int(tr_cfg.get("text_extraction_timeout_sec", tr_cfg.get("timeout_sec", 90))),
+                    timeout_backoff_sec=int(tr_cfg.get("timeout_backoff_sec", 15)),
+                    max_retries=int(tr_cfg.get("max_retries", 2)),
+                    retry_delay_sec=float(tr_cfg.get("retry_delay_sec", 1.5)),
+                    empty_max_attempts=int(tr_cfg.get("empty_max_attempts", 3)),
+                    disable_env_proxy=bool(tr_cfg.get("disable_env_proxy", True)),
+                    game_name=game_name,
+                    source_language=source_lang,
+                    log_fn=lambda m: _log(f"[VLM_OCR] {m}"),
+                    io_log_path=work_dir / "vlm_text_extraction_io.log",
+                    io_log_enabled=vlm_io_log_enabled,
+                )
+                _log(
+                    "Text extraction mode: VLM image text extraction "
+                    f"backend={text_extraction_backend} profile={extraction_profile.name} "
+                    f"model={extraction_profile.model} base_url={extraction_profile.base_url} "
+                    f"temp={extraction_temp:.2f} top_p={ext_top_p} top_k={ext_top_k} "
+                    f"max_tokens={extraction_max_tokens} thinking={extraction_thinking} "
+                    f"auth={'yes' if extraction_api_key else 'no'}"
+                )
+            else:
+                _log("Text extraction mode: RapidOCR")
         else:
             raise RuntimeError(f"Unsupported translation mode: {translation_mode}")
 
-    if text_translator is not None and ocr_engine is None:
+    if text_translator is not None and text_extraction_backend == "ocr" and ocr_engine is None:
         _log("Initializing OCR engine (OCR + Chat Completions text extraction).")
         ocr_engine = build_ocr_engine(cfg["ocr"])
         ocr_info = ocr_engine.info()
@@ -1484,9 +1553,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             and _path_is_valid(vlm_dialog_path)
             and _path_is_valid(vlm_speaker_path)
         ):
-            history_items = (
-                history_records[-max(0, vlm_history_n):] if vlm_history_enabled else None
-            )
+            # VLM Responses history is intentionally used only by Review retranslation.
+            history_items = None
             if vlm_pool is None:
                 try:
                     speaker_name, original_text, translated, usage = translate_segment_with_retry(
@@ -1555,10 +1623,28 @@ def run_pipeline(args: argparse.Namespace) -> int:
     work_relative = str(run_cache_path.resolve().relative_to(output_dir.resolve()))
 
     if text_translator is not None and not args.skip_translation:
-        if ocr_engine is None:
+        if text_extraction_backend == "ocr" and ocr_engine is None:
             raise RuntimeError("OCR engine is required for ocr_chat_completions mode")
-        _log("OCR + Chat Completions: sliding OCR lookahead with background prefetch.")
+        if text_extraction_backend != "ocr" and image_text_extractor is None:
+            raise RuntimeError("VLM image text extractor is required for selected text extraction backend")
+        _log(
+            "OCR + Chat Completions: sliding text-extraction lookahead "
+            f"with background prefetch (backend={text_extraction_backend})."
+        )
         ctx_window = max(0, int(getattr(text_translator, "context_window", 0)))
+        prefetch_setting = str(
+            tr_cfg.get("text_extraction_prefetch_during_translation", "auto") or "auto"
+        ).strip().lower()
+        if prefetch_setting in {"1", "true", "yes", "on"}:
+            prefetch_during_translation = True
+        elif prefetch_setting in {"0", "false", "no", "off"}:
+            prefetch_during_translation = False
+        else:
+            prefetch_during_translation = text_extraction_backend == "ocr"
+        _log(
+            "Text extraction prefetch during translation: "
+            f"{prefetch_during_translation} (setting={prefetch_setting})"
+        )
         ocr_done_indices: set[int] = set()
         ocr_lock = threading.Lock()
         ocr_pool = ThreadPoolExecutor(max_workers=1)
@@ -1624,27 +1710,44 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     fallback_image.close()
                 return
 
-            name_arr = np.asarray(name_image, dtype=np.uint8)
-            dialogue_arr = np.asarray(dialogue_image, dtype=np.uint8)
-            name_image.close()
-            dialogue_image.close()
-            if fallback_image is not None:
-                fallback_image.close()
-
             try:
-                speaker_ocr = ocr_engine.recognize_array(name_arr)
-                dialogue_ocr = ocr_engine.recognize_array(dialogue_arr)
-                seg.speaker = str(speaker_ocr.text or "").strip()
-                seg.speaker_confidence = float(speaker_ocr.confidence or 0.0)
-                seg.text_original = str(dialogue_ocr.text or "").strip()
-                seg.text_ocr_confidence = float(dialogue_ocr.confidence or 0.0)
+                if text_extraction_backend == "ocr":
+                    if ocr_engine is None:
+                        raise RuntimeError("OCR engine is not initialized")
+                    name_arr = np.asarray(name_image, dtype=np.uint8)
+                    dialogue_arr = np.asarray(dialogue_image, dtype=np.uint8)
+                    speaker_ocr = ocr_engine.recognize_array(name_arr)
+                    dialogue_ocr = ocr_engine.recognize_array(dialogue_arr)
+                    seg.speaker = str(speaker_ocr.text or "").strip()
+                    seg.speaker_confidence = float(speaker_ocr.confidence or 0.0)
+                    seg.text_original = str(dialogue_ocr.text or "").strip()
+                    seg.text_ocr_confidence = float(dialogue_ocr.confidence or 0.0)
+                else:
+                    if image_text_extractor is None:
+                        raise RuntimeError("VLM image text extractor is not initialized")
+                    speaker_url = _image_to_base64(name_image)
+                    dialogue_url = _image_to_base64(dialogue_image)
+                    speaker_text, original_text, usage = image_text_extractor.extract_text_from_images(
+                        speaker_image=speaker_url,
+                        dialogue_image=dialogue_url,
+                        request_tag=f"segment {seg.segment_id}",
+                    )
+                    seg.speaker = str(speaker_text or "").strip()
+                    seg.speaker_confidence = 0.0
+                    seg.text_original = str(original_text or "").strip()
+                    seg.text_ocr_confidence = 0.0
+                    _log(
+                        f"[VLM_OCR] segment {seg.segment_id}: "
+                        f"tokens_in={int(usage.get('prompt_tokens', 0))} "
+                        f"tokens_out={int(usage.get('completion_tokens', 0))}"
+                    )
                 seg.line_count_detected = max(1, seg.text_original.count("\n") + 1) if seg.text_original else 1
                 if not seg.text_original:
                     seg.translation_subtitle = debug_text
-                    seg.review_reason = _merge_review_reasons(seg.review_reason, ["ocr_text_missing"])
+                    seg.review_reason = _merge_review_reasons(seg.review_reason, ["text_extraction_missing"])
                     seg.needs_review = True
                 _log(
-                    f"[OCR_CHAT] segment {seg.segment_id}: "
+                    f"[TEXT_EXTRACT] segment {seg.segment_id}: "
                     f"speaker_chars={len(seg.speaker)} text_chars={len(seg.text_original)} "
                     f"speaker_conf={seg.speaker_confidence:.3f} text_conf={seg.text_ocr_confidence:.3f}"
                 )
@@ -1652,10 +1755,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 seg.translation_subtitle = debug_text
                 seg.review_reason = _merge_review_reasons(
                     seg.review_reason,
-                    [f"ocr_error:{exc.__class__.__name__}"],
+                    [f"text_extraction_error:{exc.__class__.__name__}"],
                 )
                 seg.needs_review = True
-                _log(f"[OCR_CHAT] segment {seg.segment_id}: OCR failed ({exc.__class__.__name__}): {exc}")
+                _log(f"[TEXT_EXTRACT] segment {seg.segment_id}: failed ({exc.__class__.__name__}): {exc}")
+            finally:
+                name_image.close()
+                dialogue_image.close()
+                if fallback_image is not None:
+                    fallback_image.close()
 
         def _submit_ocr(idx: int) -> None:
             if idx < 0 or idx >= len(final_segments):
@@ -1723,7 +1831,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
         for seg_idx, seg in enumerate(final_segments):
             _wait_ocr(seg_idx)
-            _submit_ocr(seg_idx + ctx_window + 1)
+            if prefetch_during_translation:
+                _submit_ocr(seg_idx + ctx_window + 1)
             if str(seg.dialogue_type or "").strip().lower() in {"blank_no_name", "blank", "title"}:
                 continue
             debug_text = debug_text_by_segment_id.get(seg.segment_id, "")
@@ -2115,6 +2224,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--translation-model",
         default="",
         help="translation.model_profiles key to use. Overrides translation.mode_models/config model.",
+    )
+    parser.add_argument(
+        "--text-extraction-backend",
+        choices=["ocr", "vlm_responses", "vlm_chat_completions"],
+        default="",
+        help="Text extraction backend for ocr_chat_completions mode. Overrides translation.text_extraction_backend.",
+    )
+    parser.add_argument(
+        "--text-extraction-model",
+        default="",
+        help="translation.model_profiles key for VLM image text extraction.",
     )
     parser.add_argument(
         "--auto-review",

@@ -16,6 +16,7 @@ from urllib import request
 
 DEFAULT_RESPONSES_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_CHAT_COMPLETIONS_BASE_URL = DEFAULT_RESPONSES_BASE_URL
+TEXT_EXTRACTION_PROFILE_MODE = "vlm_text_extraction"
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,42 @@ def _language_label_zh(lang: str) -> str:
     return mapping.get(v, lang)
 
 
+def _normalize_text_extraction_backend(value: Any) -> str:
+    v = str(value or "ocr").strip().lower().replace("-", "_")
+    if v in {"rapidocr", "ocr", "default"}:
+        return "ocr"
+    if v in {"vlm_responses", "responses", "response"}:
+        return "vlm_responses"
+    if v in {"vlm_chat", "vlm_chat_completions", "chat", "chat_completions", "openai_chat"}:
+        return "vlm_chat_completions"
+    raise ValueError(f"Unsupported text extraction backend: {value}")
+
+
+def _format_history_reference(history_items: list[dict[str, str]] | None, limit: int = 8) -> str:
+    if not history_items:
+        return ""
+    lines: list[str] = []
+    for item in history_items:
+        if not isinstance(item, dict):
+            continue
+        time_text = str(item.get("time", "") or "").strip()
+        speaker = str(item.get("speaker", "") or "").strip()
+        original = str(item.get("original", "") or "").strip()
+        translation = str(item.get("translation", "") or "").strip()
+        if not original and not translation:
+            continue
+        prefix = f"{time_text} " if time_text else ""
+        speaker_prefix = f"{speaker}: " if speaker else ""
+        if translation:
+            lines.append(f"{prefix}{speaker_prefix}{original} -> {translation}".strip())
+        else:
+            lines.append(f"{prefix}{speaker_prefix}{original}".strip())
+    if not lines:
+        return ""
+    window = max(1, int(limit))
+    return "### 前文参考\n" + "\n".join(lines[-window:]) + "\n\n"
+
+
 def translate_segment_with_retry(
     seg_id: int,
     translator: VlmResponsesTranslator,
@@ -597,7 +634,9 @@ class VlmResponsesTranslator:
             )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
+        history_text = _format_history_reference(history_items)
         user_text = (
+            f"{history_text}"
             "### 图片1：说话人姓名\n"
             "### 图片2：对话文本\n"
             "**请识别并翻译：**"
@@ -770,6 +809,8 @@ class VlmResponsesTranslator:
         speaker: str = "",
         request_tag: str = "",
         custom_prompt: str = "",
+        history_items: list[dict[str, str]] | None = None,
+        extra_requirements: str = "",
     ) -> tuple[str, dict[str, int]]:
         src = str(original_text or "").strip()
         if not src:
@@ -790,6 +831,8 @@ class VlmResponsesTranslator:
             "- **保留符号**：保留原文使用的『』，禁止替换为\"\"或''。\n"
             "- **禁止自创标点**：禁止自行添加原文没有的标点。\n"
             "- **英文处理**：原文若为纯英文，不需要翻译，直接输出原文。\n"
+            "### 额外要求\n"
+            "**{placeholder}**\n"
             "### 输出JSON\n"
             "**必须返回符合以下JSON Schema的JSON对象：**\n"
             "```json\n"
@@ -798,9 +841,18 @@ class VlmResponsesTranslator:
             "}\n"
             "```"
         )
+        extra_requirements_text = str(extra_requirements or "").strip()
+        if extra_requirements_text:
+            system_prompt = system_prompt.replace("**{placeholder}**", f"**{extra_requirements_text}**")
+        else:
+            system_prompt = system_prompt.replace(
+                "### 额外要求\n**{placeholder}**\n", ""
+            )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
+        history_text = _format_history_reference(history_items)
         user_text = (
+            f"{history_text}"
             f"### 当前说话人（仅供参考）\n"
             f"**{speaker}**\n"
             f"### 原文\n"
@@ -898,6 +950,7 @@ class VlmResponsesTranslator:
         request_tag: str = "",
         history_items: list[dict[str, str]] | None = None,
         custom_prompt: str = "",
+        extra_requirements: str = "",
     ) -> tuple[str, str, dict[str, int]]:
         game_hint = f"图像中的文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
         system_prompt = (
@@ -914,6 +967,8 @@ class VlmResponsesTranslator:
             "- **保留符号**：保留原文使用的『』，禁止替换为\"\"或''。\n"
             "- **禁止自创标点**：禁止自行添加原文没有的标点。\n"
             "- **英文处理**：原文若为纯英文，不需要翻译，直接输出原文。\n"
+            "### 额外要求\n"
+            "**{placeholder}**\n"
             "### 输出JSON\n"
             "**必须返回符合以下JSON Schema的JSON对象：**\n"
             "```json\n"
@@ -923,9 +978,18 @@ class VlmResponsesTranslator:
             "}\n"
             "```"
         )
+        extra_requirements_text = str(extra_requirements or "").strip()
+        if extra_requirements_text:
+            system_prompt = system_prompt.replace("**{placeholder}**", f"**{extra_requirements_text}**")
+        else:
+            system_prompt = system_prompt.replace(
+                "### 额外要求\n**{placeholder}**\n", ""
+            )
         if self.enable_web_search:
             system_prompt += self._search_hint_cn
+        history_text = _format_history_reference(history_items)
         user_text = (
+            f"{history_text}"
             "### 图像：标题/文本区域\n"
             "**请识别并翻译（前文仅作风格参考，不一定与当前图像直接相关）：**"
         )
@@ -1218,6 +1282,274 @@ class VlmResponsesTranslator:
             out = out[marker_pos:].split(":", 1)[-1]
 
         return out.strip()
+
+
+class VlmImageTextExtractor:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str,
+        backend: str = "vlm_chat_completions",
+        temperature: float = 0.0,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        max_tokens: int = 512,
+        enable_thinking: bool = False,
+        thinking_budget: int | None = None,
+        preserve_thinking: bool = False,
+        empty_max_attempts: int = 3,
+        timeout_sec: int = 30,
+        timeout_backoff_sec: int = 15,
+        max_retries: int = 2,
+        retry_delay_sec: float = 1.5,
+        disable_env_proxy: bool = True,
+        game_name: str = "",
+        source_language: str = "ja",
+        log_fn: Callable[[str], None] | None = None,
+        io_log_path: str | Path | None = None,
+        io_log_enabled: bool = False,
+    ) -> None:
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or "").strip()
+        self.base_url = str(base_url or DEFAULT_CHAT_COMPLETIONS_BASE_URL).rstrip("/")
+        self.backend = _normalize_text_extraction_backend(backend)
+        self.temperature = float(temperature)
+        self.top_p = float(top_p) if top_p is not None else None
+        self.top_k = int(top_k) if top_k is not None else None
+        self.max_tokens = max(0, int(max_tokens))
+        self.enable_thinking = bool(enable_thinking)
+        self.thinking_budget = int(thinking_budget) if thinking_budget is not None else None
+        self.preserve_thinking = bool(preserve_thinking)
+        self.empty_max_attempts = max(1, int(empty_max_attempts))
+        self.timeout_sec = int(timeout_sec)
+        self.timeout_backoff_sec = max(0, int(timeout_backoff_sec))
+        self.max_retries = max(0, int(max_retries))
+        self.retry_delay_sec = max(0.0, float(retry_delay_sec))
+        self.game_name = str(game_name or "").strip()
+        self.source_language = _language_label_zh(str(source_language or "ja").strip() or "ja")
+        self.log_fn = log_fn
+        self.io_log_path = Path(io_log_path) if io_log_path else None
+        self.io_log_enabled = bool(io_log_enabled) and (self.io_log_path is not None)
+        self._io_lock = threading.Lock()
+        self._io_pending: dict[str, dict[str, Any]] = {}
+        self._opener = (
+            request.build_opener(request.ProxyHandler({}))
+            if disable_env_proxy
+            else request.build_opener()
+        )
+
+    def extract_text_from_images(
+        self,
+        speaker_image: str | Path,
+        dialogue_image: str | Path,
+        request_tag: str = "",
+    ) -> tuple[str, str, dict[str, int]]:
+        system_prompt = (
+            "### 角色\n"
+            f"**你是{self.game_name}的游戏字幕图像文字识别助手。**\n"
+            "### 输入\n"
+            "**你会收到两张图像：**\n"
+            "- **图片1**：当前说话人的姓名区域\n"
+            "- **图片2**：对白文本区域\n"
+            "### 任务\n"
+            f"**识别图片1中的{self.source_language}说话人姓名。**\n"
+            f"**识别图片2中的{self.source_language}对白原文。只做文字识别和格式化，不要翻译。**\n"
+            "### 识别规则\n"
+            "- **保留原文**：保留原文语言、换行、符号、括号和语气符号。\n"
+            "- **多行换行**：图片2若为多行对白，`original_text` 必须使用 `\\n` 表示换行。\n"
+            "- **空白处理**：某个区域没有可见文字时，对应字段输出空字符串。\n"
+            "- **禁止编造**：文字模糊时可结合字形判断，但不要编造看不见的内容。\n"
+            "- **禁止翻译**：不要把日文、英文或其他原文翻译成中文。\n"
+            "### 输出JSON\n"
+            "**只输出 JSON，不要 Markdown，不要解释。必须符合以下格式：**\n"
+            "```json\n"
+            "{\n"
+            '  "speaker_name": "原文说话人姓名",\n'
+            '  "original_text": "原文对白文本"\n'
+            "}\n"
+            "```"
+        )
+        user_text = "### 图片1：说话人姓名\n### 图片2：对白文本\n**请识别并输出 JSON：**"
+        speaker_url = self._to_data_url(speaker_image)
+        dialogue_url = self._to_data_url(dialogue_image)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": speaker_url}},
+                    {"type": "image_url", "image_url": {"url": dialogue_url}},
+                ],
+            },
+        ]
+        payload = self._build_payload(messages)
+        if self.io_log_enabled:
+            self._append_io_log(
+                {
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "event": "request",
+                    "request_tag": request_tag,
+                    "backend": self.backend,
+                    "speaker_image_path": self._image_input_log_value(speaker_image),
+                    "dialogue_image_path": self._image_input_log_value(dialogue_image),
+                    "prompt_preview": {
+                        "model": payload.get("model"),
+                        "temperature": payload.get("temperature"),
+                        "top_p": payload.get("top_p"),
+                        "top_k": payload.get("top_k"),
+                        "max_tokens": payload.get("max_tokens"),
+                        "chat_template_kwargs": payload.get("chat_template_kwargs"),
+                        "system_prompt": system_prompt,
+                        "user_prompt": user_text,
+                    },
+                }
+            )
+        return self._request_with_retries(payload, request_tag)
+
+    def _build_payload(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
+            "stream": False,
+        }
+        if self.top_p is not None:
+            payload["top_p"] = self.top_p
+        if self.top_k is not None:
+            payload["top_k"] = self.top_k
+        if self.max_tokens > 0:
+            payload["max_tokens"] = self.max_tokens
+        if self.thinking_budget is not None:
+            payload["thinking_budget"] = int(self.thinking_budget)
+        if self.preserve_thinking:
+            payload["preserve_thinking"] = True
+        if self.backend == "vlm_responses":
+            payload["input"] = VlmResponsesTranslator._messages_to_responses_input(self, messages)
+        else:
+            payload["messages"] = messages
+        return payload
+
+    def _request_with_retries(self, payload: dict[str, Any], request_tag: str) -> tuple[str, str, dict[str, int]]:
+        path = "/responses" if self.backend == "vlm_responses" else "/chat/completions"
+        req = request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=_auth_headers(self.api_key),
+            method="POST",
+        )
+        empty_limit = self.empty_max_attempts
+        attempts = max(self.max_retries + 1, empty_limit)
+        empty_count = 0
+        err_count = 0
+        current_timeout = int(self.timeout_sec)
+        last_err: Exception | None = None
+        tag_prefix = f"{request_tag}: " if request_tag else ""
+        for i in range(attempts):
+            try:
+                with self._opener.open(req, timeout=current_timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                usage = self._extract_usage_from_data(data)
+                raw = self._extract_text(data).strip()
+                speaker, original = self._parse_json_text(raw)
+                if self.io_log_enabled:
+                    self._append_io_log(
+                        {
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "event": "response",
+                            "request_tag": request_tag,
+                            "attempt": i + 1,
+                            "usage": usage,
+                            "raw_response_text": raw,
+                            "parsed_speaker_name": speaker,
+                            "parsed_original_text": original,
+                        }
+                    )
+                if speaker or original:
+                    return speaker, original, usage
+                empty_count += 1
+                if self.log_fn is not None:
+                    self.log_fn(
+                        f"{tag_prefix}warning: empty extraction on empty-attempt {empty_count + 1}/{empty_limit}"
+                    )
+                if empty_count >= empty_limit:
+                    return "", "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                time.sleep(self.retry_delay_sec)
+                continue
+            except Exception as exc:
+                last_err = exc
+                err_count += 1
+                err_detail = self._exception_message(exc)
+                is_timeout_like = (
+                    isinstance(exc, TimeoutError)
+                    or "timeout" in exc.__class__.__name__.lower()
+                    or "timed out" in str(exc).lower()
+                )
+                if self.log_fn is not None:
+                    self.log_fn(
+                        f"{tag_prefix}request attempt {i + 1}/{attempts} failed: {exc.__class__.__name__} | {err_detail}"
+                    )
+                if is_timeout_like and self.timeout_backoff_sec > 0:
+                    current_timeout += self.timeout_backoff_sec
+                if err_count > self.max_retries or i + 1 >= attempts:
+                    break
+                time.sleep(self.retry_delay_sec)
+        if last_err is not None:
+            raise last_err
+        return "", "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _parse_json_text(self, raw_text: str) -> tuple[str, str]:
+        clean = self._strip_thinking_content(raw_text).strip()
+        obj: dict[str, Any] = {}
+        if clean:
+            try:
+                obj = json.loads(clean)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", clean)
+                if m:
+                    try:
+                        obj = json.loads(m.group(0))
+                    except Exception:
+                        obj = {}
+        if not isinstance(obj, dict):
+            obj = {}
+        speaker = str(
+            obj.get("speaker_name")
+            or obj.get("speaker")
+            or obj.get("character_name")
+            or ""
+        ).strip()
+        original = str(
+            obj.get("original_text")
+            or obj.get("ocr_text")
+            or obj.get("source_text")
+            or ""
+        ).strip()
+        return speaker, original
+
+    def _extract_usage_from_data(self, data: dict[str, Any]) -> dict[str, int]:
+        return VlmResponsesTranslator._extract_usage_from_data(self, data)
+
+    def _extract_text(self, data: dict[str, Any]) -> str:
+        if self.backend == "vlm_responses":
+            return VlmResponsesTranslator._extract_text(self, data)
+        return ChatCompletionsTextTranslator._extract_text(self, data)
+
+    def _strip_thinking_content(self, text: str) -> str:
+        return VlmResponsesTranslator._strip_thinking_content(self, text)
+
+    def _exception_message(self, exc: Exception) -> str:
+        return VlmResponsesTranslator._exception_message(self, exc)
+
+    def _image_input_log_value(self, image_input: str | Path | None) -> str:
+        return VlmResponsesTranslator._image_input_log_value(self, image_input)
+
+    def _to_data_url(self, image_input: str | Path) -> str:
+        return VlmResponsesTranslator._to_data_url(self, image_input)
+
+    def _append_io_log(self, record: dict[str, Any]) -> None:
+        return VlmResponsesTranslator._append_io_log(self, record)
 
 
 class ChatCompletionsTextTranslator:
