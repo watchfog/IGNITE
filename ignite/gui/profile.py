@@ -29,6 +29,7 @@ from ignite.gui.local_state import (
     remember_window_state,
 )
 from ignite.translation_runtime import (
+    TEXT_EXTRACTION_PROFILE_MODE,
     available_translation_model_profiles,
     resolve_translation_model_profile,
 )
@@ -121,6 +122,8 @@ class ProfileEditor:
         self.translation_mode_var = tk.StringVar(value="vlm_responses")
         self.vlm_models_var = tk.StringVar(value="")
         self.vlm_model_var = tk.StringVar(value="")
+        self.text_extraction_backend_var = tk.StringVar(value="ocr")
+        self.text_extraction_model_var = tk.StringVar(value="")
         self.auto_review_enabled_var = tk.BooleanVar(value=False)
         self.auto_review_model_var = tk.StringVar(value="")
         self.match_score_var = tk.StringVar(value="Marker匹配分数: N/A")
@@ -458,6 +461,23 @@ class ProfileEditor:
             top, textvariable=self.vlm_model_var, state="readonly", width=24,
         )
         self._vlm_model_combo.grid(row=15, column=3, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0))
+        ttk.Label(top, text="文本抽取后端").grid(row=16, column=0, sticky="w", pady=(4, 0))
+        self._text_extraction_backend_combo = ttk.Combobox(
+            top,
+            textvariable=self.text_extraction_backend_var,
+            state="readonly",
+            values=["ocr", "vlm_responses", "vlm_chat_completions"],
+            width=22,
+        )
+        self._text_extraction_backend_combo.grid(row=16, column=1, sticky="w", padx=(6, 4), pady=(4, 0))
+        ttk.Label(top, text="抽取模型").grid(row=16, column=2, sticky="e", padx=(10, 0), pady=(4, 0))
+        self._text_extraction_model_combo = ttk.Combobox(
+            top,
+            textvariable=self.text_extraction_model_var,
+            state="readonly",
+            width=24,
+        )
+        self._text_extraction_model_combo.grid(row=16, column=3, columnspan=2, sticky="w", padx=(6, 4), pady=(4, 0))
         top.columnconfigure(1, weight=1)
 
         info = ttk.Frame(self.root, padding=(8, 0, 8, 6))
@@ -515,6 +535,7 @@ class ProfileEditor:
             var.trace_add("write", lambda *_: self._update_marker2_match_score())
         self.output_name_var.trace_add("write", lambda *_: self._on_output_name_changed())
         self.translation_mode_var.trace_add("write", lambda *_: self._on_translation_mode_changed())
+        self.text_extraction_backend_var.trace_add("write", lambda *_: self._on_text_extraction_backend_changed())
         for var in [
             self.video_path_var,
             self.template_paths_var,
@@ -540,6 +561,8 @@ class ProfileEditor:
             self.translation_mode_var,
             self.vlm_models_var,
             self.vlm_model_var,
+            self.text_extraction_backend_var,
+            self.text_extraction_model_var,
             self.auto_review_model_var,
             self.output_name_var,
             self.extra_requirements_var,
@@ -592,7 +615,37 @@ class ProfileEditor:
             if isinstance(mode_models, dict):
                 preferred = str(mode_models.get(mode, "") or "").strip()
             self.vlm_model_var.set(preferred if preferred in model_list else model_list[0])
+        self._refresh_text_extraction_model_choices(tr_cfg)
         self._refresh_auto_review_model_choices(tr_cfg)
+
+    def _on_text_extraction_backend_changed(self) -> None:
+        tr_cfg = self.cfg_merged.get("translation", {}) if isinstance(self.cfg_merged, dict) else {}
+        if not isinstance(tr_cfg, dict):
+            tr_cfg = {}
+        self._refresh_text_extraction_model_choices(tr_cfg)
+
+    def _refresh_text_extraction_model_choices(self, tr_cfg: dict[str, Any] | None = None) -> None:
+        if tr_cfg is None:
+            tr_cfg = self.cfg_merged.get("translation", {}) if isinstance(self.cfg_merged, dict) else {}
+        if not isinstance(tr_cfg, dict):
+            tr_cfg = {}
+        model_list = available_translation_model_profiles(tr_cfg, TEXT_EXTRACTION_PROFILE_MODE)
+        try:
+            self._text_extraction_model_combo["values"] = model_list
+        except Exception:
+            pass
+        backend = str(self.text_extraction_backend_var.get() or "ocr").strip()
+        try:
+            self._text_extraction_model_combo.configure(state="readonly" if backend != "ocr" else "disabled")
+        except Exception:
+            pass
+        cur = str(self.text_extraction_model_var.get() or "").strip()
+        if model_list and cur not in model_list:
+            preferred = str(tr_cfg.get("text_extraction_model_profile", "") or "").strip()
+            mode_models = tr_cfg.get("mode_models")
+            if not preferred and isinstance(mode_models, dict):
+                preferred = str(mode_models.get(TEXT_EXTRACTION_PROFILE_MODE, "") or "").strip()
+            self.text_extraction_model_var.set(preferred if preferred in model_list else model_list[0])
 
     def _refresh_auto_review_model_choices(self, tr_cfg: dict[str, Any] | None = None) -> None:
         if tr_cfg is None:
@@ -908,6 +961,19 @@ class ProfileEditor:
         if not cur_model or cur_model not in model_list:
             cur_model = model_list[0] if model_list else "qwen3.6-plus"
         self.vlm_model_var.set(cur_model)
+        text_backend = str(
+            tr_cfg.get("text_extraction_backend", tr_cfg.get("text_extraction_mode", "ocr")) or "ocr"
+        ).strip()
+        if text_backend not in {"ocr", "vlm_responses", "vlm_chat_completions"}:
+            text_backend = "ocr"
+        self.text_extraction_backend_var.set(text_backend)
+        self._refresh_text_extraction_model_choices(tr_cfg)
+        text_models = list(self._text_extraction_model_combo["values"] or [])
+        text_model = str(tr_cfg.get("text_extraction_model_profile", "") or "").strip()
+        if not text_model and isinstance(mode_models, dict):
+            text_model = str(mode_models.get(TEXT_EXTRACTION_PROFILE_MODE, "") or "").strip()
+        if text_model and text_model in text_models:
+            self.text_extraction_model_var.set(text_model)
         self.auto_review_enabled_var.set(bool(tr_cfg.get("auto_review_enabled", False)))
         self._refresh_auto_review_model_choices(tr_cfg)
         review_model = str(tr_cfg.get("auto_review_model_profile", "") or "").strip()
@@ -1368,6 +1434,29 @@ class ProfileEditor:
                         errs.append(
                             f"api_key_file 不存在：{key_path}（请检查 translation.model_profiles）。"
                         )
+            text_backend = str(self.text_extraction_backend_var.get().strip() or "ocr")
+            if mode == "ocr_chat_completions" and text_backend != "ocr":
+                text_model = str(self.text_extraction_model_var.get().strip())
+                try:
+                    text_profile = resolve_translation_model_profile(
+                        tr_cfg,
+                        TEXT_EXTRACTION_PROFILE_MODE,
+                        text_model,
+                    )
+                except Exception as exc:
+                    errs.append(f"文本抽取模型配置无效：{exc}")
+                else:
+                    api_key_file = str(text_profile.api_key_file or "").strip()
+                    if api_key_file:
+                        key_path = Path(api_key_file)
+                        if not key_path.is_absolute():
+                            cfg_dir = Path(raw_cfg).resolve().parent if raw_cfg else ROOT
+                            candidates = [(cfg_dir / key_path).resolve(), (ROOT / key_path).resolve()]
+                            key_path = next((cand for cand in candidates if cand.exists()), candidates[0])
+                        if not key_path.exists() or not key_path.is_file():
+                            errs.append(
+                                f"文本抽取 api_key_file 不存在：{key_path}（请检查 translation.model_profiles）。"
+                            )
         return errs
 
     def _append_run_log(self, text: str) -> None:
@@ -1562,6 +1651,11 @@ class ProfileEditor:
             model = str(self.vlm_model_var.get().strip())
             if model:
                 cmd.extend(["--translation-model", model])
+            text_backend = str(self.text_extraction_backend_var.get().strip() or "ocr")
+            cmd.extend(["--text-extraction-backend", text_backend])
+            text_model = str(self.text_extraction_model_var.get().strip())
+            if text_backend != "ocr" and text_model:
+                cmd.extend(["--text-extraction-model", text_model])
             if bool(self.auto_review_enabled_var.get()):
                 cmd.append("--auto-review")
                 review_model = str(self.auto_review_model_var.get().strip())
@@ -2620,6 +2714,18 @@ class ProfileEditor:
             mode_models[mode] = sel_model
         else:
             data["translation"].pop("model", None)
+        text_backend = str(self.text_extraction_backend_var.get().strip() or "ocr")
+        data["translation"]["text_extraction_backend"] = text_backend
+        text_model = str(self.text_extraction_model_var.get().strip())
+        if text_backend != "ocr" and text_model:
+            data["translation"]["text_extraction_model_profile"] = text_model
+            mode_models = data["translation"].get("mode_models")
+            if not isinstance(mode_models, dict):
+                mode_models = {}
+                data["translation"]["mode_models"] = mode_models
+            mode_models[TEXT_EXTRACTION_PROFILE_MODE] = text_model
+        else:
+            data["translation"].pop("text_extraction_model_profile", None)
         data["translation"]["auto_review_enabled"] = bool(self.auto_review_enabled_var.get())
         review_model = str(self.auto_review_model_var.get().strip())
         if review_model:

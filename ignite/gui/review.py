@@ -25,7 +25,6 @@ from tkinter import filedialog, messagebox, ttk
 from ignite.archive_manager import archive_project, find_hard_subtitle_video
 from ignite.auto_review import (
     _profile_chat_params,
-    apply_updates_to_cache_entries,
     default_auto_review_profile,
     dialogue_review_entries_from_cache_entries,
     run_auto_review_entries,
@@ -49,8 +48,11 @@ from ignite.review_utils import _merge_review_reasons
 from ignite.translation_runtime import (
     available_translation_model_profiles,
     ChatCompletionsTextTranslator,
+    TEXT_EXTRACTION_PROFILE_MODE,
+    VlmImageTextExtractor,
     TranslationModelProfile,
     VlmResponsesTranslator,
+    _normalize_text_extraction_backend,
     has_kanji_overlap_from_original,
     normalize_quotes_for_subtitle,
     load_api_key,
@@ -156,6 +158,7 @@ class CacheReviewApp:
         self.cfg: dict[str, Any] = {}
         self.translator: VlmResponsesTranslator | None = None
         self.text_translator: ChatCompletionsTextTranslator | None = None
+        self.image_text_extractor: VlmImageTextExtractor | None = None
         self.auto_review_model_var = tk.StringVar(value="")
         self.last_review_result: dict[str, Any] | None = None
         self._busy = False
@@ -547,6 +550,8 @@ class CacheReviewApp:
         self.cfg = load_config(p)
         self.subtitle_style_cfg = self._load_subtitle_style_cfg()
         self.translator = None
+        self.text_translator = None
+        self.image_text_extractor = None
         tools_cfg = self.cfg.get("tools", {})
         ffmpeg_cfg = str(tools_cfg.get("ffmpeg_path", "") or "").strip()
         if ffmpeg_cfg:
@@ -791,6 +796,105 @@ class CacheReviewApp:
             context_window=int(tcfg.get("chat_context_window", 8)),
         )
         return self.text_translator
+
+    def _text_extraction_backend(self) -> str:
+        tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+        return _normalize_text_extraction_backend(
+            tcfg.get("text_extraction_backend", tcfg.get("text_extraction_mode", "ocr"))
+        )
+
+    def _build_image_text_extractor(self) -> VlmImageTextExtractor:
+        if self.image_text_extractor is not None:
+            return self.image_text_extractor
+        tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+        game_cfg = self.cfg.get("game", {}) if isinstance(self.cfg.get("game"), dict) else {}
+        backend = self._text_extraction_backend()
+        requested = str(tcfg.get("text_extraction_model_profile", "") or "").strip()
+        profile = resolve_translation_model_profile(tcfg, TEXT_EXTRACTION_PROFILE_MODE, requested)
+        api_key = self._api_key_for_profile(profile)
+        profile_temp, profile_top_p, profile_top_k = _profile_chat_params(tcfg, profile.name)
+        temp = profile_temp if profile_temp is not None else float(tcfg.get("text_extraction_temperature", 0.0))
+        budget_raw = tcfg.get("text_extraction_thinking_budget", None)
+        budget: int | None = None
+        if budget_raw is not None and str(budget_raw).strip() != "":
+            try:
+                budget = int(budget_raw)
+            except Exception:
+                budget = None
+        self.image_text_extractor = VlmImageTextExtractor(
+            api_key=api_key,
+            model=profile.model,
+            base_url=profile.base_url,
+            backend=backend,
+            temperature=temp,
+            top_p=profile_top_p,
+            top_k=profile_top_k,
+            max_tokens=int(tcfg.get("text_extraction_max_tokens", 512) or 512),
+            enable_thinking=bool(tcfg.get("text_extraction_enable_thinking", False)),
+            thinking_budget=budget,
+            preserve_thinking=bool(tcfg.get("text_extraction_preserve_thinking", False)),
+            timeout_sec=int(tcfg.get("text_extraction_timeout_sec", tcfg.get("timeout_sec", 90))),
+            timeout_backoff_sec=int(tcfg.get("timeout_backoff_sec", 15)),
+            max_retries=int(tcfg.get("max_retries", 2)),
+            retry_delay_sec=float(tcfg.get("retry_delay_sec", 1.5)),
+            empty_max_attempts=int(tcfg.get("empty_max_attempts", 3)),
+            disable_env_proxy=bool(tcfg.get("disable_env_proxy", True)),
+            game_name=str(game_cfg.get("name", "") or ""),
+            source_language=str(game_cfg.get("source_language", "ja") or "ja"),
+            io_log_enabled=True,
+            io_log_path=self.cache_path.parent / "review_vlm_text_extraction_io.log",
+            log_fn=lambda s: self._set_status_threadsafe(f"[VLM_OCR] {s}"),
+        )
+        return self.image_text_extractor
+
+    def _translation_extra_requirements(self) -> str:
+        game_cfg = self.cfg.get("game", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(game_cfg, dict):
+            return ""
+        return str(game_cfg.get("extra_requirements", "") or "").strip()
+
+    def _get_history_items_before_index(self, index: int) -> list[dict[str, str]] | None:
+        if index <= 0 or not self.entries:
+            return None
+        tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+        limit = max(0, int(tcfg.get("history_n", 5) or 5))
+        if limit <= 0:
+            return None
+        items: list[dict[str, str]] = []
+        for e in reversed(self.entries[:index]):
+            if not isinstance(e, dict):
+                continue
+            dtype = str(e.get("dialogue_type", "") or "").strip().lower()
+            if dtype in {"blank_no_name", "blank", "title"}:
+                continue
+            original = str(e.get("text_original", "") or "").strip()
+            translation = str(e.get("translation_subtitle", "") or "").strip()
+            if not original or not translation:
+                continue
+            try:
+                start = float(e.get("time_start", 0.0) or 0.0)
+                end = float(e.get("time_end", 0.0) or 0.0)
+                time_text = f"{start:.2f}-{end:.2f}s"
+            except Exception:
+                time_text = ""
+            items.insert(
+                0,
+                {
+                    "time": time_text,
+                    "speaker": str(e.get("speaker", "") or ""),
+                    "original": original,
+                    "translation": translation,
+                },
+            )
+            if len(items) >= limit:
+                break
+        return items or None
 
     def _get_context_around_index(self, index: int, before: bool) -> list[str | dict[str, str]] | None:
         ctx_window = max(0, int(getattr(self.text_translator, "context_window", 0)))
@@ -2187,6 +2291,116 @@ class CacheReviewApp:
             self.status_var.set(f"{action}前自动保存失败: {exc}")
             return False
 
+    def _entry_index_by_segment_id(self, segment_id: int) -> int | None:
+        for idx, entry in enumerate(self.entries):
+            try:
+                if int(entry.get("segment_id", 0) or 0) == int(segment_id):
+                    return idx
+            except Exception:
+                continue
+        return None
+
+    def _short_review_text(self, text: Any, max_chars: int = 700) -> str:
+        s = str(text or "").strip()
+        if len(s) <= max_chars:
+            return s
+        return s[:max_chars].rstrip() + "..."
+
+    def _confirm_auto_review_updates(self, updates: list[dict[str, Any]], report: dict[str, Any]) -> None:
+        changed_updates = [item for item in updates if item.get("changed")]
+        report_out = copy.deepcopy(report)
+        report_out["confirmation_required"] = True
+        report_out["confirmed_applied_count"] = 0
+        report_out["confirmed_skipped_count"] = 0
+        report_out["missing_entry_count"] = 0
+        report_out["confirmation_cancelled"] = False
+        if not changed_updates:
+            self.review_text.delete("1.0", tk.END)
+            self.review_text.insert(tk.END, json.dumps(report_out, ensure_ascii=False, indent=2))
+            self.review_meta_var.set(f"自动review: 待修改=0 updates={len(updates)}")
+            self.status_var.set("自动review 完成：没有需要确认的修改。")
+            return
+
+        applied = 0
+        skipped = 0
+        missing = 0
+        cancelled = False
+        last_idx: int | None = None
+        total = len(changed_updates)
+        for pos, update in enumerate(changed_updates, start=1):
+            try:
+                segment_id = int(update.get("id", 0) or 0)
+            except Exception:
+                missing += 1
+                continue
+            idx = self._entry_index_by_segment_id(segment_id)
+            if idx is None:
+                missing += 1
+                continue
+            new_text = str(update.get("new_translation", "") or "").strip()
+            if not new_text:
+                skipped += 1
+                continue
+            entry = self.entries[idx]
+            current_text = str(entry.get("translation_subtitle", "") or "").strip()
+            if current_text == new_text:
+                skipped += 1
+                continue
+            speaker = str(update.get("speaker", entry.get("speaker", "")) or "").strip()
+            original = str(update.get("original", entry.get("text_original", "")) or "").strip()
+            reason = str(update.get("reason", "") or "").strip()
+            preview = {
+                "segment_id": segment_id,
+                "speaker": speaker,
+                "original": original,
+                "current_translation": current_text,
+                "suggested_translation": new_text,
+                "reason": reason,
+            }
+            self._show_segment(idx)
+            self.review_text.delete("1.0", tk.END)
+            self.review_text.insert(tk.END, json.dumps(preview, ensure_ascii=False, indent=2))
+            self.review_meta_var.set(f"自动review确认: {pos}/{total}")
+            prompt = (
+                f"第 {pos}/{total} 条自动review建议\n"
+                f"段号：{segment_id}\n"
+                f"说话人：{speaker or '（空）'}\n\n"
+                f"原文：\n{self._short_review_text(original)}\n\n"
+                f"当前译文：\n{self._short_review_text(current_text)}\n\n"
+                f"建议译文：\n{self._short_review_text(new_text)}\n\n"
+                f"原因：\n{self._short_review_text(reason, 350) or '（无）'}\n\n"
+                "是否应用此修改？\n"
+                "是：应用；否：跳过；取消：停止后续确认。"
+            )
+            answer = messagebox.askyesnocancel("确认自动review修改", prompt, parent=self.root)
+            if answer is None:
+                cancelled = True
+                break
+            if not answer:
+                skipped += 1
+                continue
+            entry["translation_subtitle"] = new_text
+            applied += 1
+            last_idx = idx
+
+        report_out["confirmed_applied_count"] = applied
+        report_out["confirmed_skipped_count"] = skipped
+        report_out["missing_entry_count"] = missing
+        report_out["confirmation_cancelled"] = cancelled
+        if applied:
+            self._rebuild_suspect_indices()
+            self._show_segment(last_idx if last_idx is not None else self.current_index)
+            self._save_cache_file(apply_current=False)
+        else:
+            self._rebuild_suspect_indices()
+            self._show_segment(self.current_index)
+        self.review_text.delete("1.0", tk.END)
+        self.review_text.insert(tk.END, json.dumps(report_out, ensure_ascii=False, indent=2))
+        self.review_meta_var.set(f"自动review: 已应用={applied} 跳过={skipped} 缺失={missing}")
+        tail = "，用户已停止后续确认" if cancelled else ""
+        save_note = "，已保存缓存" if applied else ""
+        self.status_var.set(f"自动review 确认完成：应用 {applied} 条，跳过 {skipped} 条{tail}{save_note}。")
+
     def _auto_review_current_cache(self) -> None:
         try:
             self._save_current_entry()
@@ -2221,17 +2435,7 @@ class CacheReviewApp:
                 log_fn=lambda s: self._set_status_threadsafe(f"[自动review] {s}"),
             )
 
-            def _apply() -> None:
-                changed = apply_updates_to_cache_entries(self.entries, updates)
-                self._rebuild_suspect_indices()
-                self._show_segment(self.current_index)
-                self._save_cache_file(apply_current=False)
-                self.review_text.delete("1.0", tk.END)
-                self.review_text.insert(tk.END, json.dumps(report, ensure_ascii=False, indent=2))
-                self.review_meta_var.set(f"自动review: changed={changed} updates={len(updates)}")
-                self.status_var.set(f"自动review 完成：修改 {changed} 条，已保存缓存。")
-
-            self.root.after(0, _apply)
+            self.root.after(0, lambda: self._confirm_auto_review_updates(updates, report))
 
         self._run_bg("自动review", _job, show_review_progress=True)
 
@@ -3639,20 +3843,33 @@ class CacheReviewApp:
             cv2.imwrite(str(dia_img), cv2.cvtColor(dia_crop, cv2.COLOR_RGB2BGR))
             speaker_hint = str(self.entries[self.current_index].get("speaker", "") or "")
             custom = self._get_custom_prompt()
+            extra_requirements = self._translation_extra_requirements()
+            history_items = self._get_history_items_before_index(self.current_index)
             if self._translation_mode() == "ocr_chat_completions":
-                ocr = build_ocr_engine(self.cfg.get("ocr", {}))
-                spk_result = ocr.recognize(name_img)
-                orig_result = ocr.recognize(dia_img)
-                spk = str(spk_result.text or "").strip() or speaker_hint
-                orig = str(orig_result.text or "").strip()
+                if self._text_extraction_backend() == "ocr":
+                    ocr = build_ocr_engine(self.cfg.get("ocr", {}))
+                    spk_result = ocr.recognize(name_img)
+                    orig_result = ocr.recognize(dia_img)
+                    spk = str(spk_result.text or "").strip() or speaker_hint
+                    orig = str(orig_result.text or "").strip()
+                else:
+                    extractor = self._build_image_text_extractor()
+                    spk, orig, _extract_usage = extractor.extract_text_from_images(
+                        speaker_image=name_img,
+                        dialogue_image=dia_img,
+                        request_tag=f"review-extract-{seg_no}",
+                    )
+                    spk = str(spk or "").strip() or speaker_hint
+                    orig = str(orig or "").strip()
                 if not orig:
-                    raise RuntimeError("OCR 未识别到对话原文")
+                    raise RuntimeError("文本抽取未识别到对话原文")
                 tr_text = self._build_text_translator()
                 trans, usage = tr_text.translate_text_with_prompt(
                     original_text=orig,
                     speaker=spk,
                     request_tag=f"review-ocr-chat-{seg_no}",
                     custom_prompt=custom,
+                    extra_requirements=extra_requirements,
                     context_before=self._get_context_around_index(self.current_index, before=True),
                     context_after=self._get_context_around_index(self.current_index, before=False),
                 )
@@ -3663,8 +3880,9 @@ class CacheReviewApp:
                     speaker_image_path=name_img,
                     speaker=speaker_hint,
                     request_tag=f"review-seg-{seg_no}",
-                    history_items=None,
+                    history_items=history_items,
                     custom_prompt=custom,
+                    extra_requirements=extra_requirements,
                 )
             base_entry = self.entries[self.current_index]
             result = self._build_review_entry(
@@ -3685,13 +3903,17 @@ class CacheReviewApp:
             if not original_text:
                 raise RuntimeError("当前段 text_original 为空")
             speaker = str(parsed.get("speaker", "") or "").strip()
+            custom = self._get_custom_prompt()
+            extra_requirements = self._translation_extra_requirements()
+            history_items = self._get_history_items_before_index(self.current_index)
             if self._translation_mode() == "ocr_chat_completions":
                 tr_text = self._build_text_translator()
                 translated, usage = tr_text.translate_text_with_prompt(
                     original_text=original_text,
                     speaker=speaker,
                     request_tag=f"review-text-{self.current_index + 1}",
-                    custom_prompt=self._get_custom_prompt(),
+                    custom_prompt=custom,
+                    extra_requirements=extra_requirements,
                     context_before=self._get_context_around_index(self.current_index, before=True),
                     context_after=self._get_context_around_index(self.current_index, before=False),
                 )
@@ -3701,7 +3923,9 @@ class CacheReviewApp:
                     original_text=original_text,
                     speaker=speaker,
                     request_tag=f"review-text-{self.current_index + 1}",
-                    custom_prompt=self._get_custom_prompt(),
+                    custom_prompt=custom,
+                    history_items=history_items,
+                    extra_requirements=extra_requirements,
                 )
             base_entry = self.entries[self.current_index]
             result = self._build_review_entry(
