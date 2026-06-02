@@ -147,6 +147,7 @@ translation:
   mode_models:
     vlm_responses: qwen3.6-plus
     ocr_chat_completions: local-translator
+    vlm_text_extraction: local-vlm
 
   # Each model profile owns its API model name, base URL and optional auth.
   # Empty api_key means no Authorization header (useful for local compatible servers).
@@ -161,6 +162,7 @@ translation:
       modes:
         - vlm_responses
         - ocr_chat_completions
+        - vlm_text_extraction
     local-translator:
       model: HY-MT2-7B-Q8_0
       base_url: http://127.0.0.1:8080/v1
@@ -170,6 +172,15 @@ translation:
       top_k: 20
       modes:
         - ocr_chat_completions
+    local-vlm:
+      model: local-vlm
+      base_url: http://127.0.0.1:8080/v1
+      api_key: ""
+      temperature: 0.0
+      top_p: 0.8
+      top_k: 20
+      modes:
+        - vlm_text_extraction
     deepseek-v4-pro:
       model: deepseek-v4-pro
       base_url: https://api.deepseek.com
@@ -199,6 +210,21 @@ translation:
   auto_review_max_tokens: 0
   auto_review_parse_retries: 1
   auto_review_repair_max_tokens: 0
+
+  # Text extraction backend used before ocr_chat_completions translation.
+  # ocr keeps the existing RapidOCR behavior. VLM modes recognize image text first,
+  # then keep the same sliding lookahead + text translation flow.
+  text_extraction_backend: ocr
+  text_extraction_model_profile: local-vlm
+  text_extraction_max_tokens: 512
+  text_extraction_temperature: 0.0
+  text_extraction_enable_thinking: false
+  text_extraction_thinking_budget: null
+  text_extraction_preserve_thinking: false
+  # auto: RapidOCR overlaps extraction with translation; VLM extraction does not.
+  # Set true for remote APIs or local llama.cpp with enough parallel slots (e.g. np>=2).
+  # Set false for a single local llama.cpp slot (np=1).
+  text_extraction_prefetch_during_translation: auto
 
   # Logging and concurrency controls.
   io_log_enabled: true
