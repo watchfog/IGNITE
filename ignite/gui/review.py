@@ -2300,11 +2300,94 @@ class CacheReviewApp:
                 continue
         return None
 
-    def _short_review_text(self, text: Any, max_chars: int = 700) -> str:
-        s = str(text or "").strip()
-        if len(s) <= max_chars:
-            return s
-        return s[:max_chars].rstrip() + "..."
+    def _ask_auto_review_update(
+        self,
+        *,
+        pos: int,
+        total: int,
+        segment_id: int,
+        speaker: str,
+        original: str,
+        current_text: str,
+        new_text: str,
+        reason: str,
+    ) -> bool | None:
+        result: dict[str, bool | None] = {"value": None}
+        win = tk.Toplevel(self.root)
+        win.title("确认自动review修改")
+        win.transient(self.root)
+        win.resizable(False, False)
+        width = 900
+        height = 700
+        try:
+            self.root.update_idletasks()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            rw = max(1, self.root.winfo_width())
+            rh = max(1, self.root.winfo_height())
+            px = rx + max(0, (rw - width) // 2)
+            py = ry + max(0, (rh - height) // 2)
+            win.geometry(f"{width}x{height}+{px}+{py}")
+        except Exception:
+            win.geometry(f"{width}x{height}")
+
+        root = ttk.Frame(win, padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+        header = (
+            f"第 {pos}/{total} 条自动review建议    "
+            f"段号：{segment_id}    说话人：{speaker or '（空）'}"
+        )
+        ttk.Label(root, text=header, foreground="#1f5f99").pack(anchor="w")
+        ttk.Label(root, text="请选择是否应用此修改。窗口大小固定，长文本可滚动查看。").pack(anchor="w", pady=(2, 8))
+
+        def add_box(title: str, text: str, height_lines: int) -> None:
+            box = ttk.LabelFrame(root, text=title, padding=4)
+            box.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+            frame = ttk.Frame(box)
+            frame.pack(fill=tk.BOTH, expand=True)
+            scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+            txt = tk.Text(
+                frame,
+                height=height_lines,
+                wrap=tk.WORD,
+                font=("Consolas", 10),
+                yscrollcommand=scroll.set,
+            )
+            scroll.configure(command=txt.yview)
+            txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            txt.insert("1.0", text)
+            txt.configure(state=tk.DISABLED)
+
+        add_box("原文", original, 5)
+        add_box("当前译文", current_text, 5)
+        add_box("建议译文", new_text, 5)
+        add_box("原因", reason or "（无）", 4)
+
+        btns = ttk.Frame(root)
+        btns.pack(fill=tk.X, pady=(6, 0))
+
+        def finish(value: bool | None) -> None:
+            result["value"] = value
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        ttk.Button(btns, text="应用", command=lambda: finish(True)).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="跳过", command=lambda: finish(False)).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="停止后续确认", command=lambda: finish(None)).pack(side=tk.RIGHT)
+        win.protocol("WM_DELETE_WINDOW", lambda: finish(None))
+        win.bind("<Escape>", lambda _e: finish(None))
+        win.bind("<Return>", lambda _e: finish(True))
+        try:
+            win.grab_set()
+            win.focus_set()
+        except Exception:
+            pass
+        self.root.wait_window(win)
+        return result["value"]
 
     def _confirm_auto_review_updates(self, updates: list[dict[str, Any]], report: dict[str, Any]) -> None:
         changed_updates = [item for item in updates if item.get("changed")]
@@ -2361,18 +2444,16 @@ class CacheReviewApp:
             self.review_text.delete("1.0", tk.END)
             self.review_text.insert(tk.END, json.dumps(preview, ensure_ascii=False, indent=2))
             self.review_meta_var.set(f"自动review确认: {pos}/{total}")
-            prompt = (
-                f"第 {pos}/{total} 条自动review建议\n"
-                f"段号：{segment_id}\n"
-                f"说话人：{speaker or '（空）'}\n\n"
-                f"原文：\n{self._short_review_text(original)}\n\n"
-                f"当前译文：\n{self._short_review_text(current_text)}\n\n"
-                f"建议译文：\n{self._short_review_text(new_text)}\n\n"
-                f"原因：\n{self._short_review_text(reason, 350) or '（无）'}\n\n"
-                "是否应用此修改？\n"
-                "是：应用；否：跳过；取消：停止后续确认。"
+            answer = self._ask_auto_review_update(
+                pos=pos,
+                total=total,
+                segment_id=segment_id,
+                speaker=speaker,
+                original=original,
+                current_text=current_text,
+                new_text=new_text,
+                reason=reason,
             )
-            answer = messagebox.askyesnocancel("确认自动review修改", prompt, parent=self.root)
             if answer is None:
                 cancelled = True
                 break
