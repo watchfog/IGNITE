@@ -1408,6 +1408,86 @@ class VlmImageTextExtractor:
             )
         return self._request_with_retries(payload, request_tag)
 
+    def translate_single_image_text_with_tag(
+        self,
+        image_path: str | Path,
+        request_tag: str = "",
+        custom_prompt: str = "",
+        extra_requirements: str = "",
+        target_language: str = "zh-CN",
+    ) -> tuple[str, str, dict[str, int]]:
+        target_label = _language_label_zh(str(target_language or "zh-CN").strip() or "zh-CN")
+        game_hint = f"图像中的文本内容与{self.game_name}相关，请结合你的相关知识判断。" if self.game_name else ""
+        system_prompt = (
+            "### 角色\n"
+            f"**你是{self.game_name}的游戏文本翻译助手，负责识别{self.source_language}文本并翻译为{target_label}。**\n"
+            "### 输入\n"
+            "**你会收到一张图像，其中包含标题或文本区域（不含说话人姓名）。**\n"
+            "### 任务\n"
+            f"**识别图像中的{self.source_language}文本，结合你对{self.game_name}的了解翻译为{target_label}译文。**{game_hint}\n"
+            "**图像文字识别可能有误，对无法辨认的字形请结合上下文自行判断，不要强行翻译乱码内容。**\n"
+            "### 翻译规则\n"
+            "- **语义优先**：在保证语义通顺的前提下，尽可能保留原文的换行与符号。\n"
+            "- **禁止添加**：绝对禁止添加与原文无关的内容。\n"
+            "- **保留符号**：保留原文使用的『』，禁止替换为\"\"或''。\n"
+            "- **禁止自创标点**：禁止自行添加原文没有的标点。\n"
+            "- **英文处理**：原文若为纯英文，不需要翻译，直接输出原文。\n"
+            "### 额外要求\n"
+            "**{placeholder}**\n"
+            "### 输出JSON\n"
+            "**必须返回符合以下JSON Schema的JSON对象：**\n"
+            "```json\n"
+            "{\n"
+            f'  "original_text": "图像中识别的{self.source_language}原文",\n'
+            f'  "translated_text": "{target_label}译文"\n'
+            "}\n"
+            "```"
+        )
+        extra_requirements_text = str(extra_requirements or "").strip()
+        if extra_requirements_text:
+            system_prompt = system_prompt.replace("**{placeholder}**", f"**{extra_requirements_text}**")
+        else:
+            system_prompt = system_prompt.replace(
+                "### 额外要求\n**{placeholder}**\n", ""
+            )
+        user_text = "### 图像：标题/文本区域\n**请识别并翻译，直接输出 JSON：**"
+        custom = str(custom_prompt or "").strip()
+        if custom:
+            user_text += f"\n### 附加要求\n**{custom}**"
+        image_url = self._to_data_url(image_path)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            },
+        ]
+        payload = self._build_payload(messages)
+        if self.io_log_enabled:
+            self._append_io_log(
+                {
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "event": "request",
+                    "request_tag": request_tag,
+                    "backend": self.backend,
+                    "image_path": self._image_input_log_value(image_path),
+                    "prompt_preview": {
+                        "model": payload.get("model"),
+                        "temperature": payload.get("temperature"),
+                        "top_p": payload.get("top_p"),
+                        "top_k": payload.get("top_k"),
+                        "max_tokens": payload.get("max_tokens"),
+                        "chat_template_kwargs": payload.get("chat_template_kwargs"),
+                        "system_prompt": system_prompt,
+                        "user_prompt": user_text,
+                    },
+                }
+            )
+        return self._request_title_translation_with_retries(payload, request_tag)
+
     def _build_payload(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -1498,6 +1578,112 @@ class VlmImageTextExtractor:
         if last_err is not None:
             raise last_err
         return "", "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _request_title_translation_with_retries(
+        self,
+        payload: dict[str, Any],
+        request_tag: str,
+    ) -> tuple[str, str, dict[str, int]]:
+        path = "/responses" if self.backend == "vlm_responses" else "/chat/completions"
+        req = request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=_auth_headers(self.api_key),
+            method="POST",
+        )
+        empty_limit = self.empty_max_attempts
+        attempts = max(self.max_retries + 1, empty_limit)
+        empty_count = 0
+        err_count = 0
+        current_timeout = int(self.timeout_sec)
+        last_err: Exception | None = None
+        tag_prefix = f"{request_tag}: " if request_tag else ""
+        for i in range(attempts):
+            try:
+                with self._opener.open(req, timeout=current_timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                usage = self._extract_usage_from_data(data)
+                raw_text = self._extract_text(data).strip()
+                original_text, translated_text = self._parse_title_json_text(raw_text)
+                if self.io_log_enabled:
+                    self._append_io_log(
+                        {
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "event": "response",
+                            "request_tag": request_tag,
+                            "attempt": i + 1,
+                            "usage": usage,
+                            "raw_response_text": raw_text,
+                            "parsed_original_text": original_text,
+                            "parsed_translated_text": translated_text,
+                        }
+                    )
+                if translated_text:
+                    return original_text, translated_text, usage
+                empty_count += 1
+                if self.log_fn is not None:
+                    self.log_fn(
+                        f"{tag_prefix}warning: empty title translation on empty-attempt {empty_count + 1}/{empty_limit}"
+                    )
+                if empty_count >= empty_limit:
+                    return "", "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                time.sleep(self.retry_delay_sec)
+                continue
+            except Exception as exc:
+                last_err = exc
+                err_count += 1
+                err_detail = self._exception_message(exc)
+                is_timeout_like = (
+                    isinstance(exc, TimeoutError)
+                    or "timeout" in exc.__class__.__name__.lower()
+                    or "timed out" in str(exc).lower()
+                )
+                if self.log_fn is not None:
+                    self.log_fn(
+                        f"{tag_prefix}request attempt {i + 1}/{attempts} failed: {exc.__class__.__name__} | {err_detail}"
+                    )
+                if is_timeout_like and self.timeout_backoff_sec > 0:
+                    current_timeout += self.timeout_backoff_sec
+                if err_count > self.max_retries or i + 1 >= attempts:
+                    break
+                time.sleep(self.retry_delay_sec)
+        if last_err is not None:
+            raise last_err
+        return "", "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    def _parse_title_json_text(self, raw_text: str) -> tuple[str, str]:
+        clean = self._strip_thinking_content(raw_text).strip()
+        obj: dict[str, Any] = {}
+        if clean:
+            try:
+                obj = json.loads(clean)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", clean)
+                if m:
+                    try:
+                        obj = json.loads(m.group(0))
+                    except Exception:
+                        obj = {}
+        if not isinstance(obj, dict):
+            obj = {}
+        original = str(
+            obj.get("original_text")
+            or obj.get("ocr_text")
+            or obj.get("source_text")
+            or ""
+        ).strip()
+        translated = str(
+            obj.get("translated_text")
+            or obj.get("translation")
+            or obj.get("target_text")
+            or ""
+        ).strip()
+        original = self._strip_thinking_content(original).strip()
+        translated = self._strip_thinking_content(translated).strip()
+        translated = normalize_quotes_for_subtitle(translated)
+        if translated and has_kana_leak_from_original(original, translated, min_len=3):
+            translated = ""
+        return original, translated
 
     def _parse_json_text(self, raw_text: str) -> tuple[str, str]:
         clean = self._strip_thinking_content(raw_text).strip()

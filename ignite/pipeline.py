@@ -1628,23 +1628,28 @@ def run_pipeline(args: argparse.Namespace) -> int:
         if text_extraction_backend != "ocr" and image_text_extractor is None:
             raise RuntimeError("VLM image text extractor is required for selected text extraction backend")
         _log(
-            "OCR + Chat Completions: sliding text-extraction lookahead "
-            f"with background prefetch (backend={text_extraction_backend})."
+            "OCR + Chat Completions: text extraction followed by strict sequential "
+            f"translation (backend={text_extraction_backend})."
         )
         ctx_window = max(0, int(getattr(text_translator, "context_window", 0)))
-        prefetch_setting = str(
-            tr_cfg.get("text_extraction_prefetch_during_translation", "auto") or "auto"
-        ).strip().lower()
-        if prefetch_setting in {"1", "true", "yes", "on"}:
-            prefetch_during_translation = True
-        elif prefetch_setting in {"0", "false", "no", "off"}:
+        extract_all_before_translation = text_extraction_backend != "ocr"
+        if extract_all_before_translation:
             prefetch_during_translation = False
+            _log("VLM text extraction: extract all segments before text translation.")
         else:
-            prefetch_during_translation = text_extraction_backend == "ocr"
-        _log(
-            "Text extraction prefetch during translation: "
-            f"{prefetch_during_translation} (setting={prefetch_setting})"
-        )
+            prefetch_setting = str(
+                tr_cfg.get("text_extraction_prefetch_during_translation", "auto") or "auto"
+            ).strip().lower()
+            if prefetch_setting in {"1", "true", "yes", "on"}:
+                prefetch_during_translation = True
+            elif prefetch_setting in {"0", "false", "no", "off"}:
+                prefetch_during_translation = False
+            else:
+                prefetch_during_translation = True
+            _log(
+                "RapidOCR prefetch during translation: "
+                f"{prefetch_during_translation} (setting={prefetch_setting})"
+            )
         ocr_done_indices: set[int] = set()
         ocr_lock = threading.Lock()
         ocr_pool = ThreadPoolExecutor(max_workers=1)
@@ -1784,8 +1789,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     return
             _run_ocr_for_index(idx)
 
-        for i in range(min(len(final_segments), 1 + ctx_window)):
-            _submit_ocr(i)
+        if extract_all_before_translation:
+            for i in range(len(final_segments)):
+                _submit_ocr(i)
+            for i in range(len(final_segments)):
+                if i == 0 or (i + 1) % 10 == 0 or i + 1 == len(final_segments):
+                    _log(f"VLM text extraction progress: {i + 1}/{len(final_segments)}")
+                _wait_ocr(i)
+            _log("VLM text extraction finished; starting text translation.")
+        else:
+            for i in range(min(len(final_segments), 1 + ctx_window)):
+                _submit_ocr(i)
 
         _log("Chat Completions strict sequential mode: concurrent_workers=1")
 
@@ -1822,7 +1836,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             items: list[dict[str, str]] = []
             scan_idx = seg_idx + 1
             while scan_idx < len(final_segments) and len(items) < ctx_window:
-                _wait_ocr(scan_idx)
+                if not extract_all_before_translation:
+                    _wait_ocr(scan_idx)
                 item = _context_item(scan_idx, include_translation=False)
                 if item is not None:
                     items.append(item)
@@ -1830,8 +1845,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
             return items or None
 
         for seg_idx, seg in enumerate(final_segments):
-            _wait_ocr(seg_idx)
-            if prefetch_during_translation:
+            if not extract_all_before_translation:
+                _wait_ocr(seg_idx)
+            if prefetch_during_translation and not extract_all_before_translation:
                 _submit_ocr(seg_idx + ctx_window + 1)
             if str(seg.dialogue_type or "").strip().lower() in {"blank_no_name", "blank", "title"}:
                 continue

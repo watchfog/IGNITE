@@ -2272,10 +2272,7 @@ class ProfileEditor:
         save_path = filedialog.asksaveasfilename(
             title=title,
             defaultextension=".png",
-            initialdir=self._dialog_initial_dir(
-                "profile.marker2_templates_save" if roi_key == "marker_2_roi" else "profile.marker_templates_save",
-                default_dir,
-            ),
+            initialdir=str(default_dir),
             initialfile=default_name,
             filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg"), ("所有文件", "*.*")],
         )

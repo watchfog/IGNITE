@@ -92,7 +92,7 @@ pipeline.py  ← 编排入口，import 所有下层模块
    - **OCR 模式**：`_split_segment_by_name_ocr` 通过姓名区域 OCR 进一步切分空白→对话
    - **Marker2 模式**（OCR 禁用时）：`_split_segment_by_marker2` 通过第二标记模板匹配切分
 3. **Normalize**：`_normalize_name_subsegments_per_marker` 将精化结果按 marker_seg_id 归组标准化
-4. **翻译**：`ocr_chat_completions` 模式下使用滑动 text-extraction lookahead + ThreadPoolExecutor 异步预取（默认 RapidOCR，也可用 VLM 图像文字抽取；`text_extraction_prefetch_during_translation` 控制翻译期间是否继续后台预取），严格顺序翻译并附带滚动上下文窗口
+4. **翻译**：`ocr_chat_completions` 模式下默认 RapidOCR 使用滑动 text-extraction lookahead + ThreadPoolExecutor 异步预取；VLM 图像文字抽取会先全量识别所有分段，再严格顺序翻译并附带滚动上下文窗口
 5. **自动校对**（可选）：`--auto-review` 标志启用，在翻译完成后调用 `run_auto_review_entries()` 对 cache entries 进行 LLM 校对，将修改后的译文写回 cache
 
 ### OCR 模型语言说明
@@ -124,7 +124,7 @@ pipeline.py  ← 编排入口，import 所有下层模块
 - `translation.mode` 支持 `vlm_responses`（图片直传 VLM responses）和 `ocr_chat_completions`（先抽取原文写入 cache，再走 chat-completions 文本翻译）
 - `ocr_chat_completions` 的前置原文抽取由 `translation.text_extraction_backend` 控制：`ocr`（默认 RapidOCR）、`vlm_responses`（Responses-compatible VLM 图像识别）、`vlm_chat_completions`（本次新增的 Chat Completions-compatible VLM 图像识别，如 llama.cpp）；VLM 抽取默认 `text_extraction_enable_thinking: false`，通过 `chat_template_kwargs.enable_thinking` 控制 thinking。
 - VLM 图像文字抽取模型通过 `translation.text_extraction_model_profile` 或 `mode_models.vlm_text_extraction` 指定，profile 需允许 `modes: [vlm_text_extraction]`；默认有 `local-vlm` profile 指向 `http://127.0.0.1:8080/v1`，用于本地兼容 VLM 服务。
-- `translation.text_extraction_prefetch_during_translation` 控制翻译当前段时是否后台预取下一段原文：`auto` 下 RapidOCR 会并行预取，VLM 抽取不并行；同一个本地 llama.cpp `np=1` 建议 `auto/false`，`np>=2` 或远端 API 可设为 `true`。
+- `translation.text_extraction_prefetch_during_translation` 只影响 RapidOCR 后端：`auto/true` 会在翻译当前段时后台预取下一段原文；VLM 抽取会先全量识别完成，再开始翻译。
 - chat-completions 模式支持 `chat_context_window: 8` 控制滚动上下文窗口大小
 - 采样参数（temperature / top_p / top_k）已从全局配置移除，改为在 `model_profiles` 中按 profile 单独配置；不填则不传对应参数；本地 `local-translator` profile 默认 temperature=0.7, top_p=0.6, top_k=20
 - 新增 DeepSeek V4 Pro / V4 Flash profiles（base_url: `https://api.deepseek.com`），无采样参数
@@ -151,9 +151,10 @@ pipeline.py  ← 编排入口，import 所有下层模块
 - **选择缓存/配置**：顶部新增选择按钮，选择后自动加载；缓存和配置路径互不覆盖
 - **Marker 模板解析**：相对路径优先按 config 所在目录解析，过滤无效路径后仍能用有效模板显示分数
 - **ROI 显示开关**：勾选后在画布上叠加所有配置过的 ROI 矩形，默认关闭
-- **再次自动review**：Review GUI 顶部可对当前 cache 调用自动review；模型建议不会自动应用，每条修改都必须由用户逐条确认后才写入 cache
-- **Review 复译上下文**：Review 的原文重译/截图复译会传 `game.extra_requirements`；`ocr_chat_completions` 传前后文 context，`vlm_responses` 复译仅在 Review 中传前文 history（pipeline 的 VLM responses 不使用 history）
+- **再次自动review**：Review GUI 顶部可对当前 cache 调用自动review；点击后先重新读取配置，再弹窗编辑并保存 `game.name` / `game.extra_requirements` 到当前 config，随后再次读取配置并开始校对；模型建议不会自动应用，每条修改都必须由用户逐条确认后才写入 cache
+- **Review 复译上下文**：Review 的原文重译/截图复译发起前会重新读取配置，并传 `game.extra_requirements`；`ocr_chat_completions` 传前后文 context，`vlm_responses` 复译仅在 Review 中传前文 history（pipeline 的 VLM responses 不使用 history）
 - **截图复译文本抽取**：当 `translation.text_extraction_backend` 为 VLM 后端时，Review 的“重新截图并复译”先用 `VlmImageTextExtractor` 抽取原文，再走文本翻译；`ocr` 后端保持 RapidOCR
+- **Title 识别方式**：Review 的“识别并翻译Title”提供自动/翻译API直识别/本地VLM直识别；自动模式在 `translation.text_extraction_backend` 为 VLM 后端时用该 VLM 模型直接识别并翻译标题图像，否则保留原 API 直识别翻译
 - **归档项目**：Review GUI 操作条提供入口；自动保存当前 cache 后异步归档原视频（保留原文件名）、合并后的 `config.yaml`、Marker 模板图片、`translation_cache_latest.json`、ASS 字幕和可选硬字幕视频；归档 cache 内 `video`/`config_path` 改为同目录相对路径，归档 config 内 marker 模板路径改为 `marker_templates/` 相对路径
 
 ### 线程模型

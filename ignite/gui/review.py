@@ -69,6 +69,12 @@ ROI_COLORS = {
     "dialogue_roi": "#0168b7",
     "title_ocr_roi": "#b0b9c0",
 }
+TITLE_RECOGNITION_MODE_LABELS = {
+    "auto": "自动",
+    "direct_vlm": "翻译API直识别",
+    "local_vlm": "本地VLM直识别",
+}
+TITLE_RECOGNITION_MODE_BY_LABEL = {v: k for k, v in TITLE_RECOGNITION_MODE_LABELS.items()}
 
 
 class CacheReviewApp:
@@ -93,6 +99,7 @@ class CacheReviewApp:
         self.title_end_var = tk.StringVar(value="2.00")
         self.title_capture_var = tk.StringVar(value="1.00")
         self.title_info_var = tk.StringVar(value="")
+        self.title_recognition_mode_var = tk.StringVar(value=TITLE_RECOGNITION_MODE_LABELS["auto"])
         self.review_web_search_var = tk.BooleanVar(value=False)
         self.embed_ffmpeg_path_var = tk.StringVar(value="")
         self.embed_output_path_var = tk.StringVar(value="")
@@ -328,6 +335,14 @@ class CacheReviewApp:
         ttk.Entry(title_bar, textvariable=self.title_capture_var, width=14).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Label(title_bar, text="翻译信息").pack(side=tk.LEFT)
         ttk.Entry(title_bar, textvariable=self.title_info_var, width=36).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(title_bar, text="识别方式").pack(side=tk.LEFT)
+        ttk.Combobox(
+            title_bar,
+            textvariable=self.title_recognition_mode_var,
+            values=list(TITLE_RECOGNITION_MODE_LABELS.values()),
+            state="readonly",
+            width=16,
+        ).pack(side=tk.LEFT, padx=(4, 8))
         ttk.Button(
             title_bar,
             text="识别并翻译Title",
@@ -591,6 +606,121 @@ class CacheReviewApp:
         self._refresh_auto_review_model_choices()
         self.status_var.set(f"已加载配置: {p}")
         self._refresh_canvas()
+
+    def _reload_config_for_action(self, action: str) -> bool:
+        try:
+            self._load_config()
+            return True
+        except Exception as exc:
+            messagebox.showerror(action, f"重新读取配置失败：{exc}", parent=self.root)
+            self.status_var.set(f"{action}失败：重新读取配置失败: {exc}")
+            return False
+
+    def _read_editable_config_payload(self, path: Path) -> tuple[dict[str, Any], bool]:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        stripped = text.strip()
+        is_json = path.suffix.lower() == ".json" or stripped.startswith("{")
+        if not stripped:
+            return {}, is_json
+        data = json.loads(stripped) if is_json else yaml.safe_load(text)
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise RuntimeError("配置文件根节点必须是对象")
+        return data, is_json
+
+    def _write_editable_config_payload(self, path: Path, data: dict[str, Any], *, is_json: bool) -> None:
+        if is_json:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return
+        path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    def _save_auto_review_game_config(self, game_name: str, extra_requirements: str) -> None:
+        path = Path(self.config_var.get().strip() or self.config_path).resolve()
+        if not path.exists():
+            raise RuntimeError(f"配置不存在: {path}")
+        data, is_json = self._read_editable_config_payload(path)
+        game = data.get("game")
+        if not isinstance(game, dict):
+            game = {}
+            data["game"] = game
+        game["name"] = str(game_name or "").strip()
+        game["extra_requirements"] = str(extra_requirements or "").strip()
+        self._write_editable_config_payload(path, data, is_json=is_json)
+
+    def _edit_auto_review_game_config_dialog(self) -> bool:
+        game_cfg = self.cfg.get("game", {}) if isinstance(self.cfg.get("game"), dict) else {}
+        name_var = tk.StringVar(value=str(game_cfg.get("name", "") or ""))
+        result = {"ok": False}
+
+        win = tk.Toplevel(self.root)
+        win.title("自动review配置")
+        win.transient(self.root)
+        win.geometry("760x480")
+        win.resizable(True, True)
+
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(2, weight=1)
+
+        ttk.Label(body, text="自动review前请确认游戏名和额外要求；保存后会写入当前配置文件并重新读取配置。", foreground="#1f5f99").grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 10),
+        )
+        ttk.Label(body, text="游戏名").grid(row=1, column=0, sticky="w", pady=(0, 6))
+        ttk.Entry(body, textvariable=name_var).grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
+        ttk.Label(body, text="额外要求 / 术语表").grid(row=2, column=0, sticky="nw")
+
+        text_frame = ttk.Frame(body)
+        text_frame.grid(row=2, column=1, sticky="nsew", padx=(8, 0))
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+        extra_text = tk.Text(text_frame, height=14, wrap=tk.WORD, font=("Consolas", 10))
+        scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=extra_text.yview)
+        extra_text.configure(yscrollcommand=scroll.set)
+        extra_text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        extra_text.insert("1.0", str(game_cfg.get("extra_requirements", "") or ""))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def close(ok: bool) -> None:
+            result["ok"] = ok
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        def save_and_start() -> None:
+            try:
+                self._save_auto_review_game_config(
+                    name_var.get(),
+                    extra_text.get("1.0", tk.END).strip(),
+                )
+                self._load_config()
+            except Exception as exc:
+                messagebox.showerror("自动review配置", f"保存配置失败：{exc}", parent=win)
+                self.status_var.set(f"自动review配置保存失败: {exc}")
+                return
+            close(True)
+
+        ttk.Button(btns, text="取消", command=lambda: close(False)).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(btns, text="保存并开始自动review", command=save_and_start).pack(side=tk.RIGHT)
+        win.protocol("WM_DELETE_WINDOW", lambda: close(False))
+        win.bind("<Escape>", lambda _e: close(False))
+        try:
+            win.grab_set()
+            win.focus_set()
+        except Exception:
+            pass
+        self.root.wait_window(win)
+        return bool(result["ok"])
 
     def _refresh_auto_review_model_choices(self) -> None:
         tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
@@ -1633,6 +1763,42 @@ class CacheReviewApp:
             }
         )
 
+    def _title_recognition_mode_key(self) -> str:
+        raw = str(self.title_recognition_mode_var.get() or "").strip()
+        mode = TITLE_RECOGNITION_MODE_BY_LABEL.get(raw, raw)
+        return mode if mode in TITLE_RECOGNITION_MODE_LABELS else "auto"
+
+    def _resolve_title_recognition_mode(self) -> str:
+        mode = self._title_recognition_mode_key()
+        if mode != "auto":
+            return mode
+        return "local_vlm" if self._text_extraction_backend() != "ocr" else "direct_vlm"
+
+    def _translate_title_direct_vlm(self, img_path: Path) -> tuple[str, str, dict[str, int]]:
+        tr = self._build_translator()
+        return tr.translate_single_image_ja_to_zh_cn_structured_with_tag(
+            image_path=img_path,
+            request_tag="title-segment",
+            history_items=None,
+            custom_prompt=self._get_custom_prompt(),
+            extra_requirements=self._translation_extra_requirements(),
+        )
+
+    def _translate_title_local_vlm(self, img_path: Path) -> tuple[str, str, dict[str, int]]:
+        extractor = self._build_image_text_extractor()
+        tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
+        if not isinstance(tcfg, dict):
+            tcfg = {}
+        game_cfg = self.cfg.get("game", {}) if isinstance(self.cfg.get("game"), dict) else {}
+        target_language = str(tcfg.get("target_language", game_cfg.get("target_language", "zh-CN")) or "zh-CN")
+        return extractor.translate_single_image_text_with_tag(
+            image_path=img_path,
+            request_tag="title-local-vlm",
+            custom_prompt=self._get_custom_prompt(),
+            extra_requirements=self._translation_extra_requirements(),
+            target_language=target_language,
+        )
+
     def _open_insert_dialog(
         self,
         *,
@@ -2488,12 +2654,24 @@ class CacheReviewApp:
         except Exception as exc:
             messagebox.showerror("自动review", f"当前段 JSON 保存失败：{exc}", parent=self.root)
             return
+        if not self._reload_config_for_action("自动review"):
+            return
+        if not self._edit_auto_review_game_config_dialog():
+            self.status_var.set("自动review 已取消。")
+            return
         entries_snapshot = copy.deepcopy(self.entries)
-        tcfg = self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {}
+        tcfg = copy.deepcopy(self.cfg.get("translation", {}) if isinstance(self.cfg, dict) else {})
         if not isinstance(tcfg, dict):
             tcfg = {}
         game_cfg = self.cfg.get("game", {}) if isinstance(self.cfg.get("game"), dict) else {}
-        glossary = str(game_cfg.get("extra_requirements", "") or "").strip()
+        game_name = str(game_cfg.get("name", "") or "").strip()
+        extra_requirements = str(game_cfg.get("extra_requirements", "") or "").strip()
+        glossary_parts = []
+        if game_name:
+            glossary_parts.append(f"游戏名：{game_name}")
+        if extra_requirements:
+            glossary_parts.append(extra_requirements)
+        glossary = "\n\n".join(glossary_parts).strip()
         model_profile = str(self.auto_review_model_var.get() or "").strip()
         review_entries = dialogue_review_entries_from_cache_entries(entries_snapshot)
         if not review_entries:
@@ -2952,12 +3130,12 @@ class CacheReviewApp:
     def _insert_title_segment_from_roi(self) -> None:
         def _job() -> None:
             self._save_current_entry()
-            tr = self._build_translator()
             st = self._parse_time_input(self.title_start_var.get())
             ed = self._parse_time_input(self.title_end_var.get())
             if ed < st:
                 raise RuntimeError("Title End 必须大于等于 Title Start")
             capture_sec = self._parse_time_input(self.title_capture_var.get())
+            mode = self._resolve_title_recognition_mode()
 
             roi_key = "title_ocr_roi"
             roi = self.review_rois.get(roi_key)
@@ -2975,12 +3153,12 @@ class CacheReviewApp:
             ts = int(time.time())
             img_path = out_dir / f"title_roi_{capture_sec:.3f}_{ts}.png"
             cv2.imwrite(str(img_path), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
-            original_text, translated_text, usage = tr.translate_single_image_ja_to_zh_cn_structured_with_tag(
-                image_path=img_path,
-                request_tag="title-segment",
-                history_items=None,
-                custom_prompt=self._get_custom_prompt(),
-            )
+            if mode == "local_vlm":
+                original_text, translated_text, usage = self._translate_title_local_vlm(img_path)
+                mode_label = "本地VLM直识别"
+            else:
+                original_text, translated_text, usage = self._translate_title_direct_vlm(img_path)
+                mode_label = "翻译API直识别"
             title_entry = self._make_title_entry(st, ed, str(original_text or ""), str(translated_text or ""))
             idx = self._upsert_title_entry(title_entry)
             self.last_review_result = dict(title_entry)
@@ -2988,7 +3166,11 @@ class CacheReviewApp:
                 0,
                 lambda: (
                     self._show_segment(idx),
-                    self._show_review_result(title_entry, usage, f"Title 段已插入/更新（截图时间 {capture_sec:.3f}s，内存）"),
+                    self._show_review_result(
+                        title_entry,
+                        usage,
+                        f"Title 段已插入/更新（{mode_label}，截图时间 {capture_sec:.3f}s，内存）",
+                    ),
                 ),
             )
 
@@ -3908,6 +4090,9 @@ class CacheReviewApp:
         return self._crop_from_frame(self.current_frame_rgb, roi)
 
     def _review_by_new_crops(self) -> None:
+        if not self._reload_config_for_action("截图复译"):
+            return
+
         def _job() -> None:
             self._save_current_entry()
             if not self.entries:
@@ -3978,6 +4163,9 @@ class CacheReviewApp:
         self._run_bg("截图复译", _job, show_review_progress=True)
 
     def _review_by_text_only(self) -> None:
+        if not self._reload_config_for_action("原文重译"):
+            return
+
         def _job() -> None:
             parsed = self._read_current_json_from_editor()
             original_text = str(parsed.get("text_original", "") or "").strip()

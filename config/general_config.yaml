@@ -212,8 +212,8 @@ translation:
   auto_review_repair_max_tokens: 0
 
   # Text extraction backend used before ocr_chat_completions translation.
-  # ocr keeps the existing RapidOCR behavior. VLM modes recognize image text first,
-  # then keep the same sliding lookahead + text translation flow.
+  # ocr keeps the existing RapidOCR lookahead behavior. VLM modes recognize all image
+  # text first, then start chat-completions text translation.
   text_extraction_backend: ocr
   text_extraction_model_profile: local-vlm
   text_extraction_max_tokens: 512
@@ -221,9 +221,8 @@ translation:
   text_extraction_enable_thinking: false
   text_extraction_thinking_budget: null
   text_extraction_preserve_thinking: false
-  # auto: RapidOCR overlaps extraction with translation; VLM extraction does not.
-  # Set true for remote APIs or local llama.cpp with enough parallel slots (e.g. np>=2).
-  # Set false for a single local llama.cpp slot (np=1).
+  # RapidOCR only: auto/true overlaps extraction with translation. VLM extraction
+  # always finishes all recognition before translation starts.
   text_extraction_prefetch_during_translation: auto
 
   # Logging and concurrency controls.
